@@ -1,0 +1,30 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Data — never commit benchmark datasets
+data/benchmark_data/
+data/raw/
+
+# Checkpoints — large binary files
+checkpoints/
+
+# Logs
+logs/
+*.log
+
+# Outputs
+verify_out/
+results/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/

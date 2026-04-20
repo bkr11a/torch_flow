@@ -1,0 +1,29 @@
+# =============================================================================
+# FlyingThings3D fine-tuning config
+# Run after Chairs pre-training.
+# =============================================================================
+
+run_name: hqs_flow_things
+
+training:
+  num_steps: 100000
+  lr: 1.25e-4
+  checkpoint: checkpoints/chairs_final.pth
+
+data:
+  name: things
+  root: /data/FlyingThings3D
+  batch_size: 6
+  num_workers: 4
+  crop_size: [400, 720]
+  min_scale: -0.4
+  max_scale: 0.8
+  dstype: clean
+
+val_data:
+  name: sintel
+  root: /data/MPI-Sintel
+  batch_size: 4
+  num_workers: 2
+  crop_size: [368, 768]
+  dstype: clean

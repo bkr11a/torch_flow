@@ -1,0 +1,299 @@
+"""Data augmentation pipeline for optical flow training.
+
+Implements:
+  - Photometric augmentation  (colour jitter, grayscale, gamma)
+  - Spatial augmentation      (random crop, flip, rotation, scale)
+  - Occlusion augmentation    (erasing patches in the second image)
+  - Flow-aware spatial transforms (correctly transform GT flow)
+
+Design:  Each augmenter is a callable that receives a dict with keys
+  ``image1``, ``image2``, ``flow``, ``valid``  (all numpy arrays, H×W×3 /
+  H×W×2 / H×W bool) and returns the same dict with augmented values.
+
+A ``FlowAugmentor`` composes them for training; a ``SparseFlowAugmentor``
+handles datasets with sparse GT (KITTI).
+"""
+from __future__ import annotations
+
+import math
+import random
+from typing import Dict, Optional, Tuple
+
+import cv2
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Photometric augmentation
+# ---------------------------------------------------------------------------
+
+class ColorJitter:
+    """Apply identical colour jitter to both images, then independently."""
+
+    def __init__(
+        self,
+        brightness: float = 0.4,
+        contrast: float = 0.4,
+        saturation: float = 0.4,
+        hue: float = 0.15 / 3.14,
+        asymmetric_prob: float = 0.2,
+    ) -> None:
+        self.brightness = brightness
+        self.contrast   = contrast
+        self.saturation = saturation
+        self.hue        = hue
+        self.asym_prob  = asymmetric_prob
+
+    def _jitter(self, img: np.ndarray) -> np.ndarray:
+        img = img.astype(np.float32)
+        # brightness
+        b = random.uniform(max(0, 1 - self.brightness), 1 + self.brightness)
+        img = img * b
+        # contrast
+        c = random.uniform(max(0, 1 - self.contrast), 1 + self.contrast)
+        mean = img.mean()
+        img = (img - mean) * c + mean
+        # saturation (operate in BGR)
+        s = random.uniform(max(0, 1 - self.saturation), 1 + self.saturation)
+        gray = img.mean(axis=2, keepdims=True)
+        img = img * s + gray * (1 - s)
+        # hue (simple hue rotation in HSV)
+        h = random.uniform(-self.hue, self.hue) * 180
+        img_u8 = np.clip(img, 0, 255).astype(np.uint8)
+        hsv = cv2.cvtColor(img_u8, cv2.COLOR_BGR2HSV).astype(np.float32)
+        hsv[:, :, 0] = (hsv[:, :, 0] + h) % 180
+        img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32)
+        return np.clip(img, 0, 255)
+
+    def __call__(self, sample: Dict) -> Dict:
+        img1 = sample["image1"].copy()
+        img2 = sample["image2"].copy()
+        # Symmetric jitter (same params for both)
+        img1 = self._jitter(img1)
+        if random.random() < self.asym_prob:
+            img2 = self._jitter(img2)
+        else:
+            img2 = self._jitter(img2)
+        sample["image1"] = img1
+        sample["image2"] = img2
+        return sample
+
+
+class GrayScaleTransform:
+    """Convert both images to grayscale with given probability."""
+
+    def __init__(self, prob: float = 0.1) -> None:
+        self.prob = prob
+
+    def __call__(self, sample: Dict) -> Dict:
+        if random.random() < self.prob:
+            for k in ("image1", "image2"):
+                gray = cv2.cvtColor(
+                    sample[k].astype(np.uint8), cv2.COLOR_BGR2GRAY
+                )
+                sample[k] = np.stack([gray, gray, gray], axis=-1).astype(np.float32)
+        return sample
+
+
+# ---------------------------------------------------------------------------
+# Spatial augmentation
+# ---------------------------------------------------------------------------
+
+class RandomCrop:
+    def __init__(self, crop_size: Tuple[int, int]) -> None:
+        self.h, self.w = crop_size
+
+    def __call__(self, sample: Dict) -> Dict:
+        H, W = sample["image1"].shape[:2]
+        y0 = random.randint(0, max(0, H - self.h))
+        x0 = random.randint(0, max(0, W - self.w))
+
+        def _crop(arr: np.ndarray) -> np.ndarray:
+            return arr[y0:y0 + self.h, x0:x0 + self.w]
+
+        sample["image1"] = _crop(sample["image1"])
+        sample["image2"] = _crop(sample["image2"])
+        if "flow" in sample and sample["flow"] is not None:
+            sample["flow"]  = _crop(sample["flow"])
+        if "valid" in sample and sample["valid"] is not None:
+            sample["valid"] = _crop(sample["valid"])
+        return sample
+
+
+class RandomHorizontalFlip:
+    def __init__(self, prob: float = 0.5) -> None:
+        self.prob = prob
+
+    def __call__(self, sample: Dict) -> Dict:
+        if random.random() < self.prob:
+            sample["image1"] = np.ascontiguousarray(sample["image1"][:, ::-1])
+            sample["image2"] = np.ascontiguousarray(sample["image2"][:, ::-1])
+            if "flow" in sample and sample["flow"] is not None:
+                flow = np.ascontiguousarray(sample["flow"][:, ::-1])
+                flow[:, :, 0] *= -1          # invert horizontal component
+                sample["flow"] = flow
+            if "valid" in sample and sample["valid"] is not None:
+                sample["valid"] = np.ascontiguousarray(sample["valid"][:, ::-1])
+        return sample
+
+
+class RandomVerticalFlip:
+    def __init__(self, prob: float = 0.1) -> None:
+        self.prob = prob
+
+    def __call__(self, sample: Dict) -> Dict:
+        if random.random() < self.prob:
+            sample["image1"] = np.ascontiguousarray(sample["image1"][::-1])
+            sample["image2"] = np.ascontiguousarray(sample["image2"][::-1])
+            if "flow" in sample and sample["flow"] is not None:
+                flow = np.ascontiguousarray(sample["flow"][::-1])
+                flow[:, :, 1] *= -1          # invert vertical component
+                sample["flow"] = flow
+            if "valid" in sample and sample["valid"] is not None:
+                sample["valid"] = np.ascontiguousarray(sample["valid"][::-1])
+        return sample
+
+
+class RandomScaleAndCrop:
+    """Scale image to a random size then crop to target resolution."""
+
+    def __init__(
+        self,
+        crop_size: Tuple[int, int],
+        min_scale: float = -0.2,
+        max_scale: float = 0.5,
+        stretch_prob: float = 0.8,
+    ) -> None:
+        self.crop_h, self.crop_w = crop_size
+        self.min_scale = min_scale
+        self.max_scale = max_scale
+        self.stretch_prob = stretch_prob
+
+    def __call__(self, sample: Dict) -> Dict:
+        H, W = sample["image1"].shape[:2]
+
+        # Random log-scale
+        scale = 2 ** random.uniform(self.min_scale, self.max_scale)
+        scale_x = scale
+        scale_y = scale
+        if random.random() < self.stretch_prob:
+            scale_x *= 2 ** random.uniform(-0.1, 0.1)
+            scale_y *= 2 ** random.uniform(-0.1, 0.1)
+
+        # Ensure output is at least as large as crop
+        scale_x = max(scale_x, self.crop_w / W)
+        scale_y = max(scale_y, self.crop_h / H)
+
+        new_W = int(W * scale_x + 0.5)
+        new_H = int(H * scale_y + 0.5)
+
+        def _resize_img(img: np.ndarray) -> np.ndarray:
+            return cv2.resize(img, (new_W, new_H), interpolation=cv2.INTER_LINEAR)
+
+        sample["image1"] = _resize_img(sample["image1"])
+        sample["image2"] = _resize_img(sample["image2"])
+
+        if "flow" in sample and sample["flow"] is not None:
+            flow = cv2.resize(
+                sample["flow"], (new_W, new_H), interpolation=cv2.INTER_LINEAR
+            )
+            flow[:, :, 0] *= scale_x
+            flow[:, :, 1] *= scale_y
+            sample["flow"] = flow
+
+        if "valid" in sample and sample["valid"] is not None:
+            sample["valid"] = cv2.resize(
+                sample["valid"].astype(np.uint8), (new_W, new_H),
+                interpolation=cv2.INTER_NEAREST
+            ).astype(bool)
+
+        # Random crop
+        y0 = random.randint(0, new_H - self.crop_h)
+        x0 = random.randint(0, new_W - self.crop_w)
+
+        def _crop(arr: np.ndarray) -> np.ndarray:
+            return arr[y0:y0 + self.crop_h, x0:x0 + self.crop_w]
+
+        for k in ("image1", "image2", "flow", "valid"):
+            if k in sample and sample[k] is not None:
+                sample[k] = _crop(sample[k])
+
+        return sample
+
+
+# ---------------------------------------------------------------------------
+# Occlusion augmentation
+# ---------------------------------------------------------------------------
+
+class RandomErase:
+    """Randomly erase rectangular patches in image2 to simulate occlusions."""
+
+    def __init__(
+        self,
+        prob: float = 0.5,
+        max_area_ratio: float = 0.5,
+        num_patches: int = 3,
+    ) -> None:
+        self.prob = prob
+        self.max_area = max_area_ratio
+        self.num_patches = num_patches
+
+    def __call__(self, sample: Dict) -> Dict:
+        if random.random() > self.prob:
+            return sample
+        img = sample["image2"].copy()
+        H, W = img.shape[:2]
+        for _ in range(self.num_patches):
+            dx = random.randint(W // 8, W // 2)
+            dy = random.randint(H // 8, H // 2)
+            x1 = random.randint(0, W - dx)
+            y1 = random.randint(0, H - dy)
+            mean_col = img.mean(axis=(0, 1))
+            img[y1:y1 + dy, x1:x1 + dx] = mean_col
+        sample["image2"] = img
+        return sample
+
+
+# ---------------------------------------------------------------------------
+# Composed augmentors
+# ---------------------------------------------------------------------------
+
+class FlowAugmentor:
+    """Full augmentation pipeline for dense-GT datasets (Sintel, Things, Spring)."""
+
+    def __init__(
+        self,
+        crop_size: Tuple[int, int],
+        min_scale: float = -0.2,
+        max_scale: float = 0.5,
+    ) -> None:
+        self.transforms = [
+            ColorJitter(),
+            GrayScaleTransform(),
+            RandomScaleAndCrop(crop_size, min_scale, max_scale),
+            RandomHorizontalFlip(),
+            RandomVerticalFlip(),
+            RandomErase(),
+        ]
+
+    def __call__(self, sample: Dict) -> Dict:
+        for t in self.transforms:
+            sample = t(sample)
+        return sample
+
+
+class SparseFlowAugmentor:
+    """Augmentation for sparse-GT datasets (KITTI).  Skips scale/stretch."""
+
+    def __init__(self, crop_size: Tuple[int, int]) -> None:
+        self.transforms = [
+            ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
+            RandomHorizontalFlip(),
+            RandomCrop(crop_size),
+            RandomErase(prob=0.3),
+        ]
+
+    def __call__(self, sample: Dict) -> Dict:
+        for t in self.transforms:
+            sample = t(sample)
+        return sample

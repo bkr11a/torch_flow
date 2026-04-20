@@ -1,0 +1,10 @@
+# Ablation: DnCNN proximal operator (vs default UNet)
+defaults:
+  - ../default
+
+run_name: ablate_dncnn_prox
+model:
+  prox:
+    type: dncnn
+    num_features: 64
+    depth: 6

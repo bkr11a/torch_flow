@@ -1,0 +1,9 @@
+# Ablation: no proximal / regularisation network (identity prox)
+# Tests whether the learned regulariser contributes.
+defaults:
+  - ../default
+
+run_name: ablate_no_regularizer
+model:
+  prox:
+    type: none

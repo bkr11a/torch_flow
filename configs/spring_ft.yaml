@@ -1,0 +1,35 @@
+# =============================================================================
+# Spring dataset fine-tuning config
+# Spring is high-resolution (1920×1080); use larger crops.
+# =============================================================================
+
+run_name: hqs_flow_spring
+
+training:
+  num_steps: 100000
+  lr: 1.25e-4
+  checkpoint: checkpoints/things_final.pth
+
+loss:
+  gamma: 0.85
+  max_flow: 1000.0               # Spring has large flows
+
+data:
+  name: spring
+  root: /data/Spring
+  direction: forward
+  side: left
+  batch_size: 4
+  num_workers: 4
+  crop_size: [432, 960]
+  min_scale: -0.2
+  max_scale: 0.4
+
+val_data:
+  name: spring
+  root: /data/Spring
+  direction: forward
+  side: left
+  batch_size: 1
+  num_workers: 2
+  crop_size: [432, 960]

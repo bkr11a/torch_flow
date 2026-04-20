@@ -1,0 +1,21 @@
+# Ablation: small model (SmallEncoder, reduced hidden dim)
+defaults:
+  - ../default
+
+run_name: ablate_small_model
+model:
+  encoder:
+    type: small
+    output_dim: 128
+    norm: instance
+  context:
+    type: small
+    output_dim: 64
+    norm: instance
+  update_net:
+    hidden_dim: 64
+    head_dim: 128
+  prox:
+    type: dncnn
+    num_features: 32
+    depth: 4

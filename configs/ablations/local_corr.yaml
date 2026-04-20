@@ -1,0 +1,9 @@
+# Ablation: local correlation window instead of all-pairs 4D correlation
+defaults:
+  - ../default
+
+run_name: ablate_local_corr
+model:
+  corr:
+    type: local
+    radius: 4

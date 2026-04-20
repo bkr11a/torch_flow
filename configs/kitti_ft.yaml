@@ -1,0 +1,28 @@
+# =============================================================================
+# KITTI-2015 fine-tuning config
+# =============================================================================
+
+run_name: hqs_flow_kitti
+
+training:
+  num_steps: 50000
+  lr: 1.25e-4
+  checkpoint: checkpoints/things_final.pth
+
+loss:
+  gamma: 0.85
+  max_flow: 1000.0
+
+data:
+  name: kitti
+  root: /data/KITTI/2015
+  batch_size: 6
+  num_workers: 4
+  crop_size: [288, 960]
+
+val_data:
+  name: kitti
+  root: /data/KITTI/2015
+  batch_size: 1
+  num_workers: 2
+  crop_size: [288, 960]

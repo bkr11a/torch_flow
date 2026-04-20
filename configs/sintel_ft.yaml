@@ -1,0 +1,39 @@
+# =============================================================================
+# MPI-Sintel fine-tuning config
+# Run after Things pre-training.
+# =============================================================================
+
+run_name: hqs_flow_sintel
+
+training:
+  num_steps: 100000
+  lr: 1.25e-4
+  checkpoint: checkpoints/things_final.pth
+
+loss:
+  gamma: 0.85
+  max_flow: 400.0
+  smooth_weight: 0.0
+
+data:
+  # Mix Sintel + FlyingThings + HD1K (common recipe)
+  name:
+    - sintel
+    - things
+  root:
+    - /data/MPI-Sintel
+    - /data/FlyingThings3D
+  batch_size: 6
+  num_workers: 4
+  crop_size: [368, 768]
+  min_scale: -0.2
+  max_scale: 0.6
+  dstype: both                   # use clean + final pass of Sintel
+
+val_data:
+  name: sintel
+  root: /data/MPI-Sintel
+  batch_size: 1
+  num_workers: 2
+  crop_size: [436, 1024]        # full Sintel resolution
+  dstype: final

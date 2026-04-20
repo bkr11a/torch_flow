@@ -1,0 +1,253 @@
+"""Optical flow losses for HQSFlow.
+
+SequenceLoss   – Weighted sum of L1/Charbonnier losses over all HQS stages.
+                 Later stages receive higher weight (γ-decay from the end).
+PhotometricLoss – Unsupervised photometric consistency (for self-supervised experiments).
+SmoothnessLoss  – First/second-order spatial smoothness regulariser (auxiliary).
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict, List, Optional
+
+
+# ---------------------------------------------------------------------------
+# Charbonnier (robust L1) loss
+# ---------------------------------------------------------------------------
+
+def charbonnier(x: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
+    return (x.pow(2) + eps ** 2).sqrt()
+
+
+# ---------------------------------------------------------------------------
+# Sequence loss (main supervised loss)
+# ---------------------------------------------------------------------------
+
+class SequenceLoss(nn.Module):
+    """
+    Compute a weighted sum of per-stage endpoint errors.
+
+    Loss = Σ_k  γ^{K-k-1}  ·  mean_valid( charbonnier(||u^k - u_gt||) )
+
+    where K is the total number of stages, γ∈(0,1) favours later stages.
+
+    Args:
+        gamma:   Geometric decay (default 0.85).
+        max_flow: Ignore pixels with GT flow magnitude above this threshold
+                  (default 400 px, consistent with RAFT).
+        loss_fn: "charbonnier" | "l1" | "l2"
+    """
+
+    def __init__(
+        self,
+        gamma: float = 0.85,
+        max_flow: float = 400.0,
+        loss_fn: str = "charbonnier",
+    ) -> None:
+        super().__init__()
+        self.gamma    = gamma
+        self.max_flow = max_flow
+        self.loss_fn  = loss_fn
+
+    def _point_loss(self, pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+        diff = pred - gt
+        if self.loss_fn == "charbonnier":
+            return charbonnier(diff).mean(dim=1)  # (B, H, W)
+        if self.loss_fn == "l1":
+            return diff.abs().mean(dim=1)
+        if self.loss_fn == "l2":
+            return (diff ** 2).mean(dim=1).sqrt()
+        raise ValueError(self.loss_fn)
+
+    def forward(
+        self,
+        flow_preds: List[torch.Tensor],   # list of (B, 2, H, W), full-res
+        flow_gt: torch.Tensor,            # (B, 2, H, W)
+        valid: torch.Tensor,              # (B, H, W)  0/1
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Returns dict with keys:
+            "loss"   – total weighted loss (scalar)
+            "epe"    – endpoint error at the *last* stage (for logging)
+        """
+        K = len(flow_preds)
+        total_loss = flow_gt.new_zeros(())
+
+        # Exclude GT-invalid and too-large-flow pixels
+        mag = (flow_gt ** 2).sum(dim=1).sqrt()   # (B, H, W)
+        valid_mask = valid.bool() & (mag < self.max_flow)
+
+        for k, pred in enumerate(flow_preds):
+            weight = self.gamma ** (K - k - 1)
+
+            # Upsample GT to match prediction resolution (should already match)
+            gt_k = flow_gt
+            if pred.shape[-2:] != flow_gt.shape[-2:]:
+                scale_h = pred.shape[-2] / flow_gt.shape[-2]
+                scale_w = pred.shape[-1] / flow_gt.shape[-1]
+                gt_k = F.interpolate(flow_gt, size=pred.shape[-2:],
+                                     mode="bilinear", align_corners=True)
+                gt_k[:, 0] *= scale_w
+                gt_k[:, 1] *= scale_h
+                vm = F.interpolate(
+                    valid_mask.float().unsqueeze(1),
+                    size=pred.shape[-2:], mode="nearest"
+                ).squeeze(1).bool()
+            else:
+                vm = valid_mask
+
+            loss_k = self._point_loss(pred, gt_k)    # (B, H, W)
+            if vm.any():
+                total_loss = total_loss + weight * loss_k[vm].mean()
+
+        # EPE at the final stage
+        epe = (flow_preds[-1] - flow_gt).pow(2).sum(dim=1).sqrt()
+        epe_mean = epe[valid_mask].mean() if valid_mask.any() else epe.mean()
+
+        return {"loss": total_loss, "epe": epe_mean}
+
+
+# ---------------------------------------------------------------------------
+# Photometric loss (self-supervised auxiliary)
+# ---------------------------------------------------------------------------
+
+class PhotometricLoss(nn.Module):
+    """
+    SSIM + L1 photometric consistency loss.
+    Useful for semi-supervised or self-supervised training.
+    """
+
+    def __init__(self, alpha: float = 0.85) -> None:
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(
+        self,
+        image1: torch.Tensor,   # (B, 3, H, W)
+        image2: torch.Tensor,   # (B, 3, H, W)
+        flow: torch.Tensor,     # (B, 2, H, W)
+    ) -> torch.Tensor:
+        from models.warp import backward_warp
+        warped = backward_warp(image2, flow)
+        l1 = (image1 - warped).abs().mean(dim=1, keepdim=True)
+        ssim_val = self._ssim(image1, warped)
+        return (self.alpha * ssim_val + (1 - self.alpha) * l1).mean()
+
+    @staticmethod
+    def _ssim(x: torch.Tensor, y: torch.Tensor,
+              window_size: int = 11) -> torch.Tensor:
+        """Simplified single-scale SSIM map."""
+        C1, C2 = 0.01 ** 2, 0.03 ** 2
+        mu_x = F.avg_pool2d(x, window_size, 1, window_size // 2)
+        mu_y = F.avg_pool2d(y, window_size, 1, window_size // 2)
+        mu_x2, mu_y2 = mu_x ** 2, mu_y ** 2
+        mu_xy = mu_x * mu_y
+        sig_x  = F.avg_pool2d(x * x, window_size, 1, window_size // 2) - mu_x2
+        sig_y  = F.avg_pool2d(y * y, window_size, 1, window_size // 2) - mu_y2
+        sig_xy = F.avg_pool2d(x * y, window_size, 1, window_size // 2) - mu_xy
+        num = (2 * mu_xy + C1) * (2 * sig_xy + C2)
+        den = (mu_x2 + mu_y2 + C1) * (sig_x + sig_y + C2)
+        return (1.0 - num / den.clamp_min(1e-8)) / 2.0
+
+
+# ---------------------------------------------------------------------------
+# Smoothness loss (auxiliary regularisation during training)
+# ---------------------------------------------------------------------------
+
+class SmoothnessLoss(nn.Module):
+    """First-order edge-aware spatial smoothness penalty."""
+
+    def __init__(self, order: int = 1, edge_weight: float = 150.0) -> None:
+        super().__init__()
+        assert order in (1, 2)
+        self.order       = order
+        self.edge_weight = edge_weight
+
+    def forward(
+        self,
+        flow: torch.Tensor,   # (B, 2, H, W)
+        image: torch.Tensor,  # (B, 3, H, W)  for edge weighting
+    ) -> torch.Tensor:
+        if self.order == 1:
+            return self._first_order(flow, image)
+        return self._second_order(flow, image)
+
+    def _first_order(self, flow, image):
+        dx_flow = (flow[:, :, :, 1:] - flow[:, :, :, :-1]).abs().sum(dim=1)
+        dy_flow = (flow[:, :, 1:] - flow[:, :, :-1, :]).abs().sum(dim=1)
+        dx_img  = (image[:, :, :, 1:] - image[:, :, :, :-1]).abs().mean(dim=1)
+        dy_img  = (image[:, :, 1:] - image[:, :, :-1, :]).abs().mean(dim=1)
+        wx = torch.exp(-self.edge_weight * dx_img)
+        wy = torch.exp(-self.edge_weight * dy_img)
+        return (wx * dx_flow).mean() + (wy * dy_flow).mean()
+
+    def _second_order(self, flow, image):
+        dxx = (flow[:, :, :, 2:] - 2 * flow[:, :, :, 1:-1] + flow[:, :, :, :-2]
+               ).abs().sum(dim=1)
+        dyy = (flow[:, :, 2:] - 2 * flow[:, :, 1:-1] + flow[:, :, :-2, :]
+               ).abs().sum(dim=1)
+        dx2_img = (image[:, :, :, 2:] - 2 * image[:, :, :, 1:-1] + image[:, :, :, :-2]
+                   ).abs().mean(dim=1)
+        dy2_img = (image[:, :, 2:] - 2 * image[:, :, 1:-1] + image[:, :, :-2, :]
+                   ).abs().mean(dim=1)
+        wx = torch.exp(-self.edge_weight * dx2_img)
+        wy = torch.exp(-self.edge_weight * dy2_img)
+        return (wx * dxx).mean() + (wy * dyy).mean()
+
+
+# ---------------------------------------------------------------------------
+# Combined loss
+# ---------------------------------------------------------------------------
+
+class HQSFlowLoss(nn.Module):
+    """
+    Master loss: SequenceLoss + optional auxiliary terms.
+
+    cfg fields:
+        gamma:             float (default 0.85)
+        max_flow:          float (default 400)
+        loss_fn:           str   (default "charbonnier")
+        smooth_weight:     float (default 0.0)
+        photo_weight:      float (default 0.0)
+    """
+
+    def __init__(self, cfg) -> None:
+        super().__init__()
+        self.seq_loss = SequenceLoss(
+            gamma=cfg.get("gamma", 0.85),
+            max_flow=cfg.get("max_flow", 400.0),
+            loss_fn=cfg.get("loss_fn", "charbonnier"),
+        )
+        self.smooth_weight = cfg.get("smooth_weight", 0.0)
+        self.photo_weight  = cfg.get("photo_weight",  0.0)
+
+        if self.smooth_weight > 0:
+            self.smooth_loss = SmoothnessLoss()
+        if self.photo_weight > 0:
+            self.photo_loss = PhotometricLoss()
+
+    def forward(
+        self,
+        flow_preds: List[torch.Tensor],
+        flow_gt: torch.Tensor,
+        valid: torch.Tensor,
+        image1: Optional[torch.Tensor] = None,
+        image2: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        out = self.seq_loss(flow_preds, flow_gt, valid)
+        total = out["loss"]
+
+        if self.smooth_weight > 0 and image1 is not None:
+            s = self.smooth_loss(flow_preds[-1], image1)
+            out["smooth"] = s
+            total = total + self.smooth_weight * s
+
+        if self.photo_weight > 0 and image1 is not None and image2 is not None:
+            p = self.photo_loss(image1, image2, flow_preds[-1])
+            out["photo"] = p
+            total = total + self.photo_weight * p
+
+        out["loss"] = total
+        return out

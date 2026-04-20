@@ -1,0 +1,7 @@
+# Ablation: 4 HQS stages (vs default 12)
+defaults:
+  - ../default
+
+run_name: ablate_stages_04
+model:
+  num_stages: 4
