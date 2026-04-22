@@ -5,6 +5,7 @@ import io
 import struct
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 
 def read_flow(path: str) -> np.ndarray:
@@ -50,3 +51,36 @@ def _read_pfm(path: str) -> np.ndarray:
 def flow_to_tensor(flow: np.ndarray) -> torch.Tensor:
     """(H, W, 2) → (2, H, W) float32 tensor."""
     return torch.from_numpy(flow.transpose(2, 0, 1).copy()).float()
+
+
+class InputPadder:
+    """Pad BCHW tensors so H and W are divisible by a given stride."""
+
+    def __init__(self, shape, divisor: int = 8) -> None:
+        if len(shape) < 4:
+            raise ValueError(f"Expected BCHW shape, got {shape}")
+
+        h, w = shape[-2], shape[-1]
+        pad_h = (divisor - (h % divisor)) % divisor
+        pad_w = (divisor - (w % divisor)) % divisor
+
+        self._top = pad_h // 2
+        self._bottom = pad_h - self._top
+        self._left = pad_w // 2
+        self._right = pad_w - self._left
+        self._h = h
+        self._w = w
+
+    def pad(self, *inputs: torch.Tensor):
+        """Replicate-pad one or more BCHW tensors."""
+        padded = [
+            F.pad(x, (self._left, self._right, self._top, self._bottom), mode="replicate")
+            for x in inputs
+        ]
+        if len(padded) == 1:
+            return padded[0]
+        return padded
+
+    def unpad(self, x: torch.Tensor) -> torch.Tensor:
+        """Crop tensor back to the original unpadded spatial size."""
+        return x[..., self._top:self._top + self._h, self._left:self._left + self._w]

@@ -36,7 +36,7 @@ except ImportError:
 from models import build_model
 from losses import HQSFlowLoss
 from data import build_dataset, build_dataloader
-from utils import compute_metrics, aggregate_metrics, flow_to_color
+from utils import compute_metrics, aggregate_metrics, flow_to_color, InputPadder
 
 logger = logging.getLogger(__name__)
 
@@ -390,13 +390,25 @@ class Trainer:
                 val_metrics = self._validate()
                 if val_metrics:
                     epe = val_metrics.get("epe", math.inf)
-                    if epe < self.history.best_epe:
+                    is_best = epe < self.history.best_epe
+                    if is_best:
                         self.history.best_epe  = epe
                         self.history.best_step = self.global_step
                         self._save("best")
-                        logger.info(
-                            f"✓ New best EPE={epe:.4f} at step {self.global_step}"
-                        )
+                    # Surface val metrics in the epoch bar immediately
+                    def _fmtv(k, fmt=".3f"):
+                        v = val_metrics.get(k, float("nan"))
+                        return "nan" if math.isnan(v) else format(v, fmt)
+                    tag = " ★" if is_best else ""
+                    logger.info(
+                        f"✓ Val EPE={epe:.4f}  F1={_fmtv('f1')}%"
+                        f"  s0_10={_fmtv('s0_10')}  s10_40={_fmtv('s10_40')}"
+                        f"  s40+={_fmtv('s40_plus')}{tag}"
+                    )
+                    epoch_bar.set_postfix(
+                        val_epe=f"{epe:.4f}",
+                        best=f"{self.history.best_epe:.4f}",
+                    )
 
             # ── Periodic checkpoint ──────────────────────────────────────────
             if self.global_step % save_every == 0:
@@ -518,18 +530,29 @@ class Trainer:
                 img2  = batch["image2"].to(self.device, non_blocking=True)
                 flow  = batch["flow"].to(self.device, non_blocking=True)
                 valid = batch["valid"].to(self.device, non_blocking=True)
+                # occlusion mask is optional — None for datasets without masks
+                occ_batch = batch.get("occlusion")  # (B, H, W) tensor or None
+
+                padder = InputPadder(img1.shape, divisor=8)
+                img1, img2 = padder.pad(img1, img2)
 
                 with torch.autocast(device_type=self.device.type, enabled=self._use_amp):
                     out  = self.model(img1, img2)
-                pred = out["flow_preds"][-1]
+                pred = padder.unpad(out["flow_preds"][-1])
 
                 for b in range(img1.shape[0]):
-                    results.append(compute_metrics(pred[b], flow[b], valid[b]))
+                    occ = None
+                    if occ_batch is not None:
+                        occ = occ_batch[b].to(self.device)
+                    results.append(
+                        compute_metrics(pred[b], flow[b], valid[b], occ_mask=occ)
+                    )
 
         agg = aggregate_metrics(results)
         logger.info(
             f"  [Val step {self.global_step}] "
-            + "  ".join(f"{k}={v:.4f}" for k, v in agg.items())
+            + "  ".join(f"{k}={v:.4f}" for k, v in agg.items()
+                        if not math.isnan(v))
         )
         self.history.val_metrics.append({"step": self.global_step, **agg})
         self._log_scalars(agg, prefix="val")

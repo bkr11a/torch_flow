@@ -36,7 +36,7 @@ from omegaconf import OmegaConf
 
 from engine.trainer import get_device, amp_enabled
 from models import build_model
-from utils import compute_metrics, aggregate_metrics
+from utils import compute_metrics, aggregate_metrics, InputPadder
 from data import build_dataset, build_dataloader
 
 logging.basicConfig(
@@ -68,13 +68,20 @@ def evaluate_loader(
         img2  = batch["image2"].to(device, non_blocking=True)
         flow  = batch["flow"].to(device, non_blocking=True)
         valid = batch["valid"].to(device, non_blocking=True)
+        occ_batch = batch.get("occlusion")
+
+        padder = InputPadder(img1.shape, divisor=8)
+        img1, img2 = padder.pad(img1, img2)
 
         with torch.autocast(device_type=device.type, enabled=use_amp):
             out = model(img1, img2)
-        pred = out["flow_preds"][-1]
+        pred = padder.unpad(out["flow_preds"][-1])
 
         for b in range(pred.shape[0]):
-            records.append(compute_metrics(pred[b], flow[b], valid[b]))
+            occ = None
+            if occ_batch is not None:
+                occ = occ_batch[b].to(device)
+            records.append(compute_metrics(pred[b], flow[b], valid[b], occ_mask=occ))
 
     agg = aggregate_metrics(records)
     logger.info(

@@ -44,6 +44,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
+from utils import InputPadder
 
 logger = logging.getLogger("verify")
 
@@ -122,12 +123,16 @@ def run_model(
     x1 = img1.unsqueeze(0).to(device)
     x2 = img2.unsqueeze(0).to(device)
 
+    padder = InputPadder(x1.shape, divisor=8)
+    x1, x2 = padder.pad(x1, x2)
+
     model.eval()
     out = model(x1, x2)
+    flow_preds = [padder.unpad(f) for f in out["flow_preds"]]
 
     return {
-        "flow_pred":  out["flow_preds"][-1][0].cpu(),
-        "flow_preds": [f[0].cpu() for f in out["flow_preds"]],
+        "flow_pred":  flow_preds[-1][0].cpu(),
+        "flow_preds": [f[0].cpu() for f in flow_preds],
     }
 
 
