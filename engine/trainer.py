@@ -372,6 +372,13 @@ class Trainer:
                     "s40+":    _fmt("s40_plus"),
                     "lr":      f"{lr:.2e}",
                 }
+                # Add auxiliary losses if present
+                if "smooth" in rm:
+                    postfix["smooth"] = _fmt("smooth", ".4f")
+                if "photo" in rm:
+                    postfix["photo"] = _fmt("photo", ".4f")
+                if "ofce" in rm:
+                    postfix["ofce"] = _fmt("ofce", ".4f")
                 batch_bar.set_postfix(**postfix)
                 batch_bar.update(1)
 

@@ -198,6 +198,77 @@ class SmoothnessLoss(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# OFCE Loss (Optical Flow Constraint Equation)
+# ---------------------------------------------------------------------------
+
+class OFCELoss(nn.Module):
+    """
+    Optical Flow Constraint Equation loss.
+    
+    Enforces the brightness constancy assumption:
+        I_t + ∇I · u = 0
+    
+    This encourages flow to satisfy the fundamental optical flow equation.
+    """
+
+    def __init__(self, weight: float = 1.0) -> None:
+        super().__init__()
+        self.weight = weight
+
+    def forward(
+        self,
+        image1: torch.Tensor,   # (B, 3, H, W) or (B, 1, H, W)
+        image2: torch.Tensor,   # (B, 3, H, W) or (B, 1, H, W)
+        flow: torch.Tensor,     # (B, 2, H, W)
+    ) -> torch.Tensor:
+        """
+        Compute OFCE loss.
+        
+        Args:
+            image1: Reference image
+            image2: Target image  
+            flow: Predicted optical flow [dx, dy]
+            
+        Returns:
+            Scalar loss value
+        """
+        # Compute temporal gradient I_t = I2 - I1
+        # Average across channels
+        if image1.shape[1] == 3:
+            i1 = image1.mean(dim=1, keepdim=True)
+            i2 = image2.mean(dim=1, keepdim=True)
+        else:
+            i1 = image1
+            i2 = image2
+        
+        i_t = i2 - i1  # (B, 1, H, W)
+
+        # Compute spatial gradients ∇I = [I_x, I_y]
+        kernel_x = torch.tensor(
+            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+            dtype=image1.dtype, device=image1.device
+        ).view(1, 1, 3, 3) / 8.0
+        
+        kernel_y = torch.tensor(
+            [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+            dtype=image1.dtype, device=image1.device
+        ).view(1, 1, 3, 3) / 8.0
+
+        i_x = F.conv2d(i1, kernel_x, padding=1)  # (B, 1, H, W)
+        i_y = F.conv2d(i1, kernel_y, padding=1)  # (B, 1, H, W)
+
+        # Extract flow components
+        u = flow[:, 0:1, :, :]  # dx (B, 1, H, W)
+        v = flow[:, 1:2, :, :]  # dy (B, 1, H, W)
+
+        # Compute OFCE residual: I_t + I_x * u + I_y * v
+        ofce_residual = i_t + i_x * u + i_y * v  # (B, 1, H, W)
+
+        # Return mean squared residual
+        return self.weight * (ofce_residual ** 2).mean()
+
+
+# ---------------------------------------------------------------------------
 # Combined loss
 # ---------------------------------------------------------------------------
 
@@ -211,6 +282,7 @@ class HQSFlowLoss(nn.Module):
         loss_fn:           str   (default "charbonnier")
         smooth_weight:     float (default 0.0)
         photo_weight:      float (default 0.0)
+        ofce_weight:       float (default 0.0)
     """
 
     def __init__(self, cfg) -> None:
@@ -222,11 +294,14 @@ class HQSFlowLoss(nn.Module):
         )
         self.smooth_weight = cfg.get("smooth_weight", 0.0)
         self.photo_weight  = cfg.get("photo_weight",  0.0)
+        self.ofce_weight   = cfg.get("ofce_weight",   0.0)
 
         if self.smooth_weight > 0:
             self.smooth_loss = SmoothnessLoss()
         if self.photo_weight > 0:
             self.photo_loss = PhotometricLoss()
+        if self.ofce_weight > 0:
+            self.ofce_loss = OFCELoss()
 
     def forward(
         self,
@@ -248,6 +323,11 @@ class HQSFlowLoss(nn.Module):
             p = self.photo_loss(image1, image2, flow_preds[-1])
             out["photo"] = p
             total = total + self.photo_weight * p
+
+        if self.ofce_weight > 0 and image1 is not None and image2 is not None:
+            o = self.ofce_loss(image1, image2, flow_preds[-1])
+            out["ofce"] = o
+            total = total + self.ofce_weight * o
 
         out["loss"] = total
         return out

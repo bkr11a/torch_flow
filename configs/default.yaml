@@ -57,6 +57,7 @@ loss:
   loss_fn: charbonnier            # "charbonnier" | "l1" | "l2"
   smooth_weight: 0.0
   photo_weight: 0.0
+  ofce_weight: 0.0                # Optical Flow Constraint Equation loss
 
 # ── Training ──────────────────────────────────────────────────────────────
 training:
