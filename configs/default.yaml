@@ -74,7 +74,7 @@ training:
 # ── Data ──────────────────────────────────────────────────────────────────
 data:
   name: chairs                   # "chairs" | "things" | "sintel" | "spring" | "kitti"
-  root: /data/FlyingChairs
+  root: ./data/benchmark_data/FlyingChairs_release
   batch_size: 6
   num_workers: 4
   crop_size: [368, 496]
@@ -84,7 +84,7 @@ data:
 
 val_data:
   name: chairs
-  root: /data/FlyingChairs
+  root: ./data/benchmark_data/FlyingChairs_release
   batch_size: 4
   num_workers: 2
   crop_size: [368, 496]
