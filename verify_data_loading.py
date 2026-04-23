@@ -10,6 +10,7 @@ import os
 import sys
 
 # PyPI packages
+import cv2
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -21,7 +22,7 @@ from omegaconf import OmegaConf
 # Custom modules
 from models import build_model
 from data import build_dataset, SintelDataset
-from utils import flow_to_color
+from utils import flow_to_color, flow_to_hsv
 
 # ---------------------------------------------------------------------------
 
@@ -54,7 +55,7 @@ def load_and_verify_flyingchairs():
     axes[1].imshow(sample['image2'])
     axes[1].set_title("Image 2")
     axes[1].axis('off')
-    axes[2].imshow(flow_to_color(flow))
+    axes[2].imshow(cv2.cvtColor(flow_to_hsv(flow), cv2.COLOR_BGR2RGB))
     axes[2].set_title("Flow (HSV)")
     axes[2].axis('off')
     axes[3].imshow(valid, cmap='gray')
@@ -83,7 +84,7 @@ def load_and_verify_flyingchairs():
     axes[1].imshow(sample_val['image2'])
     axes[1].set_title("Val Image 2")
     axes[1].axis('off')
-    axes[2].imshow(flow_to_color(flow_val))
+    axes[2].imshow(cv2.cvtColor(flow_to_hsv(flow_val), cv2.COLOR_BGR2RGB))
     axes[2].set_title("Val Flow (HSV)")
     axes[2].axis('off')
     axes[3].imshow(valid_val, cmap='gray')
@@ -118,7 +119,7 @@ def load_and_verify_sintel():
         axes[0, 1].imshow(sample['image2'])
         axes[0, 1].set_title("Image 2")
         axes[0, 1].axis('off')
-        axes[1, 0].imshow(flow_to_color(flow))
+        axes[1, 0].imshow(cv2.cvtColor(flow_to_hsv(flow), cv2.COLOR_BGR2RGB))
         axes[1, 0].set_title("Flow (HSV)")
         axes[1, 0].axis('off')
         axes[1, 1].imshow(valid, cmap='gray')
@@ -155,7 +156,7 @@ def load_and_verify_sintel():
         axes[0, 1].imshow(sample_val['image2'])
         axes[0, 1].set_title("Val Image 2")
         axes[0, 1].axis('off')
-        axes[1, 0].imshow(flow_to_color(flow_val))
+        axes[1, 0].imshow(cv2.cvtColor(flow_to_hsv(flow_val), cv2.COLOR_BGR2RGB))
         axes[1, 0].set_title("Val Flow (HSV)")
         axes[1, 0].axis('off')
         axes[1, 1].imshow(valid_val, cmap='gray')
