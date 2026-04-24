@@ -26,6 +26,7 @@ import torch.optim as optim
 import numpy as np
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from omegaconf import OmegaConf
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -33,12 +34,44 @@ try:
 except ImportError:
     _TB_AVAILABLE = False
 
+try:
+    import mlflow
+    import mlflow.pytorch
+    from mlflow.tracking import MlflowClient
+    _MLFLOW_AVAILABLE = True
+except Exception:
+    _MLFLOW_AVAILABLE = False
+
 from models import build_model
 from losses import HQSFlowLoss
 from data import build_dataset, build_dataloader
 from utils import compute_metrics, aggregate_metrics, flow_to_color, InputPadder
 
 logger = logging.getLogger(__name__)
+
+
+def _flatten_dict(d, parent_key: str = "", sep: str = ".") -> Dict[str, object]:
+    items: Dict[str, object] = {}
+    for k, v in d.items():
+        new_key = f"{parent_key}{sep}{k}" if parent_key else str(k)
+        if isinstance(v, dict):
+            items.update(_flatten_dict(v, new_key, sep=sep))
+        else:
+            items[new_key] = v
+    return items
+
+
+def _sanitize_metric_dict(d: Dict[str, object]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for k, v in d.items():
+        try:
+            fv = float(v)
+            if math.isnan(fv) or math.isinf(fv):
+                continue
+            out[k] = fv
+        except Exception:
+            continue
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +311,15 @@ class Trainer:
                 config=dict(cfg),
             )
 
+        # ── MLflow ───────────────────────────────────────────────────────────
+        self.use_mlflow = bool(cfg.get("mlflow", {}).get("enabled", False))
+        self.mlflow_run = None
+        self.mlflow_run_id: Optional[str] = None
+        self.mlflow_client: Optional["MlflowClient"] = None
+        self.best_model_uri: Optional[str] = None
+        if self.use_mlflow:
+            self._init_mlflow()
+
         # ── State ─────────────────────────────────────────────────────────────
         self.global_step = 0
         self.history = TrainingHistory(
@@ -310,170 +352,118 @@ class Trainer:
         save_every = cfg.training.get("save_every", 10000)
         steps_left = num_steps - self.global_step
 
-        if steps_left <= 0:
-            logger.info("Already at target step count — nothing to do.")
-            return
+        try:
+            if steps_left <= 0:
+                logger.info("Already at target step count — nothing to do.")
+                self._mlflow_end_run("FINISHED")
+                return
 
-        self.model.train()
-        loader_iter     = iter(self._infinite_loader(self.train_loader))
-        steps_per_epoch = len(self.train_loader)
+            self.model.train()
+            loader_iter     = iter(self._infinite_loader(self.train_loader))
+            steps_per_epoch = len(self.train_loader)
 
-        # ── Epoch-level progress bar ─────────────────────────────────────────
-        total_epochs = math.ceil(steps_left / steps_per_epoch)
-        epoch_bar = tqdm(
-            total=total_epochs,
-            desc="Epochs",
-            unit="ep",
-            position=0,
-            leave=True,
-            ncols=300,
-        )
+            # ── Epoch-level progress bar ─────────────────────────────────────
+            total_epochs = math.ceil(steps_left / steps_per_epoch)
+            epoch_bar = tqdm(
+                total=total_epochs,
+                desc="Epochs",
+                unit="ep",
+                position=0,
+                leave=True,
+                ncols=300,
+            )
 
-        epoch_idx    = 0
-        steps_in_ep  = 0
-        batch_bar: Optional[tqdm] = None
-        t_epoch      = time.time()
-        running      = RunningMean()
+            epoch_idx    = 0
+            steps_in_ep  = 0
+            batch_bar: Optional[tqdm] = None
+            t_epoch      = time.time()
+            running      = RunningMean()
 
-        while self.global_step < num_steps:
-            validated_this_step = False
-            # Create batch bar at the start of each epoch
-            if steps_in_ep == 0:
-                batch_bar = tqdm(
-                    total=min(steps_per_epoch, num_steps - self.global_step),
-                    desc=f"  Epoch {epoch_idx + 1}",
-                    unit="batch",
-                    position=1,
-                    leave=False,
-                    ncols=300,
-                )
-                running.reset()
-                t_epoch = time.time()
-
-            t_batch    = time.time()
-            batch      = next(loader_iter)
-            loss_dict  = self._train_step(batch)
-
-            running.update(loss_dict)
-
-            self.global_step += 1
-            steps_in_ep += 1
-
-            # ── Update batch bar with running means ──────────────────────────
-            lr = self.optimizer.param_groups[0]["lr"]
-            if batch_bar is not None:
-                rm = running.mean()
-                def _fmt(k, fmt=".3f"):
-                    v = rm.get(k, float("nan"))
-                    return "nan" if math.isnan(v) else format(v, fmt)
-                def _fmt_cur(k, fmt=".3f"):
-                    v = loss_dict.get(k, float("nan"))
-                    return "nan" if math.isnan(v) else format(v, fmt)
-                postfix: Dict[str, str] = {
-                    "curr_loss": f"{loss_dict['loss']:.4f}",
-                    "curr_epe_all": _fmt_cur("epe_all"),
-                    "loss":    f"{rm['loss']:.4f}",
-                    "epe_m":   _fmt("epe_matched"),
-                    "epe_u":   _fmt("epe_unmatched"),
-                    "epe_all": _fmt("epe_all"),
-                    "f1":      _fmt("f1"),
-                    "s0_10":   _fmt("s0_10"),
-                    "s10_40":  _fmt("s10_40"),
-                    "s40+":    _fmt("s40_plus"),
-                    "lr":      f"{lr:.2e}",
-                }
-                postfix["smooth"] = _fmt("smooth", ".4f")
-                postfix["photo"] = _fmt("photo", ".4f")
-                postfix["ofce"] = _fmt("ofce", ".4f")
-                batch_bar.set_postfix(**postfix)
-                batch_bar.update(1)
-
-            # ── Log scalars ──────────────────────────────────────────────────
-            if self.global_step % log_every == 0:
-                self.history.train_loss.append((self.global_step, loss_dict["loss"]))
-                self.history.train_epe.append( (self.global_step, loss_dict["epe"]))
-                self._log_scalars(
-                    {k: v for k, v in loss_dict.items()},
-                    prefix="train",
-                )
-                self._log_scalars({"lr": lr}, prefix="train")
-
-            # ── Validation ───────────────────────────────────────────────────
-            if self.global_step % val_every == 0:
-                val_metrics = self._validate()
-                if val_metrics:
-                    epe = val_metrics.get("epe", math.inf)
-                    is_best = epe < self.history.best_epe
-                    if is_best:
-                        self.history.best_epe  = epe
-                        self.history.best_step = self.global_step
-                        self._save("best")
-                    # Surface val metrics in the epoch bar immediately
-                    def _fmtv(k, fmt=".3f"):
-                        v = val_metrics.get(k, float("nan"))
-                        return "nan" if math.isnan(v) else format(v, fmt)
-                    tag = " ★" if is_best else ""
-                    logger.info(
-                        f"✓ Val EPE={epe:.4f}  F1={_fmtv('f1')}%"
-                        f"  epe_m={_fmtv('epe_matched')}"
-                        f"  epe_u={_fmtv('epe_unmatched')}"
-                        f"  epe_all={_fmtv('epe_all')}"
-                        f"  s0_10={_fmtv('s0_10')}  s10_40={_fmtv('s10_40')}"
-                        f"  s40+={_fmtv('s40_plus')}{tag}"
+            while self.global_step < num_steps:
+                validated_this_step = False
+                # Create batch bar at the start of each epoch
+                if steps_in_ep == 0:
+                    batch_bar = tqdm(
+                        total=min(steps_per_epoch, num_steps - self.global_step),
+                        desc=f"  Epoch {epoch_idx + 1}",
+                        unit="batch",
+                        position=1,
+                        leave=False,
+                        ncols=300,
                     )
-                    epoch_bar.set_postfix(
-                        val_epe=f"{epe:.4f}",
-                        best=f"{self.history.best_epe:.4f}",
-                    )
-                    validated_this_step = True
+                    running.reset()
+                    t_epoch = time.time()
 
-            # ── Periodic checkpoint ──────────────────────────────────────────
-            if self.global_step % save_every == 0:
-                self._save(f"step_{self.global_step:07d}")
+                batch      = next(loader_iter)
+                loss_dict  = self._train_step(batch)
 
-            # ── Epoch boundary ───────────────────────────────────────────────
-            if steps_in_ep >= steps_per_epoch:
+                running.update(loss_dict)
+
+                self.global_step += 1
+                steps_in_ep += 1
+
+                # ── Update batch bar with running means ──────────────────────
+                lr = self.optimizer.param_groups[0]["lr"]
                 if batch_bar is not None:
-                    batch_bar.close()
-                    batch_bar = None
-                elapsed = time.time() - t_epoch
-                rm = running.mean()
-                def _fmt(k, fmt=".3f"):
-                    v = rm.get(k, float("nan"))
-                    return "nan" if math.isnan(v) else format(v, fmt)
-                epoch_bar.set_postfix(
-                    loss=f"{rm['loss']:.4f}",
-                    epe_m=_fmt("epe_matched"),
-                    epe_u=_fmt("epe_unmatched"),
-                    epe_all=_fmt("epe_all"),
-                    f1=_fmt("f1"),
-                    s0_10=_fmt("s0_10"),
-                    s10_40=_fmt("s10_40"),
-                    **{"s40+": _fmt("s40_plus")},
-                    smooth=_fmt("smooth", ".4f"),
-                    photo=_fmt("photo", ".4f"),
-                    ofce=_fmt("ofce", ".4f"),
-                    best_epe=f"{self.history.best_epe:.4f}",
-                    t=f"{elapsed:.0f}s",
-                )
-                epoch_bar.update(1)
+                    rm = running.mean()
 
-                # Always run validation at epoch end (once per step maximum).
-                if self._has_val and not validated_this_step:
+                    def _fmt(k, fmt=".3f"):
+                        v = rm.get(k, float("nan"))
+                        return "nan" if math.isnan(v) else format(v, fmt)
+
+                    def _fmt_cur(k, fmt=".3f"):
+                        v = loss_dict.get(k, float("nan"))
+                        return "nan" if math.isnan(v) else format(v, fmt)
+
+                    postfix: Dict[str, str] = {
+                        "curr_loss": f"{loss_dict['loss']:.4f}",
+                        "curr_epe_all": _fmt_cur("epe_all"),
+                        "loss":    f"{rm['loss']:.4f}",
+                        "epe_m":   _fmt("epe_matched"),
+                        "epe_u":   _fmt("epe_unmatched"),
+                        "epe_all": _fmt("epe_all"),
+                        "f1":      _fmt("f1"),
+                        "s0_10":   _fmt("s0_10"),
+                        "s10_40":  _fmt("s10_40"),
+                        "s40+":    _fmt("s40_plus"),
+                        "lr":      f"{lr:.2e}",
+                    }
+                    postfix["smooth"] = _fmt("smooth", ".4f")
+                    postfix["photo"] = _fmt("photo", ".4f")
+                    postfix["ofce"] = _fmt("ofce", ".4f")
+                    batch_bar.set_postfix(**postfix)
+                    batch_bar.update(1)
+
+                # ── Log scalars ──────────────────────────────────────────────
+                if self.global_step % log_every == 0:
+                    self.history.train_loss.append((self.global_step, loss_dict["loss"]))
+                    self.history.train_epe.append((self.global_step, loss_dict["epe"]))
+                    self._log_scalars(
+                        {k: v for k, v in loss_dict.items()},
+                        prefix="train",
+                    )
+                    self._log_scalars({"lr": lr}, prefix="train")
+
+                # ── Validation ───────────────────────────────────────────────
+                if self.global_step % val_every == 0:
                     val_metrics = self._validate()
                     if val_metrics:
                         epe = val_metrics.get("epe", math.inf)
                         is_best = epe < self.history.best_epe
                         if is_best:
-                            self.history.best_epe = epe
+                            self.history.best_epe  = epe
                             self.history.best_step = self.global_step
                             self._save("best")
+                            self._mlflow_log_best_model_and_register()
+
+                        # Surface val metrics in the epoch bar immediately
                         def _fmtv(k, fmt=".3f"):
                             v = val_metrics.get(k, float("nan"))
                             return "nan" if math.isnan(v) else format(v, fmt)
+
                         tag = " ★" if is_best else ""
                         logger.info(
-                            f"✓ [Epoch-end] Val EPE={epe:.4f}  F1={_fmtv('f1')}%"
+                            f"✓ Val EPE={epe:.4f}  F1={_fmtv('f1')}%"
                             f"  epe_m={_fmtv('epe_matched')}"
                             f"  epe_u={_fmtv('epe_unmatched')}"
                             f"  epe_all={_fmtv('epe_all')}"
@@ -484,30 +474,99 @@ class Trainer:
                             val_epe=f"{epe:.4f}",
                             best=f"{self.history.best_epe:.4f}",
                         )
+                        validated_this_step = True
 
-                epoch_idx   += 1
-                steps_in_ep  = 0
+                # ── Periodic checkpoint ──────────────────────────────────────
+                if self.global_step % save_every == 0:
+                    self._save(f"step_{self.global_step:07d}")
 
-        # Close any open batch bar at end of training
-        if batch_bar is not None:
-            batch_bar.close()
-        epoch_bar.close()
+                # ── Epoch boundary ───────────────────────────────────────────
+                if steps_in_ep >= steps_per_epoch:
+                    if batch_bar is not None:
+                        batch_bar.close()
+                        batch_bar = None
+                    elapsed = time.time() - t_epoch
+                    rm = running.mean()
 
-        # ── Final saves ──────────────────────────────────────────────────────
-        self._save("last")
-        history_path = os.path.join(self.ckpt_dir, self.run_name, "history.json")
-        self.history.to_json(history_path)
-        logger.info(f"Training history → {history_path}")
-        logger.info(
-            f"Training complete. "
-            f"Best EPE={self.history.best_epe:.4f} @ step {self.history.best_step}."
-        )
+                    def _fmt(k, fmt=".3f"):
+                        v = rm.get(k, float("nan"))
+                        return "nan" if math.isnan(v) else format(v, fmt)
 
-        if self.writer:
-            self.writer.close()
-        if self.use_wandb:
-            import wandb
-            wandb.finish()
+                    epoch_bar.set_postfix(
+                        loss=f"{rm['loss']:.4f}",
+                        epe_m=_fmt("epe_matched"),
+                        epe_u=_fmt("epe_unmatched"),
+                        epe_all=_fmt("epe_all"),
+                        f1=_fmt("f1"),
+                        s0_10=_fmt("s0_10"),
+                        s10_40=_fmt("s10_40"),
+                        **{"s40+": _fmt("s40_plus")},
+                        smooth=_fmt("smooth", ".4f"),
+                        photo=_fmt("photo", ".4f"),
+                        ofce=_fmt("ofce", ".4f"),
+                        best_epe=f"{self.history.best_epe:.4f}",
+                        t=f"{elapsed:.0f}s",
+                    )
+                    epoch_bar.update(1)
+
+                    # Always run validation at epoch end (once per step maximum).
+                    if self._has_val and not validated_this_step:
+                        val_metrics = self._validate()
+                        if val_metrics:
+                            epe = val_metrics.get("epe", math.inf)
+                            is_best = epe < self.history.best_epe
+                            if is_best:
+                                self.history.best_epe = epe
+                                self.history.best_step = self.global_step
+                                self._save("best")
+                                self._mlflow_log_best_model_and_register()
+
+                            def _fmtv(k, fmt=".3f"):
+                                v = val_metrics.get(k, float("nan"))
+                                return "nan" if math.isnan(v) else format(v, fmt)
+
+                            tag = " ★" if is_best else ""
+                            logger.info(
+                                f"✓ [Epoch-end] Val EPE={epe:.4f}  F1={_fmtv('f1')}%"
+                                f"  epe_m={_fmtv('epe_matched')}"
+                                f"  epe_u={_fmtv('epe_unmatched')}"
+                                f"  epe_all={_fmtv('epe_all')}"
+                                f"  s0_10={_fmtv('s0_10')}  s10_40={_fmtv('s10_40')}"
+                                f"  s40+={_fmtv('s40_plus')}{tag}"
+                            )
+                            epoch_bar.set_postfix(
+                                val_epe=f"{epe:.4f}",
+                                best=f"{self.history.best_epe:.4f}",
+                            )
+
+                    epoch_idx += 1
+                    steps_in_ep = 0
+
+            # Close any open batch bar at end of training
+            if batch_bar is not None:
+                batch_bar.close()
+            epoch_bar.close()
+
+            # ── Final saves ──────────────────────────────────────────────────
+            self._save("last")
+            history_path = os.path.join(self.ckpt_dir, self.run_name, "history.json")
+            self.history.to_json(history_path)
+            logger.info(f"Training history → {history_path}")
+            logger.info(
+                f"Training complete. "
+                f"Best EPE={self.history.best_epe:.4f} @ step {self.history.best_step}."
+            )
+            self._log_final_mlflow_artifacts(history_path)
+            self._mlflow_end_run("FINISHED")
+        except Exception:
+            self._mlflow_end_run("FAILED")
+            raise
+        finally:
+            if self.writer:
+                self.writer.close()
+            if self.use_wandb:
+                import wandb
+                wandb.finish()
 
     # ─────────────────────────────────────────────────────────────────────── #
     # Single training step
@@ -644,6 +703,7 @@ class Trainer:
             self.model, self.optimizer, self.scaler, self.scheduler,
             self.global_step, self.history, self.cfg, tag=tag,
         )
+        self._mlflow_log_checkpoint(path, tag)
 
     def _log_scalars(self, d: Dict, prefix: str) -> None:
         if self.writer:
@@ -653,6 +713,176 @@ class Trainer:
             import wandb
             wandb.log({f"{prefix}/{k}": v for k, v in d.items()},
                       step=self.global_step)
+        if self.use_mlflow and self.mlflow_run_id:
+            metrics = _sanitize_metric_dict({f"{prefix}/{k}": v for k, v in d.items()})
+            if metrics:
+                self._mlflow_safe(
+                    f"log_metrics_{prefix}",
+                    lambda: mlflow.log_metrics(metrics, step=self.global_step),
+                )
+
+    def _mlflow_safe(self, fn_name: str, fn):
+        try:
+            return fn()
+        except Exception as exc:
+            strict = bool(self.cfg.get("mlflow", {}).get("strict", False))
+            logger.exception(f"MLflow error during {fn_name}: {exc}")
+            if strict:
+                raise
+            return None
+
+    def _init_mlflow(self) -> None:
+        if not _MLFLOW_AVAILABLE:
+            raise RuntimeError("mlflow is not installed. Add mlflow to requirements.")
+
+        mcfg = self.cfg.get("mlflow", {})
+        tracking_uri = mcfg.get("tracking_uri", None)
+        if tracking_uri:
+            mlflow.set_tracking_uri(tracking_uri)
+
+        if mcfg.get("insecure_tls", False):
+            os.environ["MLFLOW_TRACKING_INSECURE_TLS"] = "true"
+
+        exp_name = mcfg.get("experiment_name", "torch_flow")
+        self._mlflow_safe("set_experiment", lambda: mlflow.set_experiment(exp_name))
+
+        tags = {
+            "run_name": self.run_name,
+            "device": str(self.device),
+        }
+        extra_tags = mcfg.get("tags", {})
+        if isinstance(extra_tags, dict):
+            tags.update({str(k): str(v) for k, v in extra_tags.items()})
+
+        self.mlflow_run = self._mlflow_safe(
+            "start_run",
+            lambda: mlflow.start_run(run_name=self.run_name, tags=tags),
+        )
+        if self.mlflow_run is None:
+            return
+
+        self.mlflow_run_id = self.mlflow_run.info.run_id
+        self.mlflow_client = MlflowClient()
+
+        cfg_dict = OmegaConf.to_container(self.cfg, resolve=True)
+        flat_cfg = _flatten_dict(cfg_dict)
+        params = {k: str(v)[:500] for k, v in flat_cfg.items()}
+
+        def _log_params_chunked() -> None:
+            keys = list(params.keys())
+            chunk_size = 100
+            for i in range(0, len(keys), chunk_size):
+                chunk = {k: params[k] for k in keys[i:i + chunk_size]}
+                mlflow.log_params(chunk)
+
+        self._mlflow_safe("log_params", _log_params_chunked)
+
+        run_dir = os.path.join(self.ckpt_dir, self.run_name)
+        os.makedirs(run_dir, exist_ok=True)
+        cfg_path = os.path.join(run_dir, "resolved_config.yaml")
+        with open(cfg_path, "w") as f:
+            f.write(OmegaConf.to_yaml(self.cfg, resolve=True))
+        self._mlflow_safe(
+            "log_resolved_config",
+            lambda: mlflow.log_artifact(cfg_path, artifact_path="config"),
+        )
+
+        counts = self.model.param_count()
+        self._mlflow_safe(
+            "log_param_counts",
+            lambda: mlflow.log_params(
+                {
+                    "model.feature_encoder_params": counts["feature_encoder"],
+                    "model.context_encoder_params": counts["context_encoder"],
+                    "model.stages_params": counts["stages"],
+                    "model.total_params": counts["total"],
+                }
+            ),
+        )
+
+    def _mlflow_log_checkpoint(self, path: str, tag: str) -> None:
+        if not (self.use_mlflow and self.mlflow_run_id):
+            return
+        if not bool(self.cfg.get("mlflow", {}).get("log_checkpoints", True)):
+            return
+        self._mlflow_safe(
+            f"log_checkpoint_{tag}",
+            lambda: mlflow.log_artifact(path, artifact_path="checkpoints"),
+        )
+
+    def _mlflow_log_best_model_and_register(self) -> None:
+        if not (self.use_mlflow and self.mlflow_run_id):
+            return
+
+        artifact_path = f"models/best_step_{self.global_step:07d}"
+        model_info = self._mlflow_safe(
+            "log_best_model",
+            lambda: mlflow.pytorch.log_model(
+                pytorch_model=self.model,
+                artifact_path=artifact_path,
+            ),
+        )
+        if model_info is None:
+            return
+
+        self.best_model_uri = model_info.model_uri
+
+        mcfg = self.cfg.get("mlflow", {})
+        if not bool(mcfg.get("register_best", True)):
+            return
+        model_name = mcfg.get("registered_model_name", None)
+        if not model_name:
+            return
+
+        mv = self._mlflow_safe(
+            "register_best_model",
+            lambda: mlflow.register_model(model_uri=model_info.model_uri, name=model_name),
+        )
+        if mv is None:
+            return
+
+        alias = mcfg.get("best_alias", "best")
+        if self.mlflow_client is not None and alias:
+            self._mlflow_safe(
+                "set_best_alias",
+                lambda: self.mlflow_client.set_registered_model_alias(model_name, alias, mv.version),
+            )
+
+    def _log_final_mlflow_artifacts(self, history_path: str) -> None:
+        if not (self.use_mlflow and self.mlflow_run_id):
+            return
+
+        self._mlflow_safe(
+            "log_history_artifact",
+            lambda: mlflow.log_artifact(history_path, artifact_path="history"),
+        )
+
+        if bool(self.cfg.get("mlflow", {}).get("log_tensorboard", True)):
+            tb_dir = os.path.join(self.log_dir, self.run_name)
+            if os.path.isdir(tb_dir):
+                self._mlflow_safe(
+                    "log_tensorboard_artifacts",
+                    lambda: mlflow.log_artifacts(tb_dir, artifact_path="tensorboard"),
+                )
+
+        self._mlflow_safe(
+            "log_summary_metrics",
+            lambda: mlflow.log_metrics(
+                {
+                    "summary/best_epe": float(self.history.best_epe),
+                    "summary/best_step": float(self.history.best_step),
+                    "summary/final_step": float(self.global_step),
+                },
+                step=self.global_step,
+            ),
+        )
+
+    def _mlflow_end_run(self, status: str) -> None:
+        if not (self.use_mlflow and self.mlflow_run_id):
+            return
+        self._mlflow_safe("end_run", lambda: mlflow.end_run(status=status))
+        self.mlflow_run_id = None
+        self.mlflow_run = None
 
     @staticmethod
     def _infinite_loader(loader: DataLoader):

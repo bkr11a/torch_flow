@@ -9,6 +9,21 @@ checkpoint_dir: checkpoints
 use_wandb: false
 wandb_project: hqs_flow
 
+mlflow:
+  enabled: false
+  tracking_uri: "https://mlflow.spicedrice.home/"
+  experiment_name: "torch_flow"
+  insecure_tls: true
+  strict: false
+  log_checkpoints: true
+  log_tensorboard: true
+  register_best: true
+  registered_model_name: "HQSFlowTFPort"
+  best_alias: "best"
+  tags:
+    project: "torch_flow"
+    framework: "pytorch"
+
 # ── Model ─────────────────────────────────────────────────────────────────
 model:
   num_stages: 12                  # K unrolled HQS iterations
