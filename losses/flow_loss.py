@@ -296,12 +296,11 @@ class HQSFlowLoss(nn.Module):
         self.photo_weight  = cfg.get("photo_weight",  0.0)
         self.ofce_weight   = cfg.get("ofce_weight",   0.0)
 
-        if self.smooth_weight > 0:
-            self.smooth_loss = SmoothnessLoss()
-        if self.photo_weight > 0:
-            self.photo_loss = PhotometricLoss()
-        if self.ofce_weight > 0:
-            self.ofce_loss = OFCELoss()
+        # Always instantiate auxiliary terms so we can report their values
+        # even when their weights are zero.
+        self.smooth_loss = SmoothnessLoss()
+        self.photo_loss = PhotometricLoss()
+        self.ofce_loss = OFCELoss()
 
     def forward(
         self,
@@ -313,21 +312,37 @@ class HQSFlowLoss(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         out = self.seq_loss(flow_preds, flow_gt, valid)
         total = out["loss"]
+        pred_final = flow_preds[-1]
 
-        if self.smooth_weight > 0 and image1 is not None:
-            s = self.smooth_loss(flow_preds[-1], image1)
+        if image1 is not None:
+            if self.smooth_weight > 0:
+                s = self.smooth_loss(pred_final, image1)
+            else:
+                with torch.no_grad():
+                    s = self.smooth_loss(pred_final.detach(), image1)
             out["smooth"] = s
-            total = total + self.smooth_weight * s
+            if self.smooth_weight > 0:
+                total = total + self.smooth_weight * s
 
-        if self.photo_weight > 0 and image1 is not None and image2 is not None:
-            p = self.photo_loss(image1, image2, flow_preds[-1])
+        if image1 is not None and image2 is not None:
+            if self.photo_weight > 0:
+                p = self.photo_loss(image1, image2, pred_final)
+            else:
+                with torch.no_grad():
+                    p = self.photo_loss(image1, image2, pred_final.detach())
             out["photo"] = p
-            total = total + self.photo_weight * p
+            if self.photo_weight > 0:
+                total = total + self.photo_weight * p
 
-        if self.ofce_weight > 0 and image1 is not None and image2 is not None:
-            o = self.ofce_loss(image1, image2, flow_preds[-1])
+        if image1 is not None and image2 is not None:
+            if self.ofce_weight > 0:
+                o = self.ofce_loss(image1, image2, pred_final)
+            else:
+                with torch.no_grad():
+                    o = self.ofce_loss(image1, image2, pred_final.detach())
             out["ofce"] = o
-            total = total + self.ofce_weight * o
+            if self.ofce_weight > 0:
+                total = total + self.ofce_weight * o
 
         out["loss"] = total
         return out

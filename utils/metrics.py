@@ -66,6 +66,7 @@ def compute_metrics(
     gt:       torch.Tensor,                    # (2, H, W) or (B, 2, H, W)
     valid:    Optional[torch.Tensor] = None,   # (H, W) or (B, H, W), bool/float
     occ_mask: Optional[torch.Tensor] = None,   # (H, W) or (B, H, W), bool/float
+    invalid_mask: Optional[torch.Tensor] = None,  # (H, W) or (B, H, W)
                                                # True = occluded pixel
 ) -> Dict[str, float]:
     """
@@ -93,6 +94,7 @@ def compute_metrics(
         gt    = gt.unsqueeze(0)
         if valid    is not None: valid    = valid.unsqueeze(0)
         if occ_mask is not None: occ_mask = occ_mask.unsqueeze(0)
+        if invalid_mask is not None: invalid_mask = invalid_mask.unsqueeze(0)
 
     epe_map = (pred - gt).pow(2).sum(dim=1).sqrt()   # (B, H, W)
     mag     = gt.pow(2).sum(dim=1).sqrt()             # (B, H, W)
@@ -102,17 +104,48 @@ def compute_metrics(
     else:
         valid = valid.bool()
 
+    if occ_mask is not None:
+        occ_mask = occ_mask.bool()
+
+    if invalid_mask is not None:
+        invalid_mask = invalid_mask.bool()
+
+    reliable = torch.isfinite(gt[:, 0]) & torch.isfinite(gt[:, 1])
+    if invalid_mask is not None:
+        reliable = reliable & (~invalid_mask)
+
+    matched_mask = valid & reliable
+    if occ_mask is not None:
+        matched_mask = matched_mask & (~occ_mask)
+
+    if occ_mask is not None:
+        unmatched_mask = occ_mask & reliable
+    else:
+        unmatched_mask = torch.zeros_like(matched_mask)
+
+    all_mask = matched_mask | unmatched_mask
+
+    epe_matched = epe_map[matched_mask]
+    epe_unmatched = epe_map[unmatched_mask]
+    epe_all = epe_map[all_mask]
+
     # ---- Standard metrics on valid (matched) pixels --------------------
-    epe_valid = epe_map[valid]
-    mag_valid = mag[valid]
+    epe_valid = epe_matched
+    mag_valid = mag[matched_mask]
 
     out: Dict[str, float] = {}
+    out["epe_matched"] = epe_matched.mean().item() if epe_matched.numel() > 0 else float("nan")
+    out["epe_unmatched"] = epe_unmatched.mean().item() if epe_unmatched.numel() > 0 else float("nan")
+    out["epe_all"] = epe_all.mean().item() if epe_all.numel() > 0 else float("nan")
+    # Backward compatibility for existing trainer/logger code.
+    out["epe"] = out["epe_matched"]
 
     if epe_valid.numel() == 0:
-        base_keys = ("epe", "f1", "s0_10", "s10_40", "s40_plus")
+        base_keys = (
+            "epe", "epe_matched", "epe_unmatched", "epe_all",
+            "f1", "s0_10", "s10_40", "s40_plus"
+        )
         return {k: float("nan") for k in base_keys}
-
-    out["epe"] = epe_valid.mean().item()
 
     # F1-all (KITTI)
     bad = (epe_valid > 3.0) & (epe_valid / mag_valid.clamp_min(1e-4) > 0.05)
@@ -191,7 +224,9 @@ def aggregate_metrics(results_list: list) -> Dict[str, float]:
     """Average a list of per-sample metric dicts (excluding NaN entries)."""
     if not results_list:
         return {}
-    keys = results_list[0].keys()
+    keys = set()
+    for r in results_list:
+        keys.update(r.keys())
     agg = {}
     for k in keys:
         vals = [r[k] for r in results_list if k in r and not np.isnan(r[k])]

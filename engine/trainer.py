@@ -53,6 +53,8 @@ class RunningMean:
 
     def update(self, d: Dict[str, float]) -> None:
         for k, v in d.items():
+            if isinstance(v, (float, np.floating)) and math.isnan(v):
+                continue
             self._sums[k]   = self._sums.get(k, 0.0) + v
             self._counts[k] = self._counts.get(k, 0)  + 1
 
@@ -334,6 +336,7 @@ class Trainer:
         running      = RunningMean()
 
         while self.global_step < num_steps:
+            validated_this_step = False
             # Create batch bar at the start of each epoch
             if steps_in_ep == 0:
                 batch_bar = tqdm(
@@ -363,22 +366,29 @@ class Trainer:
                 def _fmt(k, fmt=".3f"):
                     v = rm.get(k, float("nan"))
                     return "nan" if math.isnan(v) else format(v, fmt)
+                def _fmt_cur(k, fmt=".3f"):
+                    v = loss_dict.get(k, float("nan"))
+                    return "nan" if math.isnan(v) else format(v, fmt)
                 postfix: Dict[str, str] = {
+                    "cur_loss": f"{loss_dict['loss']:.4f}",
+                    "cur_epe": _fmt_cur("epe_matched"),
+                    "cur_f1": _fmt_cur("f1"),
                     "loss":    f"{rm['loss']:.4f}",
-                    "epe":     f"{rm['epe']:.3f}",
+                    "epe_m":   _fmt("epe_matched"),
+                    "epe_u":   _fmt("epe_unmatched"),
+                    "epe_all": _fmt("epe_all"),
                     "f1":      _fmt("f1"),
                     "s0_10":   _fmt("s0_10"),
                     "s10_40":  _fmt("s10_40"),
                     "s40+":    _fmt("s40_plus"),
                     "lr":      f"{lr:.2e}",
                 }
-                # Add auxiliary losses if present
-                if "smooth" in rm:
-                    postfix["smooth"] = _fmt("smooth", ".4f")
-                if "photo" in rm:
-                    postfix["photo"] = _fmt("photo", ".4f")
-                if "ofce" in rm:
-                    postfix["ofce"] = _fmt("ofce", ".4f")
+                postfix["cur_sm"] = _fmt_cur("smooth", ".4f")
+                postfix["cur_ph"] = _fmt_cur("photo", ".4f")
+                postfix["cur_of"] = _fmt_cur("ofce", ".4f")
+                postfix["smooth"] = _fmt("smooth", ".4f")
+                postfix["photo"] = _fmt("photo", ".4f")
+                postfix["ofce"] = _fmt("ofce", ".4f")
                 batch_bar.set_postfix(**postfix)
                 batch_bar.update(1)
 
@@ -409,6 +419,9 @@ class Trainer:
                     tag = " ★" if is_best else ""
                     logger.info(
                         f"✓ Val EPE={epe:.4f}  F1={_fmtv('f1')}%"
+                        f"  epe_m={_fmtv('epe_matched')}"
+                        f"  epe_u={_fmtv('epe_unmatched')}"
+                        f"  epe_all={_fmtv('epe_all')}"
                         f"  s0_10={_fmtv('s0_10')}  s10_40={_fmtv('s10_40')}"
                         f"  s40+={_fmtv('s40_plus')}{tag}"
                     )
@@ -416,6 +429,7 @@ class Trainer:
                         val_epe=f"{epe:.4f}",
                         best=f"{self.history.best_epe:.4f}",
                     )
+                    validated_this_step = True
 
             # ── Periodic checkpoint ──────────────────────────────────────────
             if self.global_step % save_every == 0:
@@ -433,15 +447,48 @@ class Trainer:
                     return "nan" if math.isnan(v) else format(v, fmt)
                 epoch_bar.set_postfix(
                     loss=f"{rm['loss']:.4f}",
-                    epe=f"{rm['epe']:.3f}",
+                    epe_m=_fmt("epe_matched"),
+                    epe_u=_fmt("epe_unmatched"),
+                    epe_all=_fmt("epe_all"),
                     f1=_fmt("f1"),
                     s0_10=_fmt("s0_10"),
                     s10_40=_fmt("s10_40"),
                     **{"s40+": _fmt("s40_plus")},
+                    smooth=_fmt("smooth", ".4f"),
+                    photo=_fmt("photo", ".4f"),
+                    ofce=_fmt("ofce", ".4f"),
                     best_epe=f"{self.history.best_epe:.4f}",
                     t=f"{elapsed:.0f}s",
                 )
                 epoch_bar.update(1)
+
+                # Always run validation at epoch end (once per step maximum).
+                if self._has_val and not validated_this_step:
+                    val_metrics = self._validate()
+                    if val_metrics:
+                        epe = val_metrics.get("epe", math.inf)
+                        is_best = epe < self.history.best_epe
+                        if is_best:
+                            self.history.best_epe = epe
+                            self.history.best_step = self.global_step
+                            self._save("best")
+                        def _fmtv(k, fmt=".3f"):
+                            v = val_metrics.get(k, float("nan"))
+                            return "nan" if math.isnan(v) else format(v, fmt)
+                        tag = " ★" if is_best else ""
+                        logger.info(
+                            f"✓ [Epoch-end] Val EPE={epe:.4f}  F1={_fmtv('f1')}%"
+                            f"  epe_m={_fmtv('epe_matched')}"
+                            f"  epe_u={_fmtv('epe_unmatched')}"
+                            f"  epe_all={_fmtv('epe_all')}"
+                            f"  s0_10={_fmtv('s0_10')}  s10_40={_fmtv('s10_40')}"
+                            f"  s40+={_fmtv('s40_plus')}{tag}"
+                        )
+                        epoch_bar.set_postfix(
+                            val_epe=f"{epe:.4f}",
+                            best=f"{self.history.best_epe:.4f}",
+                        )
+
                 epoch_idx   += 1
                 steps_in_ep  = 0
 
@@ -477,6 +524,8 @@ class Trainer:
         img2  = batch["image2"].to(self.device, non_blocking=True)
         flow  = batch["flow"].to(self.device, non_blocking=True)
         valid = batch["valid"].to(self.device, non_blocking=True)
+        occ_batch = batch.get("occlusion")
+        inv_batch = batch.get("invalid")
 
         with torch.autocast(device_type=self.device.type, enabled=self._use_amp):
             out       = self.model(img1, img2)
@@ -500,10 +549,19 @@ class Trainer:
             pred_final = out["flow_preds"][-1].detach()
             # Average metrics over batch items
             batch_metrics: Dict[str, list] = {
+                "epe": [], "epe_matched": [], "epe_unmatched": [], "epe_all": [],
                 "f1": [], "s0_10": [], "s10_40": [], "s40_plus": []
             }
             for b in range(pred_final.shape[0]):
-                m = compute_metrics(pred_final[b], flow[b], valid[b])
+                occ = None
+                inv = None
+                if occ_batch is not None:
+                    occ = occ_batch[b].to(self.device)
+                if inv_batch is not None:
+                    inv = inv_batch[b].to(self.device)
+                m = compute_metrics(
+                    pred_final[b], flow[b], valid[b], occ_mask=occ, invalid_mask=inv
+                )
                 for k in batch_metrics:
                     v = m.get(k, float("nan"))
                     if not math.isnan(v):
@@ -539,6 +597,7 @@ class Trainer:
                 valid = batch["valid"].to(self.device, non_blocking=True)
                 # occlusion mask is optional — None for datasets without masks
                 occ_batch = batch.get("occlusion")  # (B, H, W) tensor or None
+                inv_batch = batch.get("invalid")
 
                 padder = InputPadder(img1.shape, divisor=8)
                 img1, img2 = padder.pad(img1, img2)
@@ -549,10 +608,15 @@ class Trainer:
 
                 for b in range(img1.shape[0]):
                     occ = None
+                    inv = None
                     if occ_batch is not None:
                         occ = occ_batch[b].to(self.device)
+                    if inv_batch is not None:
+                        inv = inv_batch[b].to(self.device)
                     results.append(
-                        compute_metrics(pred[b], flow[b], valid[b], occ_mask=occ)
+                        compute_metrics(
+                            pred[b], flow[b], valid[b], occ_mask=occ, invalid_mask=inv
+                        )
                     )
 
         agg = aggregate_metrics(results)
