@@ -14,12 +14,12 @@ from typing import List
 
 
 class OpticalFlowFeatureEncoder(nn.Module):
-    \"\"\"
+    """
     Multi-scale feature encoder for optical flow.
     
     Uses ResNet-inspired blocks to extract hierarchical features
     from images at multiple scales.
-    \"\"\"
+    """
     
     def __init__(
         self,
@@ -29,7 +29,7 @@ class OpticalFlowFeatureEncoder(nn.Module):
         groups: int = 8,
         output_projection_dim: int = 48
     ):
-        \"\"\"
+        """
         Initialize feature encoder.
         
         Args:
@@ -38,7 +38,7 @@ class OpticalFlowFeatureEncoder(nn.Module):
             blocks_per_stage: Number of blocks per stage
             groups: Number of groups for grouped convolutions
             output_projection_dim: Output projection dimension
-        \"\"\"
+        """
         super().__init__()
         self.base_channels = base_channels
         self.channel_multiplier = channel_multiplier
@@ -74,7 +74,7 @@ class OpticalFlowFeatureEncoder(nn.Module):
         stride: int = 1,
         groups: int = 8
     ) -> nn.Sequential:
-        \"\"\"
+        """
         Create a residual stage.
         
         Args:
@@ -86,7 +86,7 @@ class OpticalFlowFeatureEncoder(nn.Module):
             
         Returns:
             Sequential module of residual blocks
-        \"\"\"
+        """
         blocks = []
         blocks.append(
             ResidualBlock(
@@ -104,7 +104,7 @@ class OpticalFlowFeatureEncoder(nn.Module):
         return nn.Sequential(*blocks)
     
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, List[torch.Tensor]]:
-        \"\"\"
+        """
         Extract multi-scale features.
         
         Args:
@@ -112,7 +112,7 @@ class OpticalFlowFeatureEncoder(nn.Module):
             
         Returns:
             (final_features, feature_pyramid)
-        \"\"\"
+        """
         x = F.relu(self.bn1(self.conv1(x)))  # [B, base_channels, H/2, W/2]
         
         pyramid = []
@@ -127,9 +127,9 @@ class OpticalFlowFeatureEncoder(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    \"\"\"
+    """
     Residual block for feature extraction.
-    \"\"\"
+    """
     
     def __init__(
         self,
@@ -138,7 +138,7 @@ class ResidualBlock(nn.Module):
         stride: int = 1,
         groups: int = 8
     ):
-        \"\"\"
+        """
         Initialize residual block.
         
         Args:
@@ -146,7 +146,7 @@ class ResidualBlock(nn.Module):
             out_channels: Output channels
             stride: Stride for first convolution
             groups: Number of groups for grouped conv
-        \"\"\"
+        """
         super().__init__()
         
         # First convolution
@@ -172,7 +172,9 @@ class ResidualBlock(nn.Module):
             )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        \"\"\"Forward pass through residual block.\"\"\"
+        """
+        Forward pass through residual block.
+        """
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         out += self.shortcut(x)
