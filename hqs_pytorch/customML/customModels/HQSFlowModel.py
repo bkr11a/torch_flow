@@ -1,293 +1,203 @@
-"""
-Main HQS Optical Flow Model for PyTorch.
+"""Primary configurable HQS optical-flow model.
 
-Hierarchical Quadratic Solver for end-to-end optical flow estimation.
-"""
+This implementation now lives under hqs_pytorch and is the authoritative
+model used by train.py / evaluate.py via models.build_model.
 
-__author__ = "Brad Rice"
-__version__ = "1.0.0"
+It preserves the repository's existing training contract:
+  - configuration is read from cfg.model
+  - forward() returns a dict with flow_preds / flow_low / hidden_states
+  - param_count() reports component totals for trainer logging
+
+The implementation reuses the stable solver components already present in the
+repository while relocating the main model definition into hqs_pytorch, which
+is now the primary solution for this codebase.
+"""
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from typing import Dict, Tuple, List, Optional
-from src.hqs_pytorch.customML.customModels.OpticalFlowFeatureEncoder import OpticalFlowFeatureEncoder
-from src.hqs_pytorch.customML.customModels.OpticalFlowContextEncoder import OpticalFlowContextEncoder
-from src.hqs_pytorch.customML.customLayers.InputPadder import InputPadderPyTorch
-from src.hqs_pytorch.customML.customLayers.CostCorrelationLayer import CostVolumeCorrelationLayer
-from src.hqs_pytorch.customML.customLayers.HQSIterations import HQSIterationLayer
-from src.hqs_pytorch.customML.customLayers.ImageWarpingLayer import ImageWarpingLayer
-from src.hqs_pytorch.customML.customLayers.ImagePyramidLayer import ImagePyramidLayer
-from src.hqs_pytorch.customML.customLosses import AEPE_Loss, OFCE_Loss
+import torch.nn.functional as F
+from typing import Dict, List, Optional
+
+from models.encoders import build_encoder
+from models.correlation import build_corr_block, CorrBlock
+from models.update_net import DataUpdateNet
+from models.reg_net import build_prox_net
+from models.hqs_stage import HQSStage
+from models.warp import upsample_flow
+
+
+def convex_upsample(
+    flow: torch.Tensor,
+    mask: torch.Tensor,
+    scale: int = 8,
+) -> torch.Tensor:
+    """RAFT-style convex upsampling from feature resolution to image space."""
+    batch_size, _, height, width = flow.shape
+    mask = mask.view(batch_size, 1, 9, scale, scale, height, width)
+    mask = torch.softmax(mask, dim=2)
+
+    up_flow = F.unfold(scale * flow, kernel_size=3, padding=1)
+    up_flow = up_flow.view(batch_size, 2, 9, 1, 1, height, width)
+    up_flow = (mask * up_flow).sum(dim=2)
+
+    return up_flow.permute(0, 1, 4, 2, 5, 3).reshape(
+        batch_size, 2, scale * height, scale * width
+    )
 
 
 class HQSFlowModel(nn.Module):
-    \"\"\"
-    Hierarchical Quadratic Solver for Optical Flow.
-    
-    Combines feature extraction, cost volume computation, and iterative
-    HQS optimization for accurate optical flow estimation.
-    
-    FIXES APPLIED:
-    - Issue #4: Consistent [dy, dx] flow convention throughout
-    - Issue #5: Corrected flow direction in loss computation
-    - Issue #10: Dynamic padder instead of hardcoded Sintel dimensions
-    \"\"\"
-    
-    def __init__(
-        self,
-        num_pyramid_levels: int = 3,
-        max_displacement: int = 3,
-        num_hqs_iterations: int = 10,
-        num_gradient_descent_iterations: int = 15,
-        init_lr: float = 1e-3
-    ):
-        \"\"\"
-        Initialize HQS flow model.
-        
-        Args:
-            num_pyramid_levels: Number of pyramid levels
-            max_displacement: Maximum search displacement
-            num_hqs_iterations: Number of HQS iterations
-            num_gradient_descent_iterations: GD steps per HQS iteration
-            init_lr: Initial learning rate
-        \"\"\"
+    """Configurable unrolled HQS optical-flow model backed by cfg.model."""
+
+    def __init__(self, cfg) -> None:
         super().__init__()
-        
-        self.num_pyramid_levels = num_pyramid_levels
-        self.max_displacement = max_displacement
-        self.num_hqs_iterations = num_hqs_iterations
-        self.num_gradient_descent_iterations = num_gradient_descent_iterations
-        self.init_lr = init_lr
-        
-        # Loss functions
-        self.aepe_loss = AEPE_Loss()
-        self.ofce_loss = OFCE_Loss()
-        
-        # FIX Issue #10: Create padder dynamically
-        self.padder = InputPadderPyTorch(factor=8, padding_mode='constant')
-        
-        # Feature encoders
-        self.feature_encoder = OpticalFlowFeatureEncoder(
-            base_channels=16,
-            channel_multiplier=(1, 2, 3),
-            blocks_per_stage=(2, 2, 2),
-            groups=8,
-            output_projection_dim=48
-        )
-        
-        # Context encoder
-        self.context_encoder = OpticalFlowContextEncoder(
-            base_channels=16,
-            context_dim=64
-        )
-        
-        # Cost volume correlation
-        self.cost_volume_layer = CostVolumeCorrelationLayer(max_displacement)
-        
-        # Image pyramid
-        self.pyramid_layer = ImagePyramidLayer(num_levels=num_pyramid_levels)
-        
-        # HQS iteration layers (one per pyramid level)
-        self.hqs_layers = nn.ModuleList([
-            HQSIterationLayer(
-                num_gradient_descent_iterations=num_gradient_descent_iterations,
-                init_learning_rate=init_lr
+        self.cfg = cfg
+
+        self.feature_encoder = build_encoder(cfg.encoder)
+        self.context_encoder = build_encoder(cfg.context)
+        self.corr_block = build_corr_block(cfg.corr)
+
+        feat_dim = cfg.encoder.output_dim
+        ctx_dim = cfg.context.output_dim
+        corr_dim = self.corr_block.out_channels
+
+        self.num_stages = cfg.num_stages
+        self.upsample_scale = cfg.get("upsample_scale", 8)
+
+        hidden_dim = cfg.update_net.hidden_dim
+        head_dim = cfg.update_net.get("head_dim", 256)
+        share = cfg.get("weight_sharing", "share_all")
+
+        def make_update_net() -> DataUpdateNet:
+            return DataUpdateNet(
+                corr_channels=corr_dim,
+                context_channels=ctx_dim,
+                hidden_dim=hidden_dim,
+                head_dim=head_dim,
+                with_upsample_mask=True,
+                upsample_scale=self.upsample_scale,
             )
-            for _ in range(num_pyramid_levels)
-        ])
-        
-        # Image warping layer
-        self.warp_layer = ImageWarpingLayer()
-        
-        # Learnable pyramid weights
-        self.hqs_beta = nn.Parameter(
-            torch.tensor([0.05, 0.08, 0.12][:num_pyramid_levels], dtype=torch.float32)
-        )
-        self.hqs_lambda = nn.Parameter(
-            torch.tensor([0.03, 0.04, 0.05][:num_pyramid_levels], dtype=torch.float32)
-        )
-        
-        # Output refinement head
-        self.final_refinement = nn.Sequential(
-            nn.Conv2d(2, 32, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 2, 3, padding=1)
-        )
-    
+
+        def make_prox_net() -> nn.Module:
+            return build_prox_net(cfg.prox)
+
+        if share == "share_all":
+            shared_update = make_update_net()
+            shared_prox = make_prox_net()
+            self.stages = nn.ModuleList([
+                HQSStage(shared_update, shared_prox, share_weights=True)
+                for _ in range(self.num_stages)
+            ])
+        elif share == "share_none":
+            self.stages = nn.ModuleList([
+                HQSStage(make_update_net(), make_prox_net(), share_weights=False)
+                for _ in range(self.num_stages)
+            ])
+        elif share == "share_update":
+            shared_update = make_update_net()
+            self.stages = nn.ModuleList([
+                HQSStage(shared_update, make_prox_net(), share_weights=False)
+                for _ in range(self.num_stages)
+            ])
+        elif share == "share_prox":
+            shared_prox = make_prox_net()
+            self.stages = nn.ModuleList([
+                HQSStage(make_update_net(), shared_prox, share_weights=False)
+                for _ in range(self.num_stages)
+            ])
+        else:
+            raise ValueError(f"Unknown weight_sharing mode: {share!r}")
+
+        self.ctx_to_hidden = nn.Conv2d(ctx_dim, hidden_dim, 1)
+        self.ctx_to_v = nn.Conv2d(ctx_dim, 2, 1)
+        nn.init.zeros_(self.ctx_to_v.weight)
+        nn.init.zeros_(self.ctx_to_v.bias)
+
+        self._feature_dim = feat_dim
+
     def forward(
         self,
         image1: torch.Tensor,
         image2: torch.Tensor,
-        flow_init: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, Dict]:
-        \"\"\"
-        Forward pass through HQS model.
-        
-        Args:
-            image1: Reference image [B, 3, H, W]
-            image2: Target image [B, 3, H, W]
-            flow_init: Optional initial flow estimate [B, 2, H, W]
-            
-        Returns:
-            (flow_pred, forward_dict) where flow_pred is [B, 2, H, W]
-            and forward_dict contains intermediate features
-        \"\"\"
-        forward_dict = {}
-        
-        batch_size, _, height, width = image1.shape
-        
-        # FIX Issue #10: Pad images dynamically
-        image1_padded, pad_info = self.padder(image1)
-        image2_padded, _ = self.padder(image2)
-        
-        # Extract features
-        f1, f1_pyramid = self.feature_encoder(image1_padded)  # [B, 48, H/8, W/8]
-        f2, f2_pyramid = self.feature_encoder(image2_padded)
-        
-        # Extract context
-        context, hidden_init = self.context_encoder(image1_padded)
-        
-        # Create image pyramids
-        i1_pyramid = self.pyramid_layer(image1_padded)
-        i2_pyramid = self.pyramid_layer(image2_padded)
-        
-        # Compute correlation volumes
-        cost_volumes = []
-        for f1_level, f2_level in zip(f1_pyramid, f2_pyramid):
-            cost_vol = self.cost_volume_layer(f1_level, f2_level)
-            cost_volumes.append(cost_vol)
-        
-        # Initialize flow
-        if flow_init is None:
-            h_pad, w_pad = pad_info
-            h_padded = height + h_pad
-            w_padded = width + w_pad
-            flow = torch.zeros(
-                batch_size, 2,
-                h_padded // 8, w_padded // 8,
-                device=image1.device,
-                dtype=image1.dtype
+        iters: Optional[int] = None,
+        flow_init: Optional[torch.Tensor] = None,
+    ) -> Dict[str, List[torch.Tensor]]:
+        iters = iters or self.num_stages
+        if iters > self.num_stages:
+            raise ValueError(
+                f"Requested {iters} HQS stages, but model was built with {self.num_stages}."
             )
+
+        img1 = self._normalise(image1)
+        img2 = self._normalise(image2)
+
+        fmap1 = self.feature_encoder(img1)
+        fmap2 = self.feature_encoder(img2)
+        fmap1 = F.normalize(fmap1, p=2, dim=1)
+        fmap2 = F.normalize(fmap2, p=2, dim=1)
+        context = self.context_encoder(img1)
+
+        if isinstance(self.corr_block, CorrBlock):
+            self.corr_block.initialise(fmap1, fmap2)
+
+        batch_size, _, height, width = fmap1.shape
+        if flow_init is not None:
+            if flow_init.shape[-2:] != (height, width):
+                flow_init = F.interpolate(
+                    flow_init / self.upsample_scale,
+                    size=(height, width),
+                    mode="bilinear",
+                    align_corners=True,
+                )
+            flow_u = flow_init.clone()
         else:
-            flow = flow_init
-        
-        # HQS iterations across pyramid levels
-        forward_pass_dict = {}
-        
-        for level in range(self.num_pyramid_levels):
-            # Get features at this level
-            I1_level = i1_pyramid[level] if level < len(i1_pyramid) else i1_pyramid[-1]
-            I2_level = i2_pyramid[level] if level < len(i2_pyramid) else i2_pyramid[-1]
-            
-            # Compute gradients
-            I1_grad = self._compute_gradients(I1_level)  # [B, C, H, W, 2]
-            I_t = self._compute_temporal_gradient(I1_level, I2_level)
-            I_x = I1_grad[..., 0]
-            I_y = I1_grad[..., 1]
-            
-            # Downsample flow if needed
-            if level > 0:
-                flow = torch.nn.functional.avg_pool2d(flow, kernel_size=2, stride=2)
-            
-            # Initialize hidden states
-            if level == 0:
-                hidden_u = torch.zeros_like(flow[:, :1])
-                hidden_v = torch.zeros_like(flow[:, :1])
-            
-            # HQS iteration layer
-            p = torch.zeros_like(flow)
-            q = torch.zeros_like(flow)
-            
-            flow_u = flow[:, :1]
-            flow_v = flow[:, 1:]
-            
-            inputs = (
-                context, f1_pyramid[level], f2_pyramid[level],
-                I_t, I_x, I_y,
-                flow_u, flow_v, p, q,
-                hidden_u, hidden_v,
-                forward_pass_dict
+            flow_u = torch.zeros(
+                batch_size, 2, height, width,
+                device=fmap1.device,
+                dtype=fmap1.dtype,
             )
-            
-            flow_u, flow_v, p, q, hidden_u, hidden_v, forward_pass_dict = (
-                self.hqs_layers[level](inputs)
+
+        flow_v = torch.tanh(self.ctx_to_v(context))
+        hidden = torch.tanh(self.ctx_to_hidden(context))
+
+        flow_preds: List[torch.Tensor] = []
+        flow_lows: List[torch.Tensor] = []
+        hidden_states: List[torch.Tensor] = []
+
+        for stage_idx in range(iters):
+            flow_u, flow_v, hidden, up_mask = self.stages[stage_idx](
+                fmap1, fmap2, self.corr_block, context, flow_u, flow_v, hidden
             )
-            
-            flow = torch.cat([flow_u, flow_v], dim=1)
-        
-        # Upsample to original resolution
-        # FIX Issue #10: Unpad to original size
-        scale_factor = 8
-        flow_upsampled = torch.nn.functional.interpolate(
-            flow, scale_factor=scale_factor,
-            mode='bilinear', align_corners=True
-        )
-        flow_final = self.padder.unpad(flow_upsampled, pad_info)
-        
-        # Final refinement
-        flow_refined = self.final_refinement(flow_final)
-        
-        forward_dict.update({
-            'flow': flow_refined,
-            'cost_volumes': cost_volumes,
-            'forward_pass': forward_pass_dict
-        })
-        
-        return flow_refined, forward_dict
-    
-    def _compute_gradients(self, image: torch.Tensor) -> torch.Tensor:
-        \"\"\"
-        Compute spatial gradients using Sobel filters.
-        
-        Args:
-            image: [B, C, H, W]
-            
-        Returns:
-            Stacked gradients [B, C, H, W, 2]
-        \"\"\"
-        batch_size, channels, height, width = image.shape
-        
-        # Sobel kernels
-        sobel_x = torch.tensor(
-            [[1, 0, -1], [2, 0, -2], [1, 0, -1]],
-            dtype=torch.float32,
-            device=image.device
-        ).reshape(1, 1, 3, 3)
-        
-        sobel_y = torch.tensor(
-            [[1, 2, 1], [0, 0, 0], [-1, -2, -1]],
-            dtype=torch.float32,
-            device=image.device
-        ).reshape(1, 1, 3, 3)
-        
-        # Tile for all channels
-        sobel_x = sobel_x.repeat(channels, 1, 1, 1)
-        sobel_y = sobel_y.repeat(channels, 1, 1, 1)
-        
-        # Apply convolution
-        grad_x = torch.nn.functional.conv2d(image, sobel_x, padding=1, groups=channels)
-        grad_y = torch.nn.functional.conv2d(image, sobel_y, padding=1, groups=channels)
-        
-        # Stack: [B, C, H, W, 2]
-        gradients = torch.stack([grad_x, grad_y], dim=-1)
-        
-        return gradients
-    
-    def _compute_temporal_gradient(
-        self,
-        image1: torch.Tensor,
-        image2: torch.Tensor
-    ) -> torch.Tensor:
-        \"\"\"
-        Compute temporal gradient using image difference.
-        
-        Args:
-            image1: [B, C, H, W]
-            image2: [B, C, H, W]
-            
-        Returns:
-            Temporal gradient [B, C, H, W]
-        \"\"\"
-        # FIX Issue #4: Consistent temporal gradient
-        I_t = image2 - image1
-        return I_t
+            flow_lows.append(flow_u)
+            hidden_states.append(hidden)
+
+            if up_mask is not None:
+                flow_up = convex_upsample(flow_u, up_mask, scale=self.upsample_scale)
+            else:
+                flow_up = upsample_flow(flow_u, scale_factor=self.upsample_scale)
+            flow_preds.append(flow_up)
+
+        return {
+            "flow_preds": flow_preds,
+            "flow_low": flow_lows,
+            "hidden_states": hidden_states,
+        }
+
+    @staticmethod
+    def _normalise(img: torch.Tensor) -> torch.Tensor:
+        if img.max() > 2.0:
+            img = img / 255.0
+        mean = img.new_tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = img.new_tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        return (img - mean) / std
+
+    def param_count(self) -> Dict[str, int]:
+        def count(module: nn.Module) -> int:
+            return sum(param.numel() for param in module.parameters())
+
+        return {
+            "feature_encoder": count(self.feature_encoder),
+            "context_encoder": count(self.context_encoder),
+            "stages": count(self.stages),
+            "total": count(self),
+        }

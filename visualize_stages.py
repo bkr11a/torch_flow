@@ -344,8 +344,11 @@ def main() -> None:
     logger.info(f"Loaded checkpoint: {args.checkpoint}")
 
     # Build data
-    val_data = build_dataset(data_cfg, split="val")
-    val_loader = build_dataloader(val_data, data_cfg, split="val", batch_size=1)
+    val_cfg = data_cfg.get("val_data") or data_cfg.get("data") or data_cfg
+    val_cfg = OmegaConf.merge(val_cfg, {"batch_size": 1})
+
+    val_data = build_dataset(val_cfg, split="val")
+    val_loader = build_dataloader(val_data, val_cfg, split="val")
     logger.info(f"Validation set: {len(val_data)} samples")
 
     # Visualize
