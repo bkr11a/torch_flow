@@ -12,20 +12,20 @@ import torch.nn as nn
 
 
 class AEPE_Loss(nn.Module):
-    \"\"\"
+    """
     Average End-Point Error loss.
     
     Computes mean Euclidean distance between predicted and ground truth flow.
     Handles invalid/occlusion masks.
-    \"\"\"
+    """
     
     def __init__(self, reduction: str = 'mean'):
-        \"\"\"
+        """
         Initialize AEPE loss.
         
         Args:
             reduction: 'mean', 'sum', or 'none'
-        \"\"\"
+        """
         super().__init__()
         self.reduction = reduction
     
@@ -35,7 +35,7 @@ class AEPE_Loss(nn.Module):
         flow_gt: torch.Tensor,
         mask: torch.Tensor = None
     ) -> torch.Tensor:
-        \"\"\"
+        """
         Compute AEPE loss.
         
         Args:
@@ -45,7 +45,7 @@ class AEPE_Loss(nn.Module):
             
         Returns:
             Loss value (scalar or per-pixel)
-        \"\"\"
+        """
         # Compute end-point error
         epe = torch.norm(flow_pred - flow_gt, p=2, dim=1, keepdim=True)  # [B, 1, H, W]
         

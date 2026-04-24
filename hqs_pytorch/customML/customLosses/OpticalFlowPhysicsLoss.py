@@ -13,11 +13,11 @@ import torch.nn.functional as F
 
 
 class OpticalFlowPhysicsLoss(nn.Module):
-    \"\"\"
+    """
     Physics-based optical flow loss.
     
     Combines OFCE, smoothness, and other physical constraints.
-    \"\"\"
+    """
     
     def __init__(
         self,
@@ -25,21 +25,21 @@ class OpticalFlowPhysicsLoss(nn.Module):
         smoothness_weight: float = 0.1,
         reduction: str = 'mean'
     ):
-        \"\"\"
+        """
         Initialize physics loss.
         
         Args:
             ofce_weight: Weight for brightness constancy term
             smoothness_weight: Weight for smoothness term
             reduction: 'mean', 'sum', or 'none'
-        \"\"\"
+        """
         super().__init__()
         self.ofce_weight = ofce_weight
         self.smoothness_weight = smoothness_weight
         self.reduction = reduction
     
     def _compute_smoothness(self, flow: torch.Tensor) -> torch.Tensor:
-        \"\"\"
+        """
         Compute flow smoothness regularization.
         
         Args:
@@ -47,7 +47,7 @@ class OpticalFlowPhysicsLoss(nn.Module):
             
         Returns:
             Smoothness loss
-        \"\"\"
+        """
         # Compute flow gradients
         dy = torch.abs(flow[:, :, 1:, :] - flow[:, :, :-1, :])
         dx = torch.abs(flow[:, :, :, 1:] - flow[:, :, :, :-1])
@@ -64,7 +64,7 @@ class OpticalFlowPhysicsLoss(nn.Module):
         flow_gt: torch.Tensor = None,
         mask: torch.Tensor = None
     ) -> torch.Tensor:
-        \"\"\"
+        """
         Compute physics-based loss.
         
         Args:
@@ -76,7 +76,7 @@ class OpticalFlowPhysicsLoss(nn.Module):
             
         Returns:
             Combined loss value
-        \"\"\"
+        """
         batch_size, channels, height, width = I1.shape
         
         # Create sampling grid for warping

@@ -13,20 +13,20 @@ import torch.nn.functional as F
 
 
 class OFCE_Loss(nn.Module):
-    \"\"\"
+    """
     Optical Flow Constraint Equation loss.
     
     Enforces brightness constancy: I1(x) - I2(x + flow) ≈ 0
     Computes residual after warping I2 with predicted flow.
-    \"\"\"
+    """
     
     def __init__(self, reduction: str = 'mean'):
-        \"\"\"
+        """
         Initialize OFCE loss.
         
         Args:
             reduction: 'mean', 'sum', or 'none'
-        \"\"\"
+        """
         super().__init__()
         self.reduction = reduction
     
@@ -37,7 +37,7 @@ class OFCE_Loss(nn.Module):
         flow: torch.Tensor,
         mask: torch.Tensor = None
     ) -> torch.Tensor:
-        \"\"\"
+        """
         Compute OFCE loss.
         
         Args:
@@ -48,7 +48,7 @@ class OFCE_Loss(nn.Module):
             
         Returns:
             Loss value
-        \"\"\"
+        """
         batch_size, channels, height, width = I1.shape
         
         # Create sampling grid

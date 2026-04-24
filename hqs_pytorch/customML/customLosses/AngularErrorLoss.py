@@ -12,20 +12,20 @@ import torch.nn as nn
 
 
 class AngularErrorLoss(nn.Module):
-    \"\"\"
+    """
     Angular error between flow vectors.
     
     Measures angle between predicted and ground truth flow directions.
     Invariant to flow magnitude scaling.
-    \"\"\"
+    """
     
     def __init__(self, reduction: str = 'mean'):
-        \"\"\"
+        """
         Initialize angular error loss.
         
         Args:
             reduction: 'mean', 'sum', or 'none'
-        \"\"\"
+        """
         super().__init__()
         self.reduction = reduction
     
@@ -35,7 +35,7 @@ class AngularErrorLoss(nn.Module):
         flow_gt: torch.Tensor,
         mask: torch.Tensor = None
     ) -> torch.Tensor:
-        \"\"\"
+        """
         Compute angular error loss.
         
         Args:
@@ -45,7 +45,7 @@ class AngularErrorLoss(nn.Module):
             
         Returns:
             Angular error in degrees
-        \"\"\"
+        """
         # Add small epsilon to avoid division by zero
         eps = 1e-8
         
