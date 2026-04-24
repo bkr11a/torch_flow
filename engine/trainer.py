@@ -370,9 +370,8 @@ class Trainer:
                     v = loss_dict.get(k, float("nan"))
                     return "nan" if math.isnan(v) else format(v, fmt)
                 postfix: Dict[str, str] = {
-                    "cur_loss": f"{loss_dict['loss']:.4f}",
-                    "cur_epe": _fmt_cur("epe_matched"),
-                    "cur_f1": _fmt_cur("f1"),
+                    "curr_loss": f"{loss_dict['loss']:.4f}",
+                    "curr_epe_all": _fmt_cur("epe_all"),
                     "loss":    f"{rm['loss']:.4f}",
                     "epe_m":   _fmt("epe_matched"),
                     "epe_u":   _fmt("epe_unmatched"),
@@ -383,9 +382,6 @@ class Trainer:
                     "s40+":    _fmt("s40_plus"),
                     "lr":      f"{lr:.2e}",
                 }
-                postfix["cur_sm"] = _fmt_cur("smooth", ".4f")
-                postfix["cur_ph"] = _fmt_cur("photo", ".4f")
-                postfix["cur_of"] = _fmt_cur("ofce", ".4f")
                 postfix["smooth"] = _fmt("smooth", ".4f")
                 postfix["photo"] = _fmt("photo", ".4f")
                 postfix["ofce"] = _fmt("ofce", ".4f")
@@ -537,9 +533,15 @@ class Trainer:
             self.model.parameters(),
             self.cfg.training.get("grad_clip", 1.0),
         )
+
+        # With AMP, GradScaler may skip optimizer.step() on overflow. In that
+        # case scheduler.step() must also be skipped to keep call order valid.
+        scale_before = self.scaler.get_scale()
         self.scaler.step(self.optimizer)
         self.scaler.update()
-        self.scheduler.step()
+        scale_after = self.scaler.get_scale()
+        if scale_after >= scale_before:
+            self.scheduler.step()
 
         scalar_dict = {k: v.item() if isinstance(v, torch.Tensor) else v
                        for k, v in loss_dict.items()}
