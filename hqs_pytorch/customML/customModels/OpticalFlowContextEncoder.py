@@ -14,25 +14,25 @@ from typing import List
 
 
 class OpticalFlowContextEncoder(nn.Module):
-    \"\"\"
+    """
     Context encoder for optical flow using UNET architecture.
     
     Extracts contextual information with skip connections
     and produces context features and hidden states.
-    \"\"\"
+    """
     
     def __init__(
         self,
         base_channels: int = 16,
         context_dim: int = 64
     ):
-        \"\"\"
+        """
         Initialize context encoder.
         
         Args:
             base_channels: Base number of channels
             context_dim: Output context dimension
-        \"\"\"
+        """
         super().__init__()
         self.base_channels = base_channels
         self.context_dim = context_dim
@@ -65,7 +65,7 @@ class OpticalFlowContextEncoder(nn.Module):
         self.hidden_head = nn.Conv2d(base_channels, context_dim, kernel_size=1)
     
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        \"\"\"
+        """
         Extract context features and hidden state.
         
         Args:
@@ -73,7 +73,7 @@ class OpticalFlowContextEncoder(nn.Module):
             
         Returns:
             (context_features, hidden_state) each [B, context_dim, H, W]
-        \"\"\"
+        """
         # Encoder
         enc1 = self.enc1(x)  # [B, base, H, W]
         enc2 = self.enc2(self.pool1(enc1))  # [B, base*2, H/2, W/2]
@@ -103,9 +103,9 @@ class OpticalFlowContextEncoder(nn.Module):
 
 
 class DoubleConv(nn.Module):
-    \"\"\"
+    """
     Double convolution block for UNET.
-    \"\"\"
+    """
     
     def __init__(
         self,
@@ -113,7 +113,9 @@ class DoubleConv(nn.Module):
         mid_channels: int,
         out_channels: int
     ):
-        \"\"\"Initialize double conv block.\"\"\"
+        """
+        Initialize double conv block.
+        """
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, mid_channels, 3, padding=1)
         self.bn1 = nn.BatchNorm2d(mid_channels)
@@ -121,7 +123,9 @@ class DoubleConv(nn.Module):
         self.bn2 = nn.BatchNorm2d(out_channels)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        \"\"\"Forward pass.\"\"\"
+        """
+        Forward pass.
+        """
         x = F.relu(self.bn1(self.conv1(x)))
         x = F.relu(self.bn2(self.conv2(x)))
         return x
