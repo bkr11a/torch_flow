@@ -28,3 +28,6 @@ results/
 # IDE
 .vscode/
 .idea/
+
+# Windows metadata artifacts
+*:Zone.Identifier
