@@ -556,6 +556,9 @@ class HQSFlowModelTFPort(nn.Module):
             flow_yx = self._resize_flow_yx(flow_yx, h, w)
 
         aux_yx = torch.zeros_like(flow_yx)
+        flow_preds: List[torch.Tensor] = []
+        flow_lows: List[torch.Tensor] = []
+        hidden_states: List[torch.Tensor] = []
 
         corr_allpairs = self.build_all_pairs_correlation(f1, f2)
         corr_pyr = self.build_corr_pyramid_from_all_pairs(corr_allpairs, num_levels=self.num_corr_levels)
@@ -584,6 +587,15 @@ class HQSFlowModelTFPort(nn.Module):
             delta_refine = self.refinement_network(refine_in)
             flow_yx = flow_yx + 0.1 * delta_refine
 
+            # Save per-stage outputs for sequence supervision.
+            flow_low_xy = torch.stack([flow_yx[:, 1], flow_yx[:, 0]], dim=1)
+            flow_stage_up_yx = self._resize_flow_yx(flow_yx, image1.shape[-2], image1.shape[-1])
+            flow_stage_up_xy = torch.stack([flow_stage_up_yx[:, 1], flow_stage_up_yx[:, 0]], dim=1)
+
+            flow_lows.append(flow_low_xy)
+            flow_preds.append(flow_stage_up_xy)
+            hidden_states.append(hidden_lvl)
+
         final_in = torch.cat([flow_yx, context_feat_lvl, hidden_lvl], dim=1)
         final_mask_logits = self.final_mask_logits(final_in)
         flow_yx = flow_yx + 0.1 * self.final_refinement_network(final_in)
@@ -595,11 +607,22 @@ class HQSFlowModelTFPort(nn.Module):
 
         # Convert internal [dy, dx] to repository output convention [dx, dy].
         flow_up_xy = torch.stack([flow_up_yx[:, 1], flow_up_yx[:, 0]], dim=1)
+        flow_low_xy_final = torch.stack([flow_yx[:, 1], flow_yx[:, 0]], dim=1)
+
+        # Keep prediction-list length == iters while making the final element
+        # the best TF-faithful refined output.
+        if flow_preds:
+            flow_preds[-1] = flow_up_xy
+            flow_lows[-1] = flow_low_xy_final
+        else:
+            flow_preds = [flow_up_xy]
+            flow_lows = [flow_low_xy_final]
+            hidden_states = [hidden_lvl]
 
         return {
-            "flow_preds": [flow_up_xy],
-            "flow_low": [flow_yx],
-            "hidden_states": [hidden_lvl],
+            "flow_preds": flow_preds,
+            "flow_low": flow_lows,
+            "hidden_states": hidden_states,
         }
 
     def param_count(self) -> Dict[str, int]:
