@@ -10,10 +10,10 @@ use_wandb: false
 wandb_project: hqs_flow
 
 mlflow:
-  enabled: false
+  enabled: true
   tracking_uri: "https://mlflow.spicedrice.home/"
-  experiment_name: "torch_flow"
-  insecure_tls: true
+  experiment_name: "torch_flow_test"
+  insecure_tls: false
   strict: false
   log_checkpoints: true
   log_tensorboard: true
@@ -85,6 +85,7 @@ training:
   val_every: 5000
   save_every: 10000
   checkpoint: null               # path to resume from
+  resume_mode: full              # "full" | "weights_only"
 
 # ── Data ──────────────────────────────────────────────────────────────────
 data:

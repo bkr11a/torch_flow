@@ -117,6 +117,10 @@ class RandomCrop:
             sample["flow"]  = _crop(sample["flow"])
         if "valid" in sample and sample["valid"] is not None:
             sample["valid"] = _crop(sample["valid"])
+        if "occlusion" in sample and sample["occlusion"] is not None:
+            sample["occlusion"] = _crop(sample["occlusion"])
+        if "invalid" in sample and sample["invalid"] is not None:
+            sample["invalid"] = _crop(sample["invalid"])
         return sample
 
 
@@ -134,6 +138,10 @@ class RandomHorizontalFlip:
                 sample["flow"] = flow
             if "valid" in sample and sample["valid"] is not None:
                 sample["valid"] = np.ascontiguousarray(sample["valid"][:, ::-1])
+            if "occlusion" in sample and sample["occlusion"] is not None:
+                sample["occlusion"] = np.ascontiguousarray(sample["occlusion"][:, ::-1])
+            if "invalid" in sample and sample["invalid"] is not None:
+                sample["invalid"] = np.ascontiguousarray(sample["invalid"][:, ::-1])
         return sample
 
 
@@ -151,6 +159,10 @@ class RandomVerticalFlip:
                 sample["flow"] = flow
             if "valid" in sample and sample["valid"] is not None:
                 sample["valid"] = np.ascontiguousarray(sample["valid"][::-1])
+            if "occlusion" in sample and sample["occlusion"] is not None:
+                sample["occlusion"] = np.ascontiguousarray(sample["occlusion"][::-1])
+            if "invalid" in sample and sample["invalid"] is not None:
+                sample["invalid"] = np.ascontiguousarray(sample["invalid"][::-1])
         return sample
 
 
@@ -207,6 +219,18 @@ class RandomScaleAndCrop:
                 interpolation=cv2.INTER_NEAREST
             ).astype(bool)
 
+        if "occlusion" in sample and sample["occlusion"] is not None:
+            sample["occlusion"] = cv2.resize(
+                sample["occlusion"].astype(np.uint8), (new_W, new_H),
+                interpolation=cv2.INTER_NEAREST
+            ).astype(bool)
+
+        if "invalid" in sample and sample["invalid"] is not None:
+            sample["invalid"] = cv2.resize(
+                sample["invalid"].astype(np.uint8), (new_W, new_H),
+                interpolation=cv2.INTER_NEAREST
+            ).astype(bool)
+
         # Random crop
         y0 = random.randint(0, new_H - self.crop_h)
         x0 = random.randint(0, new_W - self.crop_w)
@@ -214,7 +238,7 @@ class RandomScaleAndCrop:
         def _crop(arr: np.ndarray) -> np.ndarray:
             return arr[y0:y0 + self.crop_h, x0:x0 + self.crop_w]
 
-        for k in ("image1", "image2", "flow", "valid"):
+        for k in ("image1", "image2", "flow", "valid", "occlusion", "invalid"):
             if k in sample and sample[k] is not None:
                 sample[k] = _crop(sample[k])
 

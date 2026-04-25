@@ -4,395 +4,307 @@
 
 This document describes the integration of the `hqs_pytorch` folder with the main training framework. The merge unifies model development while keeping both codebases available for reference.
 
----
-
-## Changes Summary
-
-### 1. **Graveyard Folder Created**
-- **Location**: `/graveyard/`
-- **Purpose**: Stores deprecated code and alternative implementations
-- **Contents**: 
-  - Documentation of what was moved and why
-  - Reference implementations for bug fixes
-
-**Migration Decision**: The main `models/hqs_flow.py` is the authoritative implementation. It incorporates critical bug fixes from `hqs_pytorch` while maintaining full compatibility with:
-- Configuration system (`num_stages`, `weight_sharing`, etc.)
-- Training pipeline
-- Metrics collection
-- Loss functions
+The authoritative implementation is `models/hqs_flow.py`. It incorporates all critical bug fixes from `hqs_pytorch` while maintaining full compatibility with the configuration system, training pipeline, and metrics collection.
 
 ---
 
-## 2. **New Loss Functions**
+## Mathematical Formulation
 
-### OFCE Loss (Optical Flow Constraint Equation)
-**File**: `losses/flow_loss.py`
+Given two images $I_1, I_2$, optical flow $u$, and regularizer variable $v$:
 
-Enforces the brightness constancy assumption: `I_t + ∇I · u = 0`
+$$
+E(u, v) = D(u; I_1, I_2) + \frac{\mu}{2}\|u - v\|_2^2 + \lambda R(v)
+$$
 
-**Configuration**:
+Unrolled HQS iterations alternate between:
+
+$$
+u^{k+1} = \arg\min_u \; D(u; I_1, I_2) + \frac{\mu^k}{2}\|u - v^k\|_2^2
+$$
+
+$$
+v^{k+1} = \arg\min_v \; \frac{\mu^k}{2}\|u^{k+1} - v\|_2^2 + \lambda R(v)
+$$
+
+Each stage is realized by learned modules: a data/update network for the $u$-subproblem and a proximal/regularization network for the $v$-subproblem. The model is trained with a stage-weighted sequence loss.
+
+---
+
+## 1. Architecture and Authoritative Files
+
+`models/hqs_flow.py` is the single source of truth.
+
+Weight sharing modes (controlled by `model.weight_sharing`):
+
+- `share_all`: all stages share weights
+- `share_none`: each stage has independent weights
+- `share_update`: shared update/data network, independent prox
+- `share_prox`: shared prox network, independent update
+
+The `graveyard/` folder retains deprecated implementations as reference material only.
+
+---
+
+## 2. Loss Functions
+
+### SequenceLoss (default)
+
+Supervised stage-weighted loss with geometric decay. The final stage receives the largest weight.
+
 ```yaml
 loss:
-  ofce_weight: 0.01  # Set > 0 to enable
+  gamma: 0.85        # decay factor; lower = more weight on later stages
+  max_flow: 400.0    # clamp GT flow magnitude before loss
+  loss_fn: charbonnier
 ```
 
-**Usage**:
-```python
-ofce_loss = OFCELoss(weight=0.01)
-loss = ofce_loss(image1, image2, flow)
+### SmoothnessLoss
+
+Edge-aware spatial smoothness. Encourage gradients only in homogeneous regions.
+
+```yaml
+loss:
+  smooth_weight: 0.05    # set > 0 to enable
 ```
 
-### Existing Losses (Enhanced)
-- **PhotometricLoss**: SSIM + L1 photometric consistency (for semi-supervised training)
-- **SmoothnessLoss**: Edge-aware spatial smoothness regularizer
-- **SequenceLoss**: Main supervised loss with geometric decay over stages
+### PhotometricLoss
+
+Warping consistency for semi-supervised settings (no GT flow required).
+
+```yaml
+loss:
+  photo_weight: 0.05    # set > 0 to enable
+```
+
+### OFCE Loss
+
+Enforces the brightness constancy constraint $I_t + \nabla I \cdot u = 0$.
+
+```yaml
+loss:
+  ofce_weight: 0.01    # set > 0 to enable
+```
 
 ---
 
-## 3. **HSV Flow Visualization** 
+## 3. HSV Flow Visualization
 
-**New Module**: `utils/flow_visualization_hsv.py`
-
-This is the **preferred visualization method** going forward. It replaces the Middlebury `flow_to_color` visualization.
-
-### Key Functions
+**Module**: `utils/flow_visualization_hsv.py` — preferred over the legacy Middlebury visualizer.
 
 ```python
 from utils import flow_to_hsv, flow_to_hsv_batch, create_flow_colorwheel
 
-# Single flow visualization
-flow_hsv = flow_to_hsv(flow)  # (H, W, 2) → (H, W, 3) uint8 RGB
-
-# Batch visualization
-flows_hsv = flow_to_hsv_batch(flow_batch)  # List of RGB images
-
-# Reference colorwheel
-wheel = create_flow_colorwheel()  # (H, W, 3) uint8 RGB
+flow_hsv = flow_to_hsv(flow)          # (H, W, 2) → (H, W, 3) uint8 RGB
+flows_hsv = flow_to_hsv_batch(batch)  # List of RGB images
+wheel = create_flow_colorwheel()      # Reference colorwheel image
 ```
 
-### Visualization Properties
-- **Hue**: Flow direction (angle)
-- **Saturation**: Flow magnitude (speed)
-- **Value**: Constant brightness (255)
-- **Invalid/Unknown**: Gray (magnitude > threshold)
+Hue encodes direction; saturation encodes magnitude; value is constant.
 
-### Migration from Middlebury
-```python
-# Old (Middlebury)
-from utils import flow_to_color
-rgb = flow_to_color(flow)
-
-# New (HSV)
-from utils import flow_to_hsv
-rgb = flow_to_hsv(flow)
-```
-
-Both are still available for backward compatibility.
+Both `flow_to_hsv` and the legacy `flow_to_color` remain importable.
 
 ---
 
-## 4. **New Evaluation Scripts**
+## 4. Evaluation Scripts
 
-### A. Comprehensive Evaluation (`evaluate_comprehensive.py`)
+### Comprehensive Evaluation (`evaluate_comprehensive.py`)
 
-**Purpose**: Evaluate model and save all intermediate results
+Produces flows, visualizations, error maps, and per-sample/aggregated metrics.
 
-**Features**:
-- Saves predicted flows in `.flo` format
-- Saves ground truth flows
-- Creates HSV visualizations for all flows
-- Computes per-sample metrics (EPE, F1, smoothness, OFCE)
-- Saves stage-by-stage convergence plots
-- Saves error heat maps
-- Saves intermediate states for detailed inspection
+Saves predicted flows (`.flo`), HSV visualizations, error maps, per-sample metrics, and stage convergence plots.
 
-**Usage**:
 ```bash
 python evaluate_comprehensive.py \
-  --config configs/default.yaml \
-  --checkpoint checkpoints/best.pth \
-  --data_config configs/default.yaml \
-  --output_dir results/eval_run_1 \
-  --batch_size 4
+  --config configs/sintel_ft.yaml \
+  --checkpoint checkpoints/hqs_flow_sintel/best.pth \
+  --data_config configs/sintel_ft.yaml \
+  --output_dir results/eval_sintel
 ```
 
-**Output Structure**:
-```
-results/eval_run_1/
-├── flows/                      # Predicted flows (.flo)
-├── flows_hsv/                  # Predicted flows (HSV PNG)
-├── gt_flows/                   # Ground truth flows (.flo)
-├── gt_flows_hsv/              # Ground truth flows (HSV PNG)
-├── errors/                     # Error maps (EPE visualization)
-├── intermediate_stages/        # Multi-stage convergence grids
-├── stage_convergence/          # Convergence plots
-├── metrics_detailed.json       # Per-sample metrics
-├── metrics_summary.json        # Aggregated metrics
+Output layout:
+
+```text
+results/eval_sintel/
+├── flows/                    # Predicted flows (.flo)
+├── flows_hsv/                # Predicted flows (HSV PNG)
+├── gt_flows/                 # Ground truth flows (.flo)
+├── gt_flows_hsv/             # GT flows (HSV PNG)
+├── errors/                   # EPE error maps
+├── intermediate_stages/      # Multi-stage convergence grids
+├── stage_convergence/        # Convergence plots
+├── metrics_detailed.json     # Per-sample metrics
+├── metrics_summary.json      # Aggregated metrics
 └── flow_colorwheel_reference.png
 ```
 
-### B. Stage Progression Visualization (`visualize_stages.py`)
+### Stage Progression Visualization (`visualize_stages.py`)
 
-**Purpose**: Create detailed visualizations of HQS stage convergence
+Shows flow evolution across all unrolled HQS stages. Useful for diagnosing slow convergence or divergence.
 
-**Features**:
-- Shows optical flow at each stage
-- Displays error maps and magnitude differences
-- Plots EPE convergence curve
-- Tracks improvement percentage per stage
-- Shows flow magnitude evolution
-
-**Usage**:
 ```bash
 python visualize_stages.py \
-  --config configs/default.yaml \
-  --checkpoint checkpoints/best.pth \
-  --data_config configs/default.yaml \
-  --output_dir results/stage_viz \
+  --config configs/sintel_ft.yaml \
+  --checkpoint checkpoints/hqs_flow_sintel/best.pth \
+  --data_config configs/sintel_ft.yaml \
+  --output_dir results/stages_sintel \
   --num_samples 10
 ```
 
-**Output**:
-```
-results/stage_viz/
-├── sample_0000_stages.png         # 3-column grid: flow, error, magnitude
-├── sample_0000_convergence.png    # EPE + improvement curves
-├── sample_0001_stages.png
-├── sample_0001_convergence.png
-└── ...
-```
+Output per sample: `sample_XXXX_stages.png` (flow/error/magnitude grid) and `sample_XXXX_convergence.png` (EPE curve).
 
 ---
 
-## 5. **Trainer Enhancements**
-
-### Loss Component Logging
-
-The trainer now logs all loss components during training:
-- **loss**: Total weighted loss
-- **epe**: Endpoint error
-- **smooth**: Smoothness loss (if enabled)
-- **photo**: Photometric loss (if enabled)
-- **ofce**: OFCE loss (if enabled)
-- **f1, s0_10, s10_40, s40_plus**: Speed-stratified metrics
-
-**Configuration**:
-```yaml
-loss:
-  gamma: 0.85
-  max_flow: 400.0
-  loss_fn: charbonnier
-  smooth_weight: 0.05          # Enable smoothness loss
-  photo_weight: 0.0            # Enable photometric loss
-  ofce_weight: 0.01            # Enable OFCE loss
-```
+## 5. Trainer and Metrics
 
 ### Progress Display
 
-During training, the batch progress bar now shows:
-```
-Epoch 1 | loss: 0.0234 | epe: 1.456 | f1: 5.3% | s0_10: 0.892 | s10_40: 1.234 | s40+: 3.456
+During training:
+
+```text
+Epoch 1 | loss: 0.0234 | epe: 1.456 | f1: 5.3%
+         s0_10: 0.892 | s10_40: 1.234 | s40+: 3.456
+         d0: 1.123 | d0_10: 0.987 | d10_60: 1.456 | d60_140: 1.890 | d140+: 2.345
          smooth: 0.0032 | photo: 0.0045 | ofce: 0.0089 | lr: 4.00e-04
 ```
 
+Distance-to-occlusion metrics (`d0` through `d140_plus`) are logged when the dataset provides occlusion masks. If masks are absent, a one-time warning is emitted and these keys are omitted.
+
+### Resume Modes
+
+Controlled by `training.resume_mode`:
+
+- `full` (default): restores model, optimizer, scheduler, gradient scaler, and global step counter
+- `weights_only`: loads model weights only, resets everything else — use for curriculum warm-starts
+
+### Metrics Reference
+
+| Key | Meaning |
+| --- | ------- |
+| `epe_all` | Mean endpoint error over all valid pixels |
+| `epe_matched` | EPE on visible/matched pixels |
+| `epe_unmatched` | EPE on occluded pixels |
+| `f1` | KITTI-style outlier percentage |
+| `s0_10`, `s10_40`, `s40_plus` | Speed-stratified EPE |
+| `d0`, `d0_10`, `d10_60`, `d60_140`, `d140_plus` | Distance-to-occlusion-boundary EPE (Sintel) |
+
 ---
 
-## 6. **Configuration Updates**
+## 6. Configuration Reference
 
-### New Config Fields
+### Resume Mode
 
 ```yaml
-# losses/flow_loss.py
-loss:
-  ofce_weight: 0.0    # Optical Flow Constraint Equation
-
-# Already available:
-# - smooth_weight
-# - photo_weight
+training:
+  checkpoint: checkpoints/hqs_flow_default/best.pth
+  resume_mode: weights_only    # or: full
 ```
 
-### Example Configurations
+### Loss Terms
 
-#### Supervised Only (Baseline)
 ```yaml
 loss:
-  gamma: 0.85
-  max_flow: 400.0
+  gamma: 0.85          # sequence loss geometric decay
+  max_flow: 400.0      # GT flow clamp
   loss_fn: charbonnier
-  smooth_weight: 0.0
-  photo_weight: 0.0
-  ofce_weight: 0.0
-```
-
-#### With Physics Constraints
-```yaml
-loss:
-  gamma: 0.85
-  max_flow: 400.0
-  loss_fn: charbonnier
-  smooth_weight: 0.05    # Edge-aware smoothness
-  ofce_weight: 0.01      # Brightness constancy
-```
-
-#### Semi-Supervised
-```yaml
-loss:
-  gamma: 0.85
-  max_flow: 400.0
-  loss_fn: charbonnier
-  smooth_weight: 0.05
-  photo_weight: 0.05     # Photometric consistency
-  ofce_weight: 0.01
+  smooth_weight: 0.05  # edge-aware smoothness (0 to disable)
+  photo_weight: 0.0    # photometric consistency (0 to disable)
+  ofce_weight: 0.01    # brightness constancy (0 to disable)
 ```
 
 ---
 
-## 7. **Backward Compatibility**
+## 7. Command Cookbook
 
-### What Still Works
-- Old `flow_to_color` visualization (imported from `visualization.py`)
-- Existing training configs (smooth_weight and photo_weight)
-- All model architectures (BasicEncoder, CorrBlock, etc.)
-- Checkpoint loading (backward compatible)
+### Train from scratch
 
-### What's New (Opt-in)
-- HSV flow visualization (preferred but optional)
-- OFCE loss (disabled by default)
-- Comprehensive evaluation scripts
-- Stage progression visualization
-
----
-
-## 8. **Migration Checklist**
-
-### For Existing Projects
-- [ ] Update configs to enable new losses (if desired)
-- [ ] Switch to HSV visualization: `from utils import flow_to_hsv`
-- [ ] Try `evaluate_comprehensive.py` for detailed evaluation
-- [ ] Use `visualize_stages.py` to analyze convergence
-
-### For New Projects
-- [ ] Use HSV visualization by default
-- [ ] Enable OFCE loss for physics-informed training
-- [ ] Use comprehensive evaluation pipeline
-- [ ] Use stage visualization for model analysis
-
----
-
-## 9. **Key Architectural Decisions**
-
-### Why Keep models/hqs_flow.py as Primary?
-1. **Integration**: Fully integrated with config system, training pipeline, and metrics
-2. **Weight Sharing**: Supports share_all, share_none, share_update, share_prox
-3. **Maintainability**: Single source of truth for model implementation
-4. **Bug Fixes**: Critical fixes backported from hqs_pytorch
-
-### Why Create Graveyard?
-1. **Reference**: hqs_pytorch provides valuable documentation and bug fix details
-2. **Historical Record**: AUDIT_REPORT.md documents all fixes applied
-3. **Alternative Implementations**: Available if different architecture is needed
-4. **Learning Resource**: Useful for understanding the bug fixes
-
----
-
-## 10. **Troubleshooting**
-
-### OFCE Loss Returns NaN
-- Check image normalization (images should be in [0, 1] or [-1, 1])
-- Reduce `ofce_weight` to very small value (1e-4)
-- Ensure images1 and image2 are computed correctly
-
-### HSV Visualization Looks Wrong
-- Check flow magnitude scaling (max_magnitude parameter)
-- Verify flow direction conventions ([dx, dy])
-- Ensure valid mask is applied correctly
-
-### Stage Convergence Doesn't Show Improvement
-- Verify model is not stuck in local minimum
-- Check that intermediate stages are being saved correctly
-- Ensure batch size is sufficient for stable gradients
-
----
-
-## 11. **Performance Benchmarks**
-
-### Training Impact
-- Adding OFCE loss: ~2% slowdown, improved physics adherence
-- Adding photometric loss: ~3% slowdown, better generalization
-- HSV visualization: negligible overhead (computed only at eval time)
-
-### Memory Impact
-- Intermediate stages storage: ~50MB per 1000 samples (with .flo format)
-- Loss computation: <1% additional memory
-
----
-
-## 12. **References**
-
-### Files Modified
-- `losses/flow_loss.py` – Added OFCELoss class
-- `losses/__init__.py` – Export OFCELoss
-- `utils/__init__.py` – Export HSV visualization functions
-- `utils/flow_visualization_hsv.py` – New HSV visualization module
-- `configs/default.yaml` – Added ofce_weight parameter
-- `engine/trainer.py` – Enhanced loss logging
-
-### Files Created
-- `evaluate_comprehensive.py` – Full evaluation pipeline
-- `visualize_stages.py` – Stage progression visualization
-- `graveyard/README.md` – Deprecation guide
-- `INTEGRATION_GUIDE.md` – This file
-
-### Files Available for Reference
-- `graveyard/` – Original hqs_pytorch implementation
-- `hqs_pytorch/IMPLEMENTATION_FIXES.md` – Detailed bug fix documentation
-- `hqs_pytorch/AUDIT_REPORT.md` – Complete audit trail
-
----
-
-## Quick Start
-
-### 1. Enable New Losses
-```yaml
-# configs/my_config.yaml
-loss:
-  smooth_weight: 0.05
-  photo_weight: 0.0
-  ofce_weight: 0.01
-```
-
-### 2. Train with New Losses
 ```bash
-python train.py --config configs/my_config.yaml
+python train.py --config configs/default.yaml
 ```
 
-### 3. Evaluate and Visualize
+### Resume full training state
+
+```bash
+python train.py --config configs/default.yaml \
+  training.checkpoint=checkpoints/hqs_flow_default/last.pth \
+  training.resume_mode=full
+```
+
+### Curriculum warm-start on Sintel
+
+```bash
+python train.py --config configs/sintel_ft.yaml
+```
+
+`sintel_ft.yaml` sets `resume_mode: weights_only` so the OneCycle schedule restarts from zero.
+
+### Sintel-only training
+
+```bash
+python train.py --config configs/sintel_only.yaml
+```
+
+No mixed FlyingThings dataset; designed for final fine-tuning.
+
+### Standard evaluation
+
+```bash
+python evaluate.py \
+  --config configs/sintel_ft.yaml \
+  --checkpoint checkpoints/hqs_flow_sintel/best.pth
+```
+
+### Comprehensive evaluation
+
 ```bash
 python evaluate_comprehensive.py \
-  --config configs/my_config.yaml \
-  --checkpoint checkpoints/best.pth \
-  --data_config configs/my_config.yaml \
-  --output_dir results/eval
+  --config configs/sintel_ft.yaml \
+  --checkpoint checkpoints/hqs_flow_sintel/best.pth \
+  --data_config configs/sintel_ft.yaml \
+  --output_dir results/eval_sintel
+```
 
+### Stage progression analysis
+
+```bash
 python visualize_stages.py \
-  --config configs/my_config.yaml \
-  --checkpoint checkpoints/best.pth \
-  --data_config configs/my_config.yaml \
-  --output_dir results/stages \
-  --num_samples 5
+  --config configs/sintel_ft.yaml \
+  --checkpoint checkpoints/hqs_flow_sintel/best.pth \
+  --data_config configs/sintel_ft.yaml \
+  --output_dir results/stages_sintel \
+  --num_samples 10
+```
+
+### Disable MLflow for local debugging
+
+```bash
+python train.py --config configs/default.yaml mlflow.enabled=false
 ```
 
 ---
 
-## Support
+## 8. Troubleshooting
 
-For issues or questions:
-1. Check `graveyard/README.md` for what was changed
-2. Review `hqs_pytorch/IMPLEMENTATION_FIXES.md` for bug fix details
-3. Check trainer logs for loss component values
-4. Use `visualize_stages.py` to debug convergence issues
+**OFCE loss is NaN**: check image normalization (expected `[0, 1]` or `[-1, 1]`); start with `ofce_weight: 0.001`.
+
+**Distance metrics missing**: dataset has no occlusion masks. A one-time warning is logged. Metrics are expected to be absent on non-Sintel datasets.
+
+**Curriculum LR not resetting**: ensure `resume_mode: weights_only` is set in the fine-tuning config, not `full`.
+
+**MLflow TLS warning at startup**: set `mlflow.insecure_tls: false` in `default.yaml`. The trainer clears the `MLFLOW_TRACKING_INSECURE_TLS` env var automatically when disabled.
 
 ---
 
-Generated: 2026-04-23
-Version: 1.0
+## 9. File Reference
+
+| File | Purpose |
+| ---- | ------- |
+| `models/hqs_flow.py` | Authoritative HQSFlow model |
+| `engine/trainer.py` | Training loop, checkpoint I/O, MLflow |
+| `data/augmentation.py` | Spatial/photometric augmentation |
+| `losses/flow_loss.py` | SequenceLoss + auxiliary losses |
+| `utils/flow_visualization_hsv.py` | HSV flow visualizer |
+| `configs/default.yaml` | Base configuration |
+| `configs/sintel_ft.yaml` | Sintel fine-tune (weights_only resume) |
+| `configs/sintel_only.yaml` | Sintel-only training |
+| `graveyard/` | Deprecated implementations (reference only) |
+| `hqs_pytorch/AUDIT_REPORT.md` | Bug fix audit trail |

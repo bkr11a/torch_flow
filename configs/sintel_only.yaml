@@ -1,0 +1,96 @@
+# =============================================================================
+# MPI-Sintel only training config (standalone, no mixed datasets)
+# =============================================================================
+
+run_name: hqs_flow_sintel_only
+log_dir: logs
+checkpoint_dir: checkpoints
+use_wandb: false
+wandb_project: hqs_flow
+
+mlflow:
+  enabled: true
+  tracking_uri: "https://mlflow.spicedrice.home/"
+  experiment_name: "torch_flow_sintel"
+  insecure_tls: false
+  strict: false
+  log_checkpoints: true
+  log_tensorboard: true
+  register_best: true
+  registered_model_name: "HQSFlowTFPort"
+  best_alias: "best"
+  tags:
+    project: "torch_flow"
+    framework: "pytorch"
+    dataset: "sintel_only"
+
+model:
+  num_stages: 12
+  weight_sharing: share_all
+  upsample_scale: 8
+
+  encoder:
+    type: basic
+    output_dim: 256
+    norm: instance
+    output_stride: 8
+    dropout: 0.0
+
+  context:
+    type: basic
+    output_dim: 128
+    norm: batch
+    output_stride: 8
+    dropout: 0.0
+
+  corr:
+    type: all_pairs
+    num_levels: 4
+    radius: 4
+
+  update_net:
+    hidden_dim: 128
+    head_dim: 256
+
+  prox:
+    type: unet
+    base_ch: 64
+    depth: 3
+
+loss:
+  gamma: 0.85
+  max_flow: 400.0
+  loss_fn: charbonnier
+  smooth_weight: 0.0
+  photo_weight: 0.0
+  ofce_weight: 0.0
+
+training:
+  num_steps: 100000
+  lr: 1.25e-4
+  weight_decay: 1.0e-4
+  warmup_pct: 0.05
+  grad_clip: 1.0
+  log_every: 100
+  val_every: 5000
+  save_every: 10000
+  checkpoint: checkpoints/things_final.pth
+  resume_mode: weights_only
+
+data:
+  name: sintel
+  root: /data/MPI-Sintel
+  batch_size: 6
+  num_workers: 4
+  crop_size: [368, 768]
+  min_scale: -0.2
+  max_scale: 0.6
+  dstype: both
+
+val_data:
+  name: sintel
+  root: /data/MPI-Sintel
+  batch_size: 1
+  num_workers: 2
+  crop_size: [436, 1024]
+  dstype: final

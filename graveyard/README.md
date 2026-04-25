@@ -1,28 +1,48 @@
-# Graveyard 🪦
+# Graveyard
 
-This folder contains deprecated code, experimental implementations, and superseded components that are no longer part of the primary codebase.
+This folder stores deprecated or superseded code kept only for reference.
 
-## Contents
+It is intentionally not part of the primary training and evaluation path.
 
-### hqs_pytorch_original/
-The original TensorFlow-ported HQSFlowModel from `hqs_pytorch/` before integration with the main training framework. This implementation, while containing important bug fixes, has been superseded by the unified `models/hqs_flow.py` which incorporates:
-- Full configuration system compatibility
-- Integrated weight-sharing mechanisms (share_all, share_none, etc.)
-- Compatible with the standard training pipeline and metrics
-- Bug fixes from hqs_pytorch backported where applicable
+## Purpose
 
-**Why deprecated**: The main `models/hqs_flow.py` is now the authoritative implementation with all necessary features and bug fixes applied, maintained in a single location for consistency.
+Use this directory for:
 
----
+- historical context
+- migration reference
+- checking prior implementations when debugging regressions
 
-## Migration Notes
+Do not build new features on graveyard code unless you are intentionally reviving archived behavior.
 
-If you need to reference or restore code from the graveyard:
+## Cookbook Commands
 
-1. **Bug fixes from hqs_pytorch**: Check `models/hqs_flow.py` for issues #4, #5, #10 implementations
-2. **Original layers**: If you need specific layer implementations, check graveyard backup
-3. **Historical context**: AUDIT_REPORT.md documents all fixes that were applied
+### List archived assets
 
----
+```bash
+ls -la graveyard
+```
 
-Generated: 2026-04-23
+Purpose: see what is archived.
+
+### Compare archived vs active implementation
+
+```bash
+diff -u graveyard/README.md README.md | sed -n '1,200p'
+```
+
+Purpose: quickly compare documentation intent and current direction.
+
+### Search for references to graveyard code
+
+```bash
+rg "graveyard|hqs_pytorch_original" -n
+```
+
+Purpose: ensure active paths do not accidentally depend on deprecated modules.
+
+## Migration Guidance
+
+1. Identify the required behavior from archived code.
+2. Re-implement in active modules under `models/`, `data/`, `engine/`, or `utils/`.
+3. Add tests/verification in the active pipeline.
+4. Keep graveyard files unchanged except for documentation.

@@ -9,6 +9,7 @@ training:
   num_steps: 100000
   lr: 1.25e-4
   checkpoint: checkpoints/things_final.pth
+  resume_mode: weights_only
 
 loss:
   gamma: 0.85

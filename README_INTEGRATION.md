@@ -1,310 +1,161 @@
-# HQS PyTorch Flow - Complete Implementation Summary
+# HQSFlow Integration README
 
-**Date**: April 23, 2026  
-**Status**: ✅ **COMPLETE**
+This document explains what was integrated into the main training framework, why those integrations matter, and how to run the most common tasks.
 
----
+## What Is Integrated
 
-## 🎯 Mission Accomplished
+The codebase includes a unified path for:
 
-Successfully merged `hqs_pytorch` TensorFlow-ported implementation with the main training framework, adding:
+- model construction through config
+- loss composition (sequence, smoothness, photometric, OFCE)
+- dataset + augmentation + mask handling
+- checkpoint resume and warm-start behavior
+- standard and comprehensive evaluation scripts
 
-1. ✅ Unified model architecture with config compatibility
-2. ✅ OFCE (Optical Flow Constraint Equation) loss
-3. ✅ HSV flow visualization (preferred over Middlebury)
-4. ✅ Comprehensive evaluation pipeline with flow saving
-5. ✅ Stage progression visualization for convergence analysis
-6. ✅ All 15+ bug fixes integrated
-7. ✅ 100% backward compatibility
-8. ✅ Complete documentation and guides
+Key behavior now present:
 
----
+- occlusion and invalid masks follow the same crop/flip/resize as flow and valid masks
+- Sintel distance metrics are surfaced in training logs
+- curriculum warm-start can reset step and scheduler with `training.resume_mode=weights_only`
 
-## 📊 What Was Accomplished
+## HQS Model Math (Implementation View)
 
-### 🔧 New Features Implemented
+The model approximates alternating minimization of:
 
-| Feature | File(s) | Lines | Purpose |
-|---------|---------|-------|---------|
-| HSV Visualization | `utils/flow_visualization_hsv.py` | 187 | Superior flow visualization |
-| OFCE Loss | `losses/flow_loss.py` | +60 | Physics-informed training |
-| Comprehensive Eval | `evaluate_comprehensive.py` | 549 | Full evaluation pipeline |
-| Stage Visualization | `visualize_stages.py` | 514 | Convergence analysis |
-| Enhanced Trainer | `engine/trainer.py` | +10 | Loss component logging |
-| Integration Docs | Various `.md` files | 800+ | Complete guides |
+$$
+E(u, v) = D(u) + \frac{\mu}{2}\|u-v\|_2^2 + \lambda R(v)
+$$
 
-### 📝 Documentation Created
+Per unrolled stage $k$:
 
-1. **INTEGRATION_GUIDE.md** - Comprehensive overview (12 sections)
-2. **SCRIPTS_QUICKSTART.md** - Quick-start examples for new scripts
-3. **MERGE_SUMMARY.md** - Detailed merge summary
-4. **graveyard/README.md** - Deprecation guide
-5. **verify_integration.py** - Verification checklist
+$$
+u^{k+1} \approx \mathcal{D}_{\theta_k}(u^k, v^k, I_1, I_2, \text{corr})
+$$
 
-### 🐛 Bug Fixes Applied
+$$
+v^{k+1} \approx \mathcal{R}_{\phi_k}(u^{k+1}, I_1)
+$$
 
-All 15 critical/high-severity bugs from `hqs_pytorch` reviewed:
-- ✅ 5 critical fixes applied
-- ✅ 5 high-severity fixes applied  
-- ✅ Proper flow coordinate convention [dy, dx]
-- ✅ Dynamic padding instead of hardcoded sizes
-- ✅ Correct flow direction in all computations
+Where:
 
----
+- $\mathcal{D}_{\theta_k}$ is the learned data/update block
+- $\mathcal{R}_{\phi_k}$ is the learned proximal/regularization block
+- outputs across stages are supervised with weighted sequence loss
 
-## 🚀 How to Use
+## Command Cookbook
 
-### Quick Start (3 steps)
+### Validate the repository wiring
 
 ```bash
-# 1. Verify everything is working
 python verify_integration.py
+```
 
-# 2. Train with OFCE loss (physics-informed)
-python train.py --config configs/default.yaml loss.ofce_weight=0.01
+Purpose: confirms imports, configs, and main integration points are healthy.
 
-# 3. Comprehensive evaluation
+### Base training
+
+```bash
+python train.py --config configs/default.yaml
+```
+
+Purpose: run the default recipe with secure MLflow defaults.
+
+### Warm-start curriculum stage (reset LR schedule)
+
+```bash
+python train.py --config configs/sintel_ft.yaml
+```
+
+Purpose: load model weights from checkpoint while resetting step/scheduler due to `resume_mode=weights_only`.
+
+### Force full resume behavior
+
+```bash
+python train.py --config configs/default.yaml \
+  training.checkpoint=checkpoints/hqs_flow_default/last.pth \
+  training.resume_mode=full
+```
+
+Purpose: continue exact optimizer/scheduler/global-step state.
+
+### Train Sintel-only setup
+
+```bash
+python train.py --config configs/sintel_only.yaml
+```
+
+Purpose: run pure Sintel training without mixed dataset composition.
+
+### Evaluate checkpoint
+
+```bash
+python evaluate.py \
+  --config configs/sintel_ft.yaml \
+  --checkpoint checkpoints/hqs_flow_sintel/best.pth
+```
+
+Purpose: run standard evaluation metrics.
+
+### Produce comprehensive outputs
+
+```bash
 python evaluate_comprehensive.py \
-  --config configs/default.yaml \
-  --checkpoint checkpoints/best.pth \
-  --data_config configs/default.yaml \
-  --output_dir results/eval
+  --config configs/sintel_ft.yaml \
+  --checkpoint checkpoints/hqs_flow_sintel/best.pth \
+  --data_config configs/sintel_ft.yaml \
+  --output_dir results/eval_sintel
 ```
 
-### Common Tasks
+Purpose: generate richer reports and artifacts.
 
-#### Enable OFCE Loss
-```yaml
-# In config file
-loss:
-  ofce_weight: 0.01  # Enable physics constraints
-  smooth_weight: 0.05  # Edge-aware smoothness (optional)
-```
+### Visualize stage progression
 
-#### Visualize Flow with HSV
-```python
-from utils import flow_to_hsv
-rgb = flow_to_hsv(flow)  # HSV visualization
-```
-
-#### Analyze Convergence
 ```bash
 python visualize_stages.py \
-  --config cfg.yaml \
-  --checkpoint best.pth \
-  --data_config cfg.yaml \
-  --output_dir results/stages
+  --config configs/sintel_ft.yaml \
+  --checkpoint checkpoints/hqs_flow_sintel/best.pth \
+  --data_config configs/sintel_ft.yaml \
+  --output_dir results/stages_sintel \
+  --num_samples 10
 ```
 
----
+Purpose: inspect how flow evolves through the HQS unrolled stages.
 
-## 📦 What's Included
+### Enable OFCE in training
 
-### Core Modules (Updated)
-- ✅ `losses/` - Added OFCELoss
-- ✅ `utils/` - Added HSV visualization  
-- ✅ `engine/trainer.py` - Enhanced logging
-- ✅ `configs/` - Added ofce_weight parameter
-
-### New Scripts
-- ✅ `evaluate_comprehensive.py` - Full evaluation
-- ✅ `visualize_stages.py` - Convergence visualization
-- ✅ `verify_integration.py` - Verification checklist
-
-### Preserved (Reference)
-- ✅ `hqs_pytorch/` - Original implementation for reference
-- ✅ `graveyard/` - Deprecation documentation
-
----
-
-## 🎓 Key Concepts
-
-### Flow Visualization
-- **HSV Method** (New, Preferred)
-  - Hue = Direction
-  - Saturation = Magnitude
-  - Value = Brightness
-  
-### Loss Functions
-- **SequenceLoss** - Main supervised loss (weighted over stages)
-- **SmoothnessLoss** - Edge-aware spatial regularization
-- **PhotometricLoss** - Warping consistency (semi-supervised)
-- **OFCELoss** - Physics constraint (NEW)
-
-### Stage Progression
-Shows how optical flow improves through:
-- Data subproblem (UpdateNet)
-- Regularization subproblem (ProxNet)
-- Repeated for each HQS stage
-
----
-
-## 🔍 Verification
-
-Run the verification script:
 ```bash
-python verify_integration.py
+python train.py --config configs/default.yaml loss.ofce_weight=0.01
 ```
 
-Checks:
-- ✅ All new files created
-- ✅ All modifications applied
-- ✅ Modules importable
-- ✅ Configuration valid
-- ✅ Model builds
-- ✅ Forward pass works
-- ✅ Losses compute
-- ✅ HSV visualization works
+Purpose: add physics-inspired constraint loss.
 
----
+## Logging and Metrics Notes
 
-## 📈 Performance Impact
+What you should see during training and validation:
 
-### Training Time
-- OFCE loss: +2% (optional)
-- Smoothness loss: +1% (optional)
-- **Default**: No overhead
+- core: `loss`, `epe_matched`, `epe_unmatched`, `epe_all`, `f1`
+- speed buckets: `s0_10`, `s10_40`, `s40_plus`
+- Sintel distance buckets: `d0`, `d0_10`, `d10_60`, `d60_140`, `d140_plus`
 
-### Memory
-- Minimal additional memory
-- Flows storage: ~8 bytes/pixel
-- Intermediate stages: Optional
+If the dataset does not provide occlusion masks, distance buckets may be absent/NaN and the trainer emits a warning.
 
-### Evaluation Speed
-- Comprehensive eval: ~50 samples/sec (GPU)
-- Stage visualization: ~20 samples/sec (GPU)
+## MLflow Notes
 
----
+Recommended production settings:
 
-## 🔄 Backward Compatibility
+- `mlflow.insecure_tls: false`
+- valid CA trust chain installed on training hosts
+- writable artifact destination configured server-side
 
-### ✅ 100% Compatible
-- Old configs work unchanged
-- Old checkpoints load fine
-- Old training scripts run identically
-- Old visualizations still available
+Local/offline fallback:
 
-### 🆕 New Features Are Opt-in
-- OFCE loss disabled by default
-- HSV visualization available alongside old method
-- New scripts are additional tools
-
----
-
-## 📚 Documentation Structure
-
-```
-Repository Root
-├── INTEGRATION_GUIDE.md          ← Start here for overview
-├── SCRIPTS_QUICKSTART.md         ← Examples for new scripts
-├── MERGE_SUMMARY.md              ← Detailed merge info
-├── verify_integration.py          ← Run to verify setup
-├── graveyard/README.md            ← What was moved and why
-├── evaluate_comprehensive.py     ← Comprehensive evaluation
-├── visualize_stages.py           ← Stage analysis
-├── hqs_pytorch/
-│   ├── AUDIT_REPORT.md           ← Bug audit details
-│   └── IMPLEMENTATION_FIXES.md    ← Fix documentation
-└── configs/
-    └── default.yaml              ← Updated with ofce_weight
-```
-
----
-
-## 🎯 Next Steps for Users
-
-### Option A: Use As-Is (Default)
-- Existing training works perfectly
-- No configuration changes needed
-- Old visualizations available
-
-### Option B: Try Physics Constraints
-```yaml
-loss:
-  ofce_weight: 0.01  # Enable OFCE loss
-```
-
-### Option C: Try HSV Visualization
-```python
-from utils import flow_to_hsv
-```
-
-### Option D: Full Analysis
 ```bash
-# Comprehensive evaluation
-python evaluate_comprehensive.py ...
-
-# Stage convergence analysis
-python visualize_stages.py ...
+python train.py --config configs/default.yaml mlflow.enabled=false
 ```
 
----
+## Integration Checklist
 
-## 🏆 Quality Checklist
-
-- ✅ All features implemented and tested
-- ✅ Full backward compatibility maintained
-- ✅ Comprehensive documentation provided
-- ✅ Code follows existing style/conventions
-- ✅ Verification script included
-- ✅ Examples provided for all new features
-- ✅ Error handling implemented
-- ✅ Type hints included
-- ✅ Docstrings complete
-- ✅ Config system integrated
-- ✅ Trainer enhanced but backward compatible
-- ✅ Loss functions properly tested
-- ✅ Visualization quality verified
-
----
-
-## 📞 Support & Reference
-
-### For Understanding Changes
-1. Read `INTEGRATION_GUIDE.md` for complete overview
-2. Check `MERGE_SUMMARY.md` for what changed
-3. Review `hqs_pytorch/IMPLEMENTATION_FIXES.md` for bug details
-
-### For Using New Features
-1. See `SCRIPTS_QUICKSTART.md` for examples
-2. Try `verify_integration.py` to test setup
-3. Run `evaluate_comprehensive.py` for evaluation
-4. Use `visualize_stages.py` for analysis
-
-### For Troubleshooting
-1. Check docstrings in source files
-2. Review example configs
-3. Run `verify_integration.py` to diagnose issues
-4. Check loss values during training
-
----
-
-## 🎉 Summary
-
-**The hqs_pytorch integration is complete and production-ready!**
-
-- ✅ All features implemented
-- ✅ Full documentation provided
-- ✅ Backward compatibility guaranteed
-- ✅ Verification tools included
-- ✅ Examples and guides available
-
-You can now:
-- Use the model exactly as before (fully compatible)
-- Try OFCE loss for physics-informed training (optional)
-- Visualize flows with HSV (new, preferred method)
-- Evaluate models comprehensively (new pipeline)
-- Analyze convergence (new tool)
-
-**Start with**: `python verify_integration.py` to confirm everything works, then explore the new features as desired!
-
----
-
-**Status**: ✅ Production Ready  
-**Backward Compatibility**: ✅ 100%  
-**Documentation**: ✅ Comprehensive  
-**Testing**: ✅ Complete
-
----
-
-*Integration completed: April 23, 2026*
+1. Run `verify_integration.py`.
+2. Start a short training run and confirm distance metrics/logging presence.
+3. Warm-start from a checkpoint and confirm step resets when expected.
+4. Run evaluation and stage visualization scripts.

@@ -1,146 +1,223 @@
-# Half-Quadratic Splitting Optical Flow (HQSFlow)
+# HQSFlow (PyTorch)
 
-A PyTorch implementation of an **unrolled, learned Half-Quadratic Splitting (HQS)** network for optical flow estimation.
+HQSFlow is an optical flow training and evaluation framework built around an unrolled Half-Quadratic Splitting (HQS) solver.
+
+This repository supports:
+
+- multi-stage curriculum training
+- dense and sparse optical flow datasets
+- optional MLflow/TensorBoard logging
+- robust metrics, including Sintel distance-to-occlusion metrics
 
 ## Mathematical Formulation
 
-The optical flow energy minimization:
+Given two images $I_1, I_2$, optical flow $u$, and regularizer variable $v$, we optimize:
 
-$$E(u) = \sum_x \rho\bigl(I_1(x) - I_2(x + u(x))\bigr) + \lambda\,\phi(u)$$
+$$
+E(u, v) = D(u; I_1, I_2) + \frac{\mu}{2}\|u - v\|_2^2 + \lambda R(v)
+$$
 
-HQS introduces auxiliary variable $v$ to decouple data and regularization:
+Where:
 
-$$E(u, v) = \underbrace{\sum_x \rho\bigl(I_1(x) - I_2(x+u)\bigr)}_{\text{data term}} + \frac{\mu}{2}\|u - v\|^2 + \underbrace{\lambda\,\phi(v)}_{\text{regularizer}}$$
+- $D(u; I_1, I_2)$ is the data term (photometric and/or learned matching consistency)
+- $R(v)$ is the regularization prior
+- $\mu$ is the HQS coupling parameter
 
-Alternating minimization produces two subproblems per stage $k$:
+Unrolled HQS iterations alternate:
 
-1. **Data subproblem** — solved by a learned ConvGRU update network $\mathcal{D}_\theta$:
-$$u^{k+1} = \mathcal{D}_\theta\!\left(f_1, f_2, \mathrm{CorrVol}(f_1, f_2, u^k),\; u^k,\; v^k,\; \mu^k\right)$$
+$$
+u^{k+1} = \arg\min_u \; D(u; I_1, I_2) + \frac{\mu^k}{2}\|u - v^k\|_2^2
+$$
 
-2. **Proximal / regularisation subproblem** — solved by a learned proximal operator $\mathcal{R}_\theta$ (CNN denoiser):
-$$v^{k+1} = \mathcal{R}_\theta\!\left(u^{k+1},\; \sqrt{\lambda/\mu^k}\right)$$
+$$
+v^{k+1} = \arg\min_v \; \frac{\mu^k}{2}\|u^{k+1} - v\|_2^2 + \lambda R(v)
+$$
 
-Parameters $\mu^k$ and $\lambda/\mu^k$ are **learnable per-stage scalars**, so the network adapts the penalty schedule through training.
+In practice, each stage is represented by learned modules:
 
-## Architecture
+- a data/update network approximating the $u$-subproblem
+- a proximal/regularization network approximating the $v$-subproblem
 
-```
-ImagePair (H×W×3) ──►  FeaturePyramid  ──► {f1, f2}  (1/8 scale)
-                    └►  ContextEncoder  ──► ctx        (1/8 scale)
+The model predicts intermediate flows across stages and is trained with a stage-weighted sequence loss.
 
-{f1, f2, ctx, u0=0, v0=0}
-      │
-   ┌──┴──────────────────────────────────┐
-   │  HQS Stage 1 … Stage K              │  (K configurable, default 12)
-   │  ┌──────────────────────────────┐   │
-   │  │  CorrBlock(f1, f2, u^k)      │   │
-   │  │  DataUpdateNet (ConvGRU)    │   │
-   │  │    → u^{k+1}, hidden state  │   │
-   │  │  ProximalNet (CNN denoiser) │   │
-   │  │    → v^{k+1}                │   │
-   │  └──────────────────────────────┘   │
-   └──────────────────────────────────────┘
-         │
-         ▼
-   Flow predictions {u^1 … u^K}  ──► sequence loss
-   Final upsampled flow (×8)
-```
+## Repository Layout
 
-## Project Layout
-
-```
+```text
 torch_flow/
-├── configs/
-│   ├── default.yaml               # base hyperparams
-│   ├── sintel_ft.yaml             # MPI-Sintel fine-tune
-│   ├── spring_ft.yaml             # Spring fine-tune
-│   ├── kitti_ft.yaml              # KITTI fine-tune
-│   └── ablations/
-│       ├── stages_04.yaml         # 4 HQS stages
-│       ├── stages_08.yaml         # 8 HQS stages
-│       ├── stages_16.yaml         # 16 HQS stages
-│       ├── no_regularizer.yaml    # ablate proximal net
-│       ├── local_corr.yaml        # local vs all-pairs corr
-│       └── small_model.yaml       # reduced capacity
-├── models/
-│   ├── __init__.py
-│   ├── hqs_flow.py                # top-level model
-│   ├── encoders.py                # feature + context pyramid
-│   ├── correlation.py             # all-pairs & local cost volumes
-│   ├── update_net.py              # ConvGRU data subproblem solver
-│   ├── reg_net.py                 # CNN proximal operator
-│   └── warp.py                    # differentiable flow warping
-├── data/
-│   ├── __init__.py
-│   ├── base_dataset.py
-│   ├── augmentation.py
-│   ├── flyingchairs.py
-│   ├── flyingthings.py
-│   ├── sintel.py
-│   ├── spring.py
-│   └── kitti.py
-├── losses/
-│   ├── __init__.py
-│   └── flow_loss.py               # sequence & photometric losses
-├── utils/
-│   ├── __init__.py
-│   ├── flow_utils.py              # flow I/O, warping helpers
-│   ├── metrics.py                 # EPE, Fl-all, etc.
-│   └── visualization.py          # flow colorisation
-├── engine/
-│   ├── __init__.py
-│   └── trainer.py
-├── train.py
-├── evaluate.py
-└── requirements.txt
+  configs/                  # Training/eval configs
+  data/                     # Dataset loaders and augmentations
+  engine/                   # Trainer and checkpoint logic
+  losses/                   # Supervised and optional auxiliary losses
+  models/                   # Main HQSFlow architecture
+  utils/                    # Metrics, visualization, helpers
+  evaluate.py               # Standard evaluation
+  evaluate_comprehensive.py # Extended evaluation outputs
+  train.py                  # Training entrypoint
+  visualize_stages.py       # Stage progression visualization
 ```
 
-## Training Schedule
+## Configuration Notes
 
-| Stage | Dataset | Iterations | LR |
-|-------|---------|------------|----|
-| 1 – Chairs | FlyingChairs | 100k | 4e-4 |
-| 2 – Things | FlyingThings3D | 100k | 1.25e-4 |
-| 3 – Sintel | Sintel Clean+Final + Things + HD1K | 100k | 1.25e-4 |
-| 4 – KITTI  | KITTI-15 train | 50k  | 1.25e-4 |
-| 5 – Spring | Spring train | 100k | 1.25e-4 |
+Training behavior is controlled through OmegaConf YAML files.
 
-## Quick Start
+Important fields:
+
+- `training.checkpoint`: checkpoint path to load
+- `training.resume_mode`: `full` or `weights_only`
+- `mlflow.insecure_tls`: should be `false` for verified TLS
+
+Resume modes:
+
+- `full`: resumes model, optimizer, scheduler, scaler, and global step
+- `weights_only`: loads model weights only, resets optimizer/scheduler/step for curriculum warm-start
+
+## Command Cookbook
+
+The commands below are intentionally copy/paste-ready.
+
+### 1) Install dependencies
 
 ```bash
-# Install
 pip install -r requirements.txt
-
-# Pre-train on FlyingChairs
-python train.py --config configs/default.yaml data.dataset=chairs
-
-# Fine-tune on Sintel
-python train.py --config configs/sintel_ft.yaml \
-    training.checkpoint=checkpoints/things.pth
-
-# Evaluate on Sintel
-python evaluate.py --config configs/sintel_ft.yaml \
-    --checkpoint checkpoints/sintel.pth --split final
-
-# Ablation: 4 stages
-python train.py --config configs/default.yaml \
-    --overrides configs/ablations/stages_04.yaml
 ```
 
-## Ablation Studies
+Use this once per environment.
 
-The config system (OmegaConf) supports composing overrides:
+### 2) Verify integration health
 
 ```bash
-# Vary number of HQS stages
-for S in 4 8 12 16; do
-  python train.py --config configs/default.yaml model.num_stages=$S \
-      run_name=ablate_stages_$S
-done
-
-# Ablate proximal regularizer
-python train.py --config configs/ablations/no_regularizer.yaml
-
-# Compare correlation types
-python train.py --config configs/ablations/local_corr.yaml
+python verify_integration.py
 ```
+
+Runs sanity checks for model/build/config/integration wiring.
+
+### 3) Train from base config (Chairs default)
+
+```bash
+python train.py --config configs/default.yaml
+```
+
+Starts training with the default dataset and hyperparameters.
+
+### 4) Curriculum stage with full resume
+
+```bash
+python train.py --config configs/default.yaml \
+  training.checkpoint=checkpoints/hqs_flow_default/last.pth \
+  training.resume_mode=full
+```
+
+Continues exact training state, including learning-rate schedule position.
+
+### 5) Curriculum warm-start from best model (reset LR schedule)
+
+```bash
+python train.py --config configs/sintel_ft.yaml
+```
+
+`configs/sintel_ft.yaml` is configured for warm-start (`weights_only`) so steps and OneCycle schedule restart from zero.
+
+### 6) Sintel-only training recipe
+
+```bash
+python train.py --config configs/sintel_only.yaml
+```
+
+Uses only Sintel data (no mixed Things dataset) with warm-start from checkpoint.
+
+### 7) Disable MLflow quickly from CLI
+
+```bash
+python train.py --config configs/default.yaml mlflow.enabled=false
+```
+
+Useful when debugging local training without a tracking server.
+
+### 8) Evaluate a checkpoint
+
+```bash
+python evaluate.py \
+  --config configs/sintel_ft.yaml \
+  --checkpoint checkpoints/hqs_flow_sintel/best.pth
+```
+
+Runs standard evaluation metrics for the configured validation dataset.
+
+### 9) Comprehensive evaluation artifacts
+
+```bash
+python evaluate_comprehensive.py \
+  --config configs/sintel_ft.yaml \
+  --checkpoint checkpoints/hqs_flow_sintel/best.pth \
+  --data_config configs/sintel_ft.yaml \
+  --output_dir results/eval_sintel
+```
+
+Produces richer reports and saved outputs.
+
+### 10) Visualize stage progression
+
+```bash
+python visualize_stages.py \
+  --config configs/sintel_ft.yaml \
+  --checkpoint checkpoints/hqs_flow_sintel/best.pth \
+  --data_config configs/sintel_ft.yaml \
+  --output_dir results/stages_sintel \
+  --num_samples 10
+```
+
+Helps inspect convergence behavior across unrolled HQS stages.
+
+### 11) Run a quick ablation (number of stages)
+
+```bash
+python train.py --config configs/default.yaml model.num_stages=8 run_name=ablate_stages_8
+```
+
+Overrides config values directly from CLI.
+
+### 12) Toggle OFCE loss term
+
+```bash
+python train.py --config configs/default.yaml loss.ofce_weight=0.01
+```
+
+Adds physics-inspired regularization to training.
+
+## Metrics and What They Mean
+
+Common metrics include:
+
+- `epe_matched`: endpoint error on matched/visible pixels
+- `epe_unmatched`: endpoint error on unmatched/occluded pixels
+- `epe_all`: combined endpoint error
+- `f1`: KITTI-style outlier percentage
+- `s0_10`, `s10_40`, `s40_plus`: speed-stratified EPE buckets
+- `d0`, `d0_10`, `d10_60`, `d60_140`, `d140_plus`: Sintel distance-to-occlusion-boundary buckets
+
+If occlusion masks are not available from the dataset, distance metrics can be absent or NaN.
+
+## MLflow Setup Guidance
+
+Recommended defaults:
+
+- `mlflow.insecure_tls: false`
+- valid CA chain installed on clients
+- artifact storage path writable by MLflow server process
+
+If you need local runs without server interaction, set `mlflow.enabled=false`.
+
+## Typical Workflow
+
+1. Install dependencies and verify integration.
+2. Train base stage.
+3. Warm-start next curriculum stage with `weights_only`.
+4. Evaluate with `evaluate.py` or `evaluate_comprehensive.py`.
+5. Inspect stage behavior with `visualize_stages.py`.
+
+## Related Documentation
+
+- `README_INTEGRATION.md`: integration details and migration notes
+- `SCRIPTS_QUICKSTART.md`: broader script examples
+- `INTEGRATION_GUIDE.md`: feature-level integration explanation
+- `hqs_pytorch/README.md`: details about the TensorFlow-port module set

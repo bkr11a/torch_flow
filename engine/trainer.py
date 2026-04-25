@@ -189,6 +189,9 @@ def load_checkpoint(
     optimizer: Optional[optim.Optimizer] = None,
     scaler: Optional[torch.cuda.amp.GradScaler] = None,
     scheduler=None,
+    load_optimizer: bool = True,
+    load_scaler: bool = True,
+    load_scheduler: bool = True,
     strict: bool = True,
     device: Optional[torch.device] = None,
 ) -> Tuple[int, Optional["TrainingHistory"]]:
@@ -199,11 +202,11 @@ def load_checkpoint(
     if unexpected:
         logger.warning(f"Unexpected keys ({len(unexpected)}): {unexpected[:5]}...")
     step = ckpt.get("step", 0)
-    if optimizer is not None and "optimizer" in ckpt:
+    if load_optimizer and optimizer is not None and "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])
-    if scaler is not None and "scaler" in ckpt:
+    if load_scaler and scaler is not None and "scaler" in ckpt:
         scaler.load_state_dict(ckpt["scaler"])
-    if scheduler is not None and ckpt.get("scheduler") is not None:
+    if load_scheduler and scheduler is not None and ckpt.get("scheduler") is not None:
         scheduler.load_state_dict(ckpt["scheduler"])
     history = None
     if "history" in ckpt:
@@ -317,6 +320,7 @@ class Trainer:
         self.mlflow_run_id: Optional[str] = None
         self.mlflow_client: Optional["MlflowClient"] = None
         self.best_model_uri: Optional[str] = None
+        self._warned_missing_occ_masks = False
         if self.use_mlflow:
             self._init_mlflow()
 
@@ -328,17 +332,46 @@ class Trainer:
         )
 
         if cfg.training.get("checkpoint"):
-            step, loaded_history = load_checkpoint(
-                cfg.training.checkpoint,
-                self.model, self.optimizer, self.scaler, self.scheduler,
-                strict=cfg.training.get("strict", True),
-                device=self.device,
-            )
-            self.global_step = step
-            if loaded_history is not None:
-                self.history = loaded_history
-                logger.info(f"Resumed history (best EPE={self.history.best_epe:.4f} "
-                             f"@ step {self.history.best_step})")
+            resume_mode = str(cfg.training.get("resume_mode", "full")).lower()
+            if resume_mode not in {"full", "weights_only"}:
+                raise ValueError(
+                    f"Unknown training.resume_mode={resume_mode!r}. "
+                    "Expected 'full' or 'weights_only'."
+                )
+
+            if resume_mode == "weights_only":
+                load_checkpoint(
+                    cfg.training.checkpoint,
+                    self.model,
+                    optimizer=self.optimizer,
+                    scaler=self.scaler,
+                    scheduler=self.scheduler,
+                    load_optimizer=False,
+                    load_scaler=False,
+                    load_scheduler=False,
+                    strict=cfg.training.get("strict", True),
+                    device=self.device,
+                )
+                self.global_step = 0
+                logger.info(
+                    "Warm-started model weights only from checkpoint; "
+                    "optimizer/scheduler/step/history were reset."
+                )
+            else:
+                step, loaded_history = load_checkpoint(
+                    cfg.training.checkpoint,
+                    self.model,
+                    self.optimizer,
+                    self.scaler,
+                    self.scheduler,
+                    strict=cfg.training.get("strict", True),
+                    device=self.device,
+                )
+                self.global_step = step
+                if loaded_history is not None:
+                    self.history = loaded_history
+                    logger.info(f"Resumed history (best EPE={self.history.best_epe:.4f} "
+                                 f"@ step {self.history.best_step})")
 
     # ─────────────────────────────────────────────────────────────────────── #
     # Main training loop
@@ -426,6 +459,11 @@ class Trainer:
                         "s0_10":   _fmt("s0_10"),
                         "s10_40":  _fmt("s10_40"),
                         "s40+":    _fmt("s40_plus"),
+                        "d0":      _fmt("d0"),
+                        "d0_10":   _fmt("d0_10"),
+                        "d10_60":  _fmt("d10_60"),
+                        "d60_140": _fmt("d60_140"),
+                        "d140+":   _fmt("d140_plus"),
                         "lr":      f"{lr:.2e}",
                     }
                     postfix["smooth"] = _fmt("smooth", ".4f")
@@ -468,7 +506,11 @@ class Trainer:
                             f"  epe_u={_fmtv('epe_unmatched')}"
                             f"  epe_all={_fmtv('epe_all')}"
                             f"  s0_10={_fmtv('s0_10')}  s10_40={_fmtv('s10_40')}"
-                            f"  s40+={_fmtv('s40_plus')}{tag}"
+                            f"  s40+={_fmtv('s40_plus')}"
+                            f"  d0={_fmtv('d0')}  d0_10={_fmtv('d0_10')}"
+                            f"  d10_60={_fmtv('d10_60')}"
+                            f"  d60_140={_fmtv('d60_140')}"
+                            f"  d140+={_fmtv('d140_plus')}{tag}"
                         )
                         epoch_bar.set_postfix(
                             val_epe=f"{epe:.4f}",
@@ -501,6 +543,11 @@ class Trainer:
                         s0_10=_fmt("s0_10"),
                         s10_40=_fmt("s10_40"),
                         **{"s40+": _fmt("s40_plus")},
+                        d0=_fmt("d0"),
+                        d0_10=_fmt("d0_10"),
+                        d10_60=_fmt("d10_60"),
+                        d60_140=_fmt("d60_140"),
+                        **{"d140+": _fmt("d140_plus")},
                         smooth=_fmt("smooth", ".4f"),
                         photo=_fmt("photo", ".4f"),
                         ofce=_fmt("ofce", ".4f"),
@@ -532,7 +579,11 @@ class Trainer:
                                 f"  epe_u={_fmtv('epe_unmatched')}"
                                 f"  epe_all={_fmtv('epe_all')}"
                                 f"  s0_10={_fmtv('s0_10')}  s10_40={_fmtv('s10_40')}"
-                                f"  s40+={_fmtv('s40_plus')}{tag}"
+                                f"  s40+={_fmtv('s40_plus')}"
+                                f"  d0={_fmtv('d0')}  d0_10={_fmtv('d0_10')}"
+                                f"  d10_60={_fmtv('d10_60')}"
+                                f"  d60_140={_fmtv('d60_140')}"
+                                f"  d140+={_fmtv('d140_plus')}{tag}"
                             )
                             epoch_bar.set_postfix(
                                 val_epe=f"{epe:.4f}",
@@ -611,7 +662,8 @@ class Trainer:
             # Average metrics over batch items
             batch_metrics: Dict[str, list] = {
                 "epe": [], "epe_matched": [], "epe_unmatched": [], "epe_all": [],
-                "f1": [], "s0_10": [], "s10_40": [], "s40_plus": []
+                "f1": [], "s0_10": [], "s10_40": [], "s40_plus": [],
+                "d0": [], "d0_10": [], "d10_60": [], "d60_140": [], "d140_plus": []
             }
             for b in range(pred_final.shape[0]):
                 occ = None
@@ -659,6 +711,14 @@ class Trainer:
                 # occlusion mask is optional — None for datasets without masks
                 occ_batch = batch.get("occlusion")  # (B, H, W) tensor or None
                 inv_batch = batch.get("invalid")
+
+                if occ_batch is None and not self._warned_missing_occ_masks:
+                    logger.warning(
+                        "Validation batches do not include occlusion masks; "
+                        "distance-to-occlusion metrics (d0/d0_10/d10_60/d60_140/d140_plus) "
+                        "will be NaN or absent."
+                    )
+                    self._warned_missing_occ_masks = True
 
                 padder = InputPadder(img1.shape, divisor=8)
                 img1, img2 = padder.pad(img1, img2)
@@ -742,6 +802,8 @@ class Trainer:
 
         if mcfg.get("insecure_tls", False):
             os.environ["MLFLOW_TRACKING_INSECURE_TLS"] = "true"
+        else:
+            os.environ.pop("MLFLOW_TRACKING_INSECURE_TLS", None)
 
         exp_name = mcfg.get("experiment_name", "torch_flow")
         self._mlflow_safe("set_experiment", lambda: mlflow.set_experiment(exp_name))
