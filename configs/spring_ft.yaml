@@ -5,6 +5,11 @@
 
 run_name: hqs_flow_spring
 
+model:
+  model_type: tfport
+  model_backbone:
+    prox_jacobi_iters: 3
+
 training:
   num_steps: 100000
   lr: 1.25e-4

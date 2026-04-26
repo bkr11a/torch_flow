@@ -26,44 +26,38 @@ mlflow:
 
 # ── Model ─────────────────────────────────────────────────────────────────
 model:
+  model_type: tfport              # "tfport" | "original"
   num_stages: 12                  # K unrolled HQS iterations
+  upsample_scale: 8               # 1/upsample_scale encoder resolution → full res
 
-  # Weight-sharing across stages:
-  #   share_all    – one UpdateNet + one ProxNet (recurrent, fewest params)
-  #   share_none   – independent weights per stage (most expressive)
-  #   share_update – shared UpdateNet, independent ProxNets
-  #   share_prox   – independent UpdateNets, shared ProxNet
-  weight_sharing: share_all
-
-  upsample_scale: 8               # encoder output stride → full-res factor
-
-  encoder:                        # feature extractor (applied to both images)
-    type: basic
-    output_dim: 256
-    norm: instance
-    output_stride: 8
-    dropout: 0.0
-
-  context:                        # context encoder (applied to image1 only)
-    type: basic
-    output_dim: 128
-    norm: batch
-    output_stride: 8
-    dropout: 0.0
-
-  corr:                           # correlation / cost volume
-    type: all_pairs               # "all_pairs" | "local"
+  corr:                           # correlation pyramid (shared keys)
     num_levels: 4
     radius: 4
 
-  update_net:                     # data-subproblem solver
-    hidden_dim: 128
-    head_dim: 256
+  model_backbone:                 # TFPort encoder / ConvGRU architecture
+    # ── Shared encoder backbone ──────────────────────────────────────────
+    base_channels: 32             # stem output channels
+    channel_multiplier: [1, 2, 4] # per-stage channel scale (3 stages)
+    blocks_per_stage: [2, 2, 2]   # residual blocks per stage
+    groups: 8                     # GroupNorm groups
+    dropout_rate: 0.0
 
-  prox:                           # regularisation subproblem (proximal net)
-    type: unet                    # "unet" | "dncnn" | "none"
-    base_ch: 64
-    depth: 3
+    # ── Feature encoder ──────────────────────────────────────────────────
+    feature_dim: 128              # projected feature dim (level2 used for corr)
+
+    # ── Context encoder ──────────────────────────────────────────────────
+    context_dim: 128              # context features passed to update unit each iter
+    hidden_dim: 64                # context encoder seed dim (projected to gru_hidden_dim)
+
+    # ── ConvGRU update unit ───────────────────────────────────────────────
+    gru_hidden_dim: 128           # GRU hidden state channels
+    motion_dim: 128               # MotionEncoder output channels
+
+    # ── Iteration parameters ─────────────────────────────────────────────
+    num_hqs_iterations: 12        # overrides model.num_stages if set
+    max_displacement: 4           # correlation lookup radius
+    num_corr_levels: 4            # correlation pyramid levels
+    prox_jacobi_iters: 3          # inner Jacobi iterations for TV prox step
 
 # ── Loss ──────────────────────────────────────────────────────────────────
 loss:

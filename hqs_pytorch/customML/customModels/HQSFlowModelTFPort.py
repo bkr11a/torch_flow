@@ -191,28 +191,173 @@ def _cfg_get(cfg, key: str, default):
 
 
 class HQSFlowModelTFPort(nn.Module):
+# ---------------------------------------------------------------------------
+# Motion Encoder
+# ---------------------------------------------------------------------------
+
+
+class MotionEncoder(nn.Module):
+    """
+    Encodes sampled correlation features, the current flow estimate, and the
+    HQS coupling residual (flow_yx - aux_yx) into a compact motion feature
+    consumed by the ConvGRU update unit.
+
+    The HQS residual is a physics-informed cue: when it is large the data
+    step and the prox step disagree, signalling that the update unit should
+    apply a stronger correction.
+
+    Inputs (all at encoder resolution, typically 1/8):
+        corr_feat : (B, corr_channels, H, W)  sampled correlation pyramid
+        flow_yx   : (B, 2, H, W)              current flow [dy, dx]
+        hqs_resid : (B, 2, H, W)              flow_yx - aux_yx
+    Output:
+        (B, motion_dim, H, W)
+    """
+
+    def __init__(self, corr_channels: int, motion_dim: int = 128) -> None:
+        super().__init__()
+        self.corr_proj = nn.Sequential(
+            nn.Conv2d(corr_channels, 256, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 192, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.flow_proj = nn.Sequential(
+            nn.Conv2d(4, 64, kernel_size=7, padding=3),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.fusion = nn.Sequential(
+            nn.Conv2d(192 + 64, motion_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.motion_dim = motion_dim
+
+    def forward(
+        self,
+        corr_feat: torch.Tensor,   # (B, corr_channels, H, W)
+        flow_yx: torch.Tensor,     # (B, 2, H, W)
+        hqs_resid: torch.Tensor,   # (B, 2, H, W)  flow_yx - aux_yx
+    ) -> torch.Tensor:
+        c = self.corr_proj(corr_feat)
+        f = self.flow_proj(torch.cat([flow_yx, hqs_resid], dim=1))
+        return self.fusion(torch.cat([c, f], dim=1))
+
+
+# ---------------------------------------------------------------------------
+# ConvGRU Cell
+# ---------------------------------------------------------------------------
+
+
+class ConvGRUCell(nn.Module):
+    """
+    Single-step convolutional GRU cell.
+
+    Args:
+        input_dim  : channels of input x
+        hidden_dim : channels of hidden state h
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.conv_z = nn.Conv2d(input_dim + hidden_dim, hidden_dim, kernel_size=3, padding=1)
+        self.conv_r = nn.Conv2d(input_dim + hidden_dim, hidden_dim, kernel_size=3, padding=1)
+        self.conv_h = nn.Conv2d(input_dim + hidden_dim, hidden_dim, kernel_size=3, padding=1)
+
+    def forward(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        xh = torch.cat([x, h], dim=1)
+        z = torch.sigmoid(self.conv_z(xh))
+        r = torch.sigmoid(self.conv_r(xh))
+        h_cand = torch.tanh(self.conv_h(torch.cat([x, r * h], dim=1)))
+        return (1.0 - z) * h + z * h_cand
+
+
+# ---------------------------------------------------------------------------
+# HQS Update Unit  (ConvGRU + flow head + mask head)
+# ---------------------------------------------------------------------------
+
+
+class HQSUpdateUnit(nn.Module):
+    """
+    Per-iteration update unit that maintains a hidden state across HQS
+    iterations, predicts a residual flow correction delta, and produces
+    convex-upsampling mask logits for full-resolution output.
+
+    Maintaining hidden state allows the unit to distinguish odd (data-step)
+    from even (prox-step) iterations, eliminating the even/odd oscillation
+    produced by a stateless conv applied to alternating HQS states.
+
+    Args:
+        motion_dim    : channels from MotionEncoder
+        context_dim   : channels from context encoder (concatenated with motion)
+        hidden_dim    : GRU hidden state channels
+        upsample_scale: spatial upsampling factor (determines mask output channels)
+    """
+
+    def __init__(
+        self,
+        motion_dim: int,
+        context_dim: int,
+        hidden_dim: int,
+        upsample_scale: int = 8,
+    ) -> None:
+        super().__init__()
+        input_dim = motion_dim + context_dim
+        self.gru = ConvGRUCell(input_dim, hidden_dim)
+        self.flow_head = nn.Sequential(
+            nn.Conv2d(hidden_dim, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 2, kernel_size=3, padding=1),
+        )
+        self.mask_head = nn.Conv2d(
+            hidden_dim,
+            upsample_scale * upsample_scale * 9,
+            kernel_size=3,
+            padding=1,
+        )
+
+    def forward(
+        self,
+        motion_feat: torch.Tensor,
+        context_feat: torch.Tensor,
+        net: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x = torch.cat([motion_feat, context_feat], dim=1)
+        net = self.gru(x, net)
+        delta = self.flow_head(net)
+        mask_logits = self.mask_head(net)
+        return delta, mask_logits, net
+
+
+class HQSFlowModelTFPort(nn.Module):
     """TensorFlow-faithful HQS optical flow model in PyTorch."""
 
     def __init__(self, cfg) -> None:
         super().__init__()
         self.cfg = cfg
 
-        tfp = _cfg_get(cfg, "tf_port", {})
-        self.num_hqs_iterations = int(_cfg_get(tfp, "num_hqs_iterations", _cfg_get(cfg, "num_stages", 10)))
+        mb = _cfg_get(cfg, "model_backbone", {})
+        self.num_hqs_iterations = int(_cfg_get(mb, "num_hqs_iterations", _cfg_get(cfg, "num_stages", 10)))
         self.upsample_scale = int(_cfg_get(cfg, "upsample_scale", 8))
 
         corr_cfg = _cfg_get(cfg, "corr", {})
-        self.max_displacement = int(_cfg_get(tfp, "max_displacement", _cfg_get(corr_cfg, "radius", 4)))
-        self.num_corr_levels = int(_cfg_get(tfp, "num_corr_levels", _cfg_get(corr_cfg, "num_levels", 4)))
+        self.max_displacement = int(_cfg_get(mb, "max_displacement", _cfg_get(corr_cfg, "radius", 4)))
+        self.num_corr_levels = int(_cfg_get(mb, "num_corr_levels", _cfg_get(corr_cfg, "num_levels", 4)))
+        self.prox_jacobi_iters = int(_cfg_get(mb, "prox_jacobi_iters", 3))
 
-        base_channels = int(_cfg_get(tfp, "base_channels", 16))
-        channel_multiplier = tuple(_cfg_get(tfp, "channel_multiplier", (1, 2, 3)))
-        blocks_per_stage = tuple(_cfg_get(tfp, "blocks_per_stage", (2, 2, 2)))
-        groups = int(_cfg_get(tfp, "groups", 8))
-        dropout_rate = float(_cfg_get(tfp, "dropout_rate", 0.0))
-        feature_dim = int(_cfg_get(tfp, "feature_dim", 48))
-        context_dim = int(_cfg_get(tfp, "context_dim", 64))
-        hidden_dim = int(_cfg_get(tfp, "hidden_dim", 32))
+        base_channels = int(_cfg_get(mb, "base_channels", 32))
+        channel_multiplier = tuple(_cfg_get(mb, "channel_multiplier", (1, 2, 4)))
+        blocks_per_stage = tuple(_cfg_get(mb, "blocks_per_stage", (2, 2, 2)))
+        groups = int(_cfg_get(mb, "groups", 8))
+        dropout_rate = float(_cfg_get(mb, "dropout_rate", 0.0))
+        feature_dim = int(_cfg_get(mb, "feature_dim", 128))
+        context_dim = int(_cfg_get(mb, "context_dim", 128))
+        hidden_dim = int(_cfg_get(mb, "hidden_dim", 64))       # context encoder seed dim
+        gru_hidden_dim = int(_cfg_get(mb, "gru_hidden_dim", 128))  # GRU state channels
+        motion_dim = int(_cfg_get(mb, "motion_dim", 128))          # motion encoder output
+        self._gru_hidden_dim = gru_hidden_dim  # stored for param_count
 
         self.feature_encoder = OpticalFlowFeatureEncoderTF(
             base_channels=base_channels,
@@ -232,15 +377,17 @@ class HQSFlowModelTFPort(nn.Module):
             dropout_rate=dropout_rate,
         )
 
-        # Learned penalties per HQS iteration.
-        beta_init = torch.tensor([0.05, 0.08, 0.12, 0.16], dtype=torch.float32)
-        lam_init = torch.tensor([0.03, 0.04, 0.05, 0.06], dtype=torch.float32)
-        beta = beta_init.repeat((self.num_hqs_iterations + 3) // 4)[: self.num_hqs_iterations]
-        lam = lam_init.repeat((self.num_hqs_iterations + 3) // 4)[: self.num_hqs_iterations]
-        self.hqs_beta = nn.Parameter(beta)
-        self.hqs_lambda = nn.Parameter(lam)
+        # Learned HQS coupling and regularisation penalties.
+        # Monotonically increasing so that later iterations have stronger
+        # coupling, progressively tightening the HQS constraint rather than
+        # resetting it on a 4-step tile (which caused oscillation beats).
+        self.hqs_beta = nn.Parameter(torch.linspace(0.05, 0.50, self.num_hqs_iterations))
+        self.hqs_lambda = nn.Parameter(torch.linspace(0.02, 0.20, self.num_hqs_iterations))
 
         corr_channels = self.num_corr_levels * (2 * self.max_displacement + 1) ** 2
+
+        # Initialization decoder: called once before the loop at zero-flow.
+        # Not reused inside the loop to avoid distribution mismatch.
         self.allpairs_corr_decoder = nn.Sequential(
             nn.Conv2d(corr_channels, 128, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -248,15 +395,42 @@ class HQSFlowModelTFPort(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.allpairs_init_head = nn.Conv2d(64 + 2, 2, kernel_size=3, padding=1)
-        self.allpairs_conf_head = nn.Sequential(nn.Conv2d(64, 1, kernel_size=3, padding=1), nn.Sigmoid())
+        self.allpairs_conf_head = nn.Sequential(
+            nn.Conv2d(64, 1, kernel_size=3, padding=1), nn.Sigmoid()
+        )
 
-        self.refinement_network = nn.Conv2d(2 + 2 + feature_dim + context_dim, 2, kernel_size=3, padding=1)
+        # Per-iteration confidence head: trained on localized correlation
+        # features sampled around the current flow estimate, not at zero-offset.
+        self.iter_conf_head = nn.Sequential(
+            nn.Conv2d(corr_channels, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 1, kernel_size=3, padding=1),
+            nn.Sigmoid(),
+        )
+
+        # Project context encoder seed → GRU hidden state dimension.
+        self.hidden_proj = nn.Conv2d(hidden_dim, gru_hidden_dim, kernel_size=1)
+
+        # Motion encoder: correlation + flow + HQS residual → motion feature.
+        self.motion_encoder = MotionEncoder(corr_channels, motion_dim)
+
+        # Per-iteration GRU update unit: flow delta + convex upsample mask.
+        self.update_unit = HQSUpdateUnit(
+            motion_dim, context_dim, gru_hidden_dim, self.upsample_scale
+        )
+
+        # Final post-loop refinement (uses context encoder hidden output directly).
         self.final_refinement_network = nn.Sequential(
             nn.Conv2d(2 + context_dim + hidden_dim, 32, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, 2, kernel_size=3, padding=1),
         )
-        self.final_mask_logits = nn.Conv2d(2 + context_dim + hidden_dim, 8 * 8 * 9, kernel_size=3, padding=1)
+        self.final_mask_logits = nn.Conv2d(
+            2 + context_dim + hidden_dim,
+            self.upsample_scale * self.upsample_scale * 9,
+            kernel_size=3,
+            padding=1,
+        )
 
     @staticmethod
     def _normalise(img: torch.Tensor) -> torch.Tensor:
@@ -545,79 +719,99 @@ class HQSFlowModelTFPort(nn.Module):
         b, _, h, w = f1.shape
         i1_lvl = F.interpolate(i1, size=(h, w), mode="bilinear", align_corners=True)
         i2_lvl = F.interpolate(i2, size=(h, w), mode="bilinear", align_corners=True)
-        context_feat_lvl = F.interpolate(context_feat, size=(h, w), mode="nearest")
-        hidden_lvl = F.interpolate(hidden_state, size=(h, w), mode="nearest")
+        context_feat_lvl = F.interpolate(context_feat, size=(h, w), mode="bilinear", align_corners=False)
+        hidden_lvl = F.interpolate(hidden_state, size=(h, w), mode="bilinear", align_corners=False)
+
+        # Seed GRU hidden state from the context encoder's hidden output.
+        net = torch.tanh(self.hidden_proj(hidden_lvl))  # (B, gru_hidden_dim, H, W)
 
         if flow_init is None:
             flow_yx = torch.zeros(b, 2, h, w, device=f1.device, dtype=f1.dtype)
         else:
-            # Input flow to this model is expected in [dx, dy] output convention, convert to [dy, dx].
+            # Input flow in [dx, dy] repository convention → internal [dy, dx].
             flow_yx = torch.stack([flow_init[:, 1], flow_init[:, 0]], dim=1)
             flow_yx = self._resize_flow_yx(flow_yx, h, w)
 
         aux_yx = torch.zeros_like(flow_yx)
-        flow_preds: List[torch.Tensor] = []
-        flow_lows: List[torch.Tensor] = []
-        hidden_states: List[torch.Tensor] = []
 
         corr_allpairs = self.build_all_pairs_correlation(f1, f2)
         corr_pyr = self.build_corr_pyramid_from_all_pairs(corr_allpairs, num_levels=self.num_corr_levels)
         coords1 = self._coords_grid(b, h, w, device=f1.device, dtype=f1.dtype)
 
+        # Initialization: dense matching at current (zero) flow position.
         coords_query = coords1 + flow_yx.permute(0, 2, 3, 1)
-        corr_feat = self.sample_all_pairs_corr_pyramid(corr_pyr, coords_query, radius=self.max_displacement)
-        delta_init, confidence, _ = self.build_all_pairs_init_from_lookup(corr_feat, flow_yx)
+        corr_feat_0 = self.sample_all_pairs_corr_pyramid(corr_pyr, coords_query, radius=self.max_displacement)
+        corr_feat_0_chw = corr_feat_0.permute(0, 3, 1, 2).contiguous()
+        x0 = self.allpairs_corr_decoder(corr_feat_0_chw)
+        delta_init = self.allpairs_init_head(torch.cat([flow_yx, x0], dim=1))
         flow_yx = flow_yx + delta_init
         aux_yx = flow_yx.clone()
+
+        flow_preds: List[torch.Tensor] = []
+        flow_lows: List[torch.Tensor] = []
+        hidden_states: List[torch.Tensor] = []
 
         for k in range(iters):
             beta = F.softplus(self.hqs_beta[k]) + 1e-4
             lam = F.softplus(self.hqs_lambda[k]) + 1e-4
 
+            # Sample correlation pyramid at current flow position.
             coords_query = coords1 + flow_yx.permute(0, 2, 3, 1)
             corr_feat_k = self.sample_all_pairs_corr_pyramid(corr_pyr, coords_query, radius=self.max_displacement)
-            _, confidence_k, _ = self.build_all_pairs_init_from_lookup(corr_feat_k, flow_yx)
+            corr_feat_k_chw = corr_feat_k.permute(0, 3, 1, 2).contiguous()
 
+            # Per-iteration confidence from dedicated head (not the init decoder).
+            confidence_k = self.iter_conf_head(corr_feat_k_chw)
+
+            # HQS u-step: closed-form OFCE data minimisation.
             ix, iy, it, _ = self.compute_ofce_derivatives(i1_lvl, i2_lvl, flow_yx)
             flow_yx, _, _ = self.hqs_data_step(ix, iy, it, aux_yx, confidence_k, flow_yx, beta)
-            aux_yx, _, _ = self.hqs_prox_step(flow_yx, i1_lvl, beta, lam, num_iter=1)
 
-            # Match TF step refinement input: [flow, aux, F1, context_feat]
-            refine_in = torch.cat([flow_yx, aux_yx, f1, context_feat_lvl], dim=1)
-            delta_refine = self.refinement_network(refine_in)
-            flow_yx = flow_yx + 0.1 * delta_refine
+            # HQS v-step: Jacobi TV-proximal smoothing.
+            aux_yx, _, _ = self.hqs_prox_step(
+                flow_yx, i1_lvl, beta, lam, num_iter=self.prox_jacobi_iters
+            )
 
-            # Save per-stage outputs for sequence supervision.
-            flow_low_xy = torch.stack([flow_yx[:, 1], flow_yx[:, 0]], dim=1)
-            flow_stage_up_yx = self._resize_flow_yx(flow_yx, image1.shape[-2], image1.shape[-1])
-            flow_stage_up_xy = torch.stack([flow_stage_up_yx[:, 1], flow_stage_up_yx[:, 0]], dim=1)
+            # Motion encoding: pack correlation, flow, and HQS coupling residual.
+            # Large residual (flow - aux) signals that data and prox disagree.
+            hqs_resid = flow_yx - aux_yx
+            motion_feat = self.motion_encoder(corr_feat_k_chw, flow_yx, hqs_resid)
 
-            flow_lows.append(flow_low_xy)
-            flow_preds.append(flow_stage_up_xy)
-            hidden_states.append(hidden_lvl)
+            # ConvGRU update: stateful, so even/odd iterations are distinguishable.
+            delta, mask_logits, net = self.update_unit(motion_feat, context_feat_lvl, net)
 
+            # Apply learned correction and keep aux in sync so the next data
+            # step anchors to the refined estimate rather than pre-correction flow.
+            flow_yx = flow_yx + delta
+            aux_yx = aux_yx + delta  # propagate correction to coupling variable
+
+            # Per-iteration full-resolution prediction via convex upsampling.
+            flow_up_yx = self.convex_upsample(flow_yx, mask_logits, rate=self.upsample_scale)
+            if flow_up_yx.shape[-2:] != image1.shape[-2:]:
+                flow_up_yx = self._resize_flow_yx(flow_up_yx, image1.shape[-2], image1.shape[-1])
+            flow_up_xy = torch.stack([flow_up_yx[:, 1], flow_up_yx[:, 0]], dim=1)
+
+            flow_lows.append(torch.stack([flow_yx[:, 1], flow_yx[:, 0]], dim=1))
+            flow_preds.append(flow_up_xy)
+            hidden_states.append(net)
+
+        # Post-loop refinement using the fixed context-encoder hidden output
+        # (stable reference independent of GRU trajectory).
         final_in = torch.cat([flow_yx, context_feat_lvl, hidden_lvl], dim=1)
-        final_mask_logits = self.final_mask_logits(final_in)
         flow_yx = flow_yx + 0.1 * self.final_refinement_network(final_in)
-        flow_up_yx = self.convex_upsample(flow_yx, final_mask_logits, rate=self.upsample_scale)
+        final_mask = self.final_mask_logits(final_in)
+        flow_up_final_yx = self.convex_upsample(flow_yx, final_mask, rate=self.upsample_scale)
+        if flow_up_final_yx.shape[-2:] != image1.shape[-2:]:
+            flow_up_final_yx = self._resize_flow_yx(flow_up_final_yx, image1.shape[-2], image1.shape[-1])
+        flow_up_xy = torch.stack([flow_up_final_yx[:, 1], flow_up_final_yx[:, 0]], dim=1)
 
-        # If spatial mismatch due odd dimensions, resize with proper vector scaling.
-        if flow_up_yx.shape[-2:] != image1.shape[-2:]:
-            flow_up_yx = self._resize_flow_yx(flow_up_yx, image1.shape[-2], image1.shape[-1])
-
-        # Convert internal [dy, dx] to repository output convention [dx, dy].
-        flow_up_xy = torch.stack([flow_up_yx[:, 1], flow_up_yx[:, 0]], dim=1)
-        flow_low_xy_final = torch.stack([flow_yx[:, 1], flow_yx[:, 0]], dim=1)
-
-        # Keep prediction-list length == iters while making the final element
-        # the best TF-faithful refined output.
         if flow_preds:
             flow_preds[-1] = flow_up_xy
-            flow_lows[-1] = flow_low_xy_final
+            flow_lows[-1] = torch.stack([flow_yx[:, 1], flow_yx[:, 0]], dim=1)
         else:
             flow_preds = [flow_up_xy]
-            flow_lows = [flow_low_xy_final]
-            hidden_states = [hidden_lvl]
+            flow_lows = [torch.stack([flow_yx[:, 1], flow_yx[:, 0]], dim=1)]
+            hidden_states = [net]
 
         return {
             "flow_preds": flow_preds,
@@ -632,6 +826,17 @@ class HQSFlowModelTFPort(nn.Module):
         return {
             "feature_encoder": count(self.feature_encoder),
             "context_encoder": count(self.context_encoder),
-            "stages": count(self.refinement_network) + count(self.final_refinement_network),
+            "motion_encoder": count(self.motion_encoder),
+            "update_unit": count(self.update_unit),
+            "init_decoder": (
+                count(self.allpairs_corr_decoder)
+                + count(self.allpairs_init_head)
+                + count(self.allpairs_conf_head)
+            ),
+            "iter_conf_head": count(self.iter_conf_head),
+            "final_refinement": (
+                count(self.final_refinement_network) + count(self.final_mask_logits)
+            ),
+            "stages": count(self.update_unit),  # alias kept for trainer logging compat
             "total": count(self),
         }

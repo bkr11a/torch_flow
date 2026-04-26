@@ -25,37 +25,29 @@ mlflow:
     dataset: "sintel_only"
 
 model:
+  model_type: tfport
   num_stages: 12
-  weight_sharing: share_all
   upsample_scale: 8
 
-  encoder:
-    type: basic
-    output_dim: 256
-    norm: instance
-    output_stride: 8
-    dropout: 0.0
-
-  context:
-    type: basic
-    output_dim: 128
-    norm: batch
-    output_stride: 8
-    dropout: 0.0
-
   corr:
-    type: all_pairs
     num_levels: 4
     radius: 4
 
-  update_net:
-    hidden_dim: 128
-    head_dim: 256
-
-  prox:
-    type: unet
-    base_ch: 64
-    depth: 3
+  model_backbone:
+    base_channels: 32
+    channel_multiplier: [1, 2, 4]
+    blocks_per_stage: [2, 2, 2]
+    groups: 8
+    dropout_rate: 0.0
+    feature_dim: 128
+    context_dim: 128
+    hidden_dim: 64
+    gru_hidden_dim: 128
+    motion_dim: 128
+    num_hqs_iterations: 12
+    max_displacement: 4
+    num_corr_levels: 4
+    prox_jacobi_iters: 3
 
 loss:
   gamma: 0.85

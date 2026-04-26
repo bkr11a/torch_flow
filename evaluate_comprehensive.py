@@ -185,10 +185,15 @@ class FlowEvaluator:
 
                     # Save error map
                     epe = torch.sqrt(((flow_pred - flow_gt_b) ** 2).sum(dim=0))
-                    error_hsv = flow_to_hsv(epe.unsqueeze(0), max_magnitude=5.0)
+                    # EPE is a scalar (H, W) map — not a flow vector, so we
+                    # cannot pass it to flow_to_hsv (which expects 2 channels).
+                    # Clip at 5 px for display, apply a hot colormap.
+                    epe_np = epe.cpu().numpy()  # (H, W)
+                    epe_norm = np.clip(epe_np / 5.0 * 255.0, 0, 255).astype(np.uint8)
+                    epe_bgr = cv2.applyColorMap(epe_norm, cv2.COLORMAP_HOT)
                     cv2.imwrite(
                         str(self.output_dir / "errors" / f"{sample_name}_epe.png"),
-                        cv2.cvtColor(error_hsv, cv2.COLOR_RGB2BGR),
+                        epe_bgr,
                     )
 
                     # Save stage-by-stage convergence
