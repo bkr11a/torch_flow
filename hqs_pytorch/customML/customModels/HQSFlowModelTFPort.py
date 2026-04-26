@@ -190,12 +190,6 @@ def _cfg_get(cfg, key: str, default):
         return getattr(cfg, key, default)
 
 
-class HQSFlowModelTFPort(nn.Module):
-# ---------------------------------------------------------------------------
-# Motion Encoder
-# ---------------------------------------------------------------------------
-
-
 class MotionEncoder(nn.Module):
     """
     Encodes sampled correlation features, the current flow estimate, and the
