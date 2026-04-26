@@ -590,8 +590,8 @@ class HQSFlowModelTFPort(nn.Module):
         eps: float = 1e-3,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Keep same channel semantics as TF: flow_yx = [v, u] = [dy, dx].
-        p = aux_yx[:, 0:1]
-        q = aux_yx[:, 1:2]
+        q = aux_yx[:, 0:1]
+        p = aux_yx[:, 1:2]
         v0 = flow0_yx[:, 0:1]
         u0 = flow0_yx[:, 1:2]
 
