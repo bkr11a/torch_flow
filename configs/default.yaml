@@ -43,15 +43,15 @@ model:
     dropout_rate: 0.0
 
     # ── Feature encoder ──────────────────────────────────────────────────
-    feature_dim: 128              # projected feature dim (level2 used for corr)
+    feature_dim: 64              # projected feature dim (level2 used for corr)
 
     # ── Context encoder ──────────────────────────────────────────────────
-    context_dim: 128              # context features passed to update unit each iter
-    hidden_dim: 64                # context encoder seed dim (projected to gru_hidden_dim)
+    context_dim: 64              # context features passed to update unit each iter
+    hidden_dim: 32                # context encoder seed dim (projected to gru_hidden_dim)
 
     # ── ConvGRU update unit ───────────────────────────────────────────────
-    gru_hidden_dim: 128           # GRU hidden state channels
-    motion_dim: 128               # MotionEncoder output channels
+    gru_hidden_dim: 64           # GRU hidden state channels
+    motion_dim: 64               # MotionEncoder output channels
 
     # ── Iteration parameters ─────────────────────────────────────────────
     num_hqs_iterations: 12        # overrides model.num_stages if set
