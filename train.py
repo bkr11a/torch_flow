@@ -8,7 +8,7 @@ import argparse
 import logging
 import sys
 
-from omegaconf import OmegaConf, DictConfig
+from omegaconf import OmegaConf, DictConfig, open_dict
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,6 +59,14 @@ def main() -> None:
     if args.overrides:
         cli_cfg = OmegaConf.from_dotlist(args.overrides)
         cfg = OmegaConf.merge(cfg, cli_cfg)
+
+    # Persist launch metadata so Trainer can archive the exact input YAML(s).
+    with open_dict(cfg):
+        cfg.launch = {
+            "config_path": os.path.abspath(args.config),
+            "override_path": os.path.abspath(args.override) if args.override else None,
+            "cli_overrides": list(args.overrides),
+        }
 
     setup_logging(cfg.get("log_dir", "logs"), cfg.get("run_name", "hqs_flow"))
     logger = logging.getLogger(__name__)

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 import logging
 import math
@@ -297,6 +298,9 @@ class Trainer:
         self.run_name = cfg.get("run_name", "hqs_flow")
         self.log_dir  = cfg.get("log_dir", "logs")
         self.ckpt_dir = cfg.get("checkpoint_dir", "checkpoints")
+        self.run_dir = os.path.join(self.ckpt_dir, self.run_name)
+        self.config_dir = os.path.join(self.run_dir, "config")
+        self._archive_run_config()
 
         if _TB_AVAILABLE:
             self.writer: Optional[SummaryWriter] = SummaryWriter(
@@ -765,6 +769,29 @@ class Trainer:
         )
         self._mlflow_log_checkpoint(path, tag)
 
+    def _archive_run_config(self) -> None:
+        """Save launch/resolved configs alongside checkpoints for this run."""
+        os.makedirs(self.config_dir, exist_ok=True)
+
+        resolved_path = os.path.join(self.config_dir, "resolved_config.yaml")
+        with open(resolved_path, "w") as f:
+            f.write(OmegaConf.to_yaml(self.cfg, resolve=True))
+
+        launch_cfg = self.cfg.get("launch", {}) if hasattr(self.cfg, "get") else {}
+        launch_config_path = launch_cfg.get("config_path") if isinstance(launch_cfg, dict) else None
+        launch_override_path = launch_cfg.get("override_path") if isinstance(launch_cfg, dict) else None
+        launch_cli_overrides = launch_cfg.get("cli_overrides") if isinstance(launch_cfg, dict) else None
+
+        if launch_config_path and os.path.isfile(launch_config_path):
+            shutil.copy2(launch_config_path, os.path.join(self.config_dir, "launch_config.yaml"))
+        if launch_override_path and os.path.isfile(launch_override_path):
+            shutil.copy2(launch_override_path, os.path.join(self.config_dir, "override_config.yaml"))
+        if launch_cli_overrides:
+            cli_path = os.path.join(self.config_dir, "cli_overrides.txt")
+            with open(cli_path, "w") as f:
+                for item in launch_cli_overrides:
+                    f.write(f"{item}\n")
+
     def _log_scalars(self, d: Dict, prefix: str) -> None:
         if self.writer:
             for k, v in d.items():
@@ -839,11 +866,7 @@ class Trainer:
 
         self._mlflow_safe("log_params", _log_params_chunked)
 
-        run_dir = os.path.join(self.ckpt_dir, self.run_name)
-        os.makedirs(run_dir, exist_ok=True)
-        cfg_path = os.path.join(run_dir, "resolved_config.yaml")
-        with open(cfg_path, "w") as f:
-            f.write(OmegaConf.to_yaml(self.cfg, resolve=True))
+        cfg_path = os.path.join(self.config_dir, "resolved_config.yaml")
         self._mlflow_safe(
             "log_resolved_config",
             lambda: mlflow.log_artifact(cfg_path, artifact_path="config"),
