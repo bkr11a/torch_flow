@@ -4,4 +4,5 @@ defaults:
 
 run_name: ablate_stages_16
 model:
-  num_stages: 16
+  model_backbone:
+    num_hqs_iterations: 16

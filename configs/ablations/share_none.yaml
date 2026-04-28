@@ -4,5 +4,6 @@ defaults:
 
 run_name: ablate_share_none
 model:
-  num_stages: 6           # fewer stages to keep param count tractable
+  model_backbone:
+    num_hqs_iterations: 6 # fewer stages to keep param count tractable
   weight_sharing: share_none

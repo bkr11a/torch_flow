@@ -26,7 +26,6 @@ mlflow:
 
 model:
   model_type: tfport
-  num_stages: 12
   upsample_scale: 8
 
   corr:

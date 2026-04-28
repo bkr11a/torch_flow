@@ -190,6 +190,11 @@ def _cfg_get(cfg, key: str, default):
         return getattr(cfg, key, default)
 
 
+def _inv_sigmoid(y: float) -> float:
+    y = min(max(y, 1e-4), 1.0 - 1e-4)
+    return math.log(y / (1.0 - y))
+
+
 class MotionEncoder(nn.Module):
     """
     Encodes sampled correlation features, the current flow estimate, and the
@@ -335,7 +340,15 @@ class HQSFlowModelTFPort(nn.Module):
         self.cfg = cfg
 
         mb = _cfg_get(cfg, "model_backbone", {})
-        self.num_hqs_iterations = int(_cfg_get(mb, "num_hqs_iterations", _cfg_get(cfg, "num_stages", 10)))
+        legacy_num_stages = _cfg_get(cfg, "num_stages", None)
+        self.num_hqs_iterations = int(
+            _cfg_get(mb, "num_hqs_iterations", legacy_num_stages if legacy_num_stages is not None else 10)
+        )
+        if legacy_num_stages is not None and int(legacy_num_stages) != self.num_hqs_iterations:
+            raise ValueError(
+                "model.num_stages and model.model_backbone.num_hqs_iterations disagree. "
+                "Use model.model_backbone.num_hqs_iterations as the authoritative setting."
+            )
         self.upsample_scale = int(_cfg_get(cfg, "upsample_scale", 8))
 
         corr_cfg = _cfg_get(cfg, "corr", {})
@@ -373,18 +386,18 @@ class HQSFlowModelTFPort(nn.Module):
             dropout_rate=dropout_rate,
         )
 
-        # Learned HQS coupling and regularisation penalties.
-        # Raw values are softplus-inverse of the desired effective penalties so
-        # that F.softplus(raw) + 1e-4 yields the intended value at init.
-        # softplus_inv(y) = log(exp(y - 1e-4) - 1)
-        def _sp_inv(y: float) -> float:
-            return math.log(math.expm1(max(y - 1e-4, 1e-6)))
+        # Bounded monotone HQS schedules reduce late-iteration instability while
+        # preserving the unrolled physics-inspired structure.
+        self.beta_min = 0.05
+        self.beta_max = 0.50
+        self.lambda_ratio_min = 0.25
+        self.lambda_ratio_max = 0.45
+        self.correction_gate_max = 0.50
 
-        self.hqs_beta = nn.Parameter(
-            torch.linspace(_sp_inv(0.05), _sp_inv(0.50), self.num_hqs_iterations)
-        )
-        self.hqs_lambda = nn.Parameter(
-            torch.linspace(_sp_inv(0.02), _sp_inv(0.20), self.num_hqs_iterations)
+        self.hqs_beta_steps = nn.Parameter(torch.zeros(self.num_hqs_iterations))
+        self.hqs_lambda_ratio_steps = nn.Parameter(torch.zeros(self.num_hqs_iterations))
+        self.delta_gate_logits = nn.Parameter(
+            torch.full((self.num_hqs_iterations,), _inv_sigmoid(0.40))
         )
 
         corr_channels = self.num_corr_levels * (2 * self.max_displacement + 1) ** 2
@@ -676,13 +689,33 @@ class HQSFlowModelTFPort(nn.Module):
         return torch.cat([p, q], dim=1), wx, wy
 
     @staticmethod
+    def _monotone_schedule(raw_steps: torch.Tensor, lower: float, upper: float) -> torch.Tensor:
+        steps = F.softplus(raw_steps) + 1e-4
+        cumulative = steps.cumsum(dim=0)
+        normalized = cumulative / cumulative[-1].clamp_min(1e-6)
+        return lower + (upper - lower) * normalized
+
+    def _hqs_penalties(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        beta = self._monotone_schedule(self.hqs_beta_steps, self.beta_min, self.beta_max)
+        lam_ratio = self._monotone_schedule(
+            self.hqs_lambda_ratio_steps,
+            self.lambda_ratio_min,
+            self.lambda_ratio_max,
+        )
+        lam = beta * lam_ratio
+        return beta, lam
+
+    def _correction_gates(self) -> torch.Tensor:
+        return self.correction_gate_max * torch.sigmoid(self.delta_gate_logits)
+
+    @staticmethod
     def convex_upsample(flow_lr: torch.Tensor, mask_logits: torch.Tensor, rate: int = 8) -> torch.Tensor:
         """RAFT-style convex upsampling, matching TensorFlow logic."""
         b, _, h, w = flow_lr.shape
         mask = mask_logits.view(b, 1, 9, rate, rate, h, w)
         mask = torch.softmax(mask, dim=2)
 
-        up_flow = F.unfold(flow_lr, kernel_size=3, padding=1)
+        up_flow = F.unfold(rate * flow_lr, kernel_size=3, padding=1)
         up_flow = up_flow.view(b, 2, 9, 1, 1, h, w)
         up_flow = (mask * up_flow).sum(dim=2)
         up_flow = up_flow.permute(0, 1, 4, 2, 5, 3).reshape(b, 2, rate * h, rate * w)
@@ -757,10 +790,12 @@ class HQSFlowModelTFPort(nn.Module):
         flow_preds: List[torch.Tensor] = []
         flow_lows: List[torch.Tensor] = []
         hidden_states: List[torch.Tensor] = []
+        beta_schedule, lambda_schedule = self._hqs_penalties()
+        correction_gates = self._correction_gates()
 
         for k in range(iters):
-            beta = F.softplus(self.hqs_beta[k]) + 1e-4
-            lam = F.softplus(self.hqs_lambda[k]) + 1e-4
+            beta = beta_schedule[k]
+            lam = lambda_schedule[k]
 
             # Sample correlation pyramid at current flow position.
             coords_query = coords1 + flow_yx.permute(0, 2, 3, 1)
@@ -791,7 +826,7 @@ class HQSFlowModelTFPort(nn.Module):
             # variable by re-running prox on the corrected flow (Option B).
             # This ensures the next data-step anchors to prox(u_corrected)
             # rather than the drifted aux + delta.
-            flow_yx = flow_yx + delta
+            flow_yx = flow_yx + correction_gates[k] * delta
             aux_yx, _, _ = self.hqs_prox_step(
                 flow_yx, i1_lvl, beta, lam, num_iter=self.prox_jacobi_iters
             )
@@ -805,6 +840,9 @@ class HQSFlowModelTFPort(nn.Module):
             flow_lows.append(torch.stack([flow_yx[:, 1], flow_yx[:, 0]], dim=1))
             flow_preds.append(flow_up_xy)
             hidden_states.append(net)
+
+        raw_flow_preds = list(flow_preds)
+        raw_flow_lows = list(flow_lows)
 
         # Post-loop refinement using the fixed context-encoder hidden output
         # (stable reference independent of GRU trajectory).
@@ -826,8 +864,12 @@ class HQSFlowModelTFPort(nn.Module):
 
         return {
             "flow_preds": flow_preds,
+            "flow_preds_raw": raw_flow_preds,
             "flow_low": flow_lows,
+            "flow_low_raw": raw_flow_lows,
             "hidden_states": hidden_states,
+            "flow_final_raw": raw_flow_preds[-1] if raw_flow_preds else flow_up_xy,
+            "flow_final_refined": flow_up_xy,
         }
 
     def param_count(self) -> Dict[str, int]:

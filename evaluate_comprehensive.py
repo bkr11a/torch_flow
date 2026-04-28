@@ -99,6 +99,7 @@ class FlowEvaluator:
         # Metrics storage
         self.metrics_list: List[Dict] = []
         self.flow_magnitudes: List[float] = []
+        self.normalized_stage_profiles: List[np.ndarray] = []
 
     def evaluate(self, dataloader: DataLoader) -> Dict[str, float]:
         """Evaluate model on dataloader."""
@@ -196,8 +197,12 @@ class FlowEvaluator:
                         epe_bgr,
                     )
 
-                    # Save stage-by-stage convergence
-                    self._save_stage_convergence(sample_name, flow_stages, flow_gt_b)
+                    # Save stage-by-stage convergence and collect normalized profile
+                    stage_epe = self._compute_stage_mean_epe(flow_stages, flow_gt_b, valid_b)
+                    self._save_stage_convergence(sample_name, stage_epe)
+                    self.normalized_stage_profiles.append(
+                        stage_epe / max(float(stage_epe[0]), 1e-6)
+                    )
 
                     # Save intermediate states for detailed inspection
                     self._save_intermediate_states(
@@ -240,23 +245,24 @@ class FlowEvaluator:
             cv2.cvtColor(wheel, cv2.COLOR_RGB2BGR),
         )
 
+        # Save dataset-wide normalized convergence profile (mean ± 2 std).
+        self._save_dataset_normalized_convergence()
+
         logger.info(f"Evaluation complete. Results saved to {self.output_dir}")
         return aggregate_metrics
 
-    def _save_stage_convergence(
+    def _compute_stage_mean_epe(
         self,
-        sample_name: str,
         flow_stages: List[torch.Tensor],
         flow_gt: torch.Tensor,
-    ) -> None:
-        """Save visualization of how flow improves across stages."""
-        import cv2
-        import matplotlib.pyplot as plt
+        valid: torch.Tensor,
+    ) -> np.ndarray:
+        """Compute per-stage mean EPE against GT, respecting valid mask."""
+        epe_stages: List[float] = []
 
-        K = len(flow_stages)
-        epe_stages = []
+        for flow_k in flow_stages:
+            vm = valid.bool()
 
-        for k, flow_k in enumerate(flow_stages):
             # Upsample to GT resolution if needed
             if flow_k.shape != flow_gt.shape:
                 scale_h = flow_gt.shape[-2] / flow_k.shape[-2]
@@ -267,9 +273,82 @@ class FlowEvaluator:
                 ).squeeze(0)
                 flow_k[0] *= scale_w
                 flow_k[1] *= scale_h
+                vm = F.interpolate(
+                    vm.float().unsqueeze(0).unsqueeze(0),
+                    size=flow_gt.shape[-2:],
+                    mode="nearest",
+                ).squeeze(0).squeeze(0).bool()
 
             epe = torch.sqrt(((flow_k - flow_gt) ** 2).sum(dim=0))
-            epe_stages.append(epe.mean().item())
+            epe_stages.append(epe[vm].mean().item() if vm.any() else epe.mean().item())
+
+        return np.asarray(epe_stages, dtype=np.float32)
+
+    def _save_dataset_normalized_convergence(self) -> None:
+        """Save dataset-level normalized stage convergence (mean with ±2std band)."""
+        if not self.normalized_stage_profiles:
+            logger.warning("No stage profiles collected; skipping dataset convergence plot")
+            return
+
+        import matplotlib.pyplot as plt
+
+        max_k = max(profile.shape[0] for profile in self.normalized_stage_profiles)
+        profile_mat = np.full((len(self.normalized_stage_profiles), max_k), np.nan, dtype=np.float32)
+        for i, profile in enumerate(self.normalized_stage_profiles):
+            profile_mat[i, : profile.shape[0]] = profile
+
+        mean_profile = np.nanmean(profile_mat, axis=0)
+        std_profile = np.nanstd(profile_mat, axis=0)
+        counts = np.sum(~np.isnan(profile_mat), axis=0)
+        lower = np.maximum(0.0, mean_profile - 2.0 * std_profile)
+        upper = mean_profile + 2.0 * std_profile
+        stages = np.arange(1, max_k + 1)
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(stages, mean_profile, "o-", linewidth=2, markersize=6, color="#176087", label="Mean normalized EPE")
+        ax.fill_between(stages, lower, upper, color="#6ba4bf", alpha=0.30, label="\u00b12\u03c3")
+        ax.set_xlabel("HQS Stage", fontsize=12)
+        ax.set_ylabel("Normalized Mean EPE", fontsize=12)
+        ax.set_title("Dataset-Wide Normalized Stage Convergence", fontsize=14)
+        ax.grid(True, alpha=0.3)
+        ax.set_xticks(stages)
+        ax.legend()
+
+        plot_path = self.output_dir / "stage_convergence" / "dataset_normalized_convergence.png"
+        plt.savefig(plot_path, dpi=120, bbox_inches="tight")
+        plt.close()
+
+        stats = {
+            "normalization": "per-sample mean EPE divided by stage-1 mean EPE",
+            "samples": int(len(self.normalized_stage_profiles)),
+            "per_stage": [
+                {
+                    "stage": int(k + 1),
+                    "samples": int(counts[k]),
+                    "mean_normalized_epe": float(mean_profile[k]),
+                    "std_normalized_epe": float(std_profile[k]),
+                    "lower_2std": float(lower[k]),
+                    "upper_2std": float(upper[k]),
+                }
+                for k in range(max_k)
+            ],
+        }
+        stats_path = self.output_dir / "stage_convergence" / "dataset_normalized_convergence.json"
+        with open(stats_path, "w") as f:
+            json.dump(stats, f, indent=2)
+
+        logger.info(f"Saved dataset normalized convergence plot → {plot_path}")
+        logger.info(f"Saved dataset normalized convergence stats → {stats_path}")
+
+    def _save_stage_convergence(
+        self,
+        sample_name: str,
+        epe_stages: np.ndarray,
+    ) -> None:
+        """Save visualization of how flow improves across stages."""
+        import matplotlib.pyplot as plt
+
+        K = int(epe_stages.shape[0])
 
         # Create convergence plot
         fig, ax = plt.subplots(figsize=(10, 6))

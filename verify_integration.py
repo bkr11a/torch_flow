@@ -98,7 +98,11 @@ def main():
         check_config_field("configs/default.yaml", "loss.ofce_weight", "OFCE weight in config"),
         check_config_field("configs/default.yaml", "loss.smooth_weight", "Smoothness weight in config"),
         check_config_field("configs/default.yaml", "loss.photo_weight", "Photometric weight in config"),
-        check_config_field("configs/default.yaml", "model.num_stages", "Number of stages in config"),
+        check_config_field(
+            "configs/default.yaml",
+            "model.model_backbone.num_hqs_iterations",
+            "Number of HQS iterations in config",
+        ),
     ])
     
     # 5. Backward Compatibility
@@ -199,7 +203,7 @@ def main():
             out = model(img1, img2)
         
         assert "flow_preds" in out
-        assert len(out["flow_preds"]) == cfg.model.num_stages
+        assert len(out["flow_preds"]) == cfg.model.model_backbone.num_hqs_iterations
         
         print(f"  ✅ Forward pass successful")
         print(f"    - Input shape: {img1.shape}")

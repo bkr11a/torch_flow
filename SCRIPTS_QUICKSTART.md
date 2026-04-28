@@ -44,7 +44,7 @@ No mixed FlyingThings dataset. Designed for final fine-tuning on Sintel alone.
 
 ```bash
 # Change number of stages
-python train.py --config configs/default.yaml model.num_stages=8 run_name=ablate_stages_8
+python train.py --config configs/default.yaml model.model_backbone.num_hqs_iterations=8 run_name=ablate_stages_8
 
 # Add OFCE loss
 python train.py --config configs/default.yaml loss.ofce_weight=0.01

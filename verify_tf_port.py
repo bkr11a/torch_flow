@@ -335,7 +335,15 @@ class HQSFlowModelTFPort(nn.Module):
         self.cfg = cfg
 
         mb = _cfg_get(cfg, "model_backbone", {})
-        self.num_hqs_iterations = int(_cfg_get(mb, "num_hqs_iterations", _cfg_get(cfg, "num_stages", 10)))
+        legacy_num_stages = _cfg_get(cfg, "num_stages", None)
+        self.num_hqs_iterations = int(
+            _cfg_get(mb, "num_hqs_iterations", legacy_num_stages if legacy_num_stages is not None else 10)
+        )
+        if legacy_num_stages is not None and int(legacy_num_stages) != self.num_hqs_iterations:
+            raise ValueError(
+                "model.num_stages and model.model_backbone.num_hqs_iterations disagree. "
+                "Use model.model_backbone.num_hqs_iterations as the authoritative setting."
+            )
         self.upsample_scale = int(_cfg_get(cfg, "upsample_scale", 8))
 
         corr_cfg = _cfg_get(cfg, "corr", {})
@@ -682,7 +690,7 @@ class HQSFlowModelTFPort(nn.Module):
         mask = mask_logits.view(b, 1, 9, rate, rate, h, w)
         mask = torch.softmax(mask, dim=2)
 
-        up_flow = F.unfold(flow_lr, kernel_size=3, padding=1)
+        up_flow = F.unfold(rate * flow_lr, kernel_size=3, padding=1)
         up_flow = up_flow.view(b, 2, 9, 1, 1, h, w)
         up_flow = (mask * up_flow).sum(dim=2)
         up_flow = up_flow.permute(0, 1, 4, 2, 5, 3).reshape(b, 2, rate * h, rate * w)

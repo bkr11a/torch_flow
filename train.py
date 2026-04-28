@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "overrides", nargs="*",
-        help="Dot-notation key=value overrides, e.g. model.num_stages=8",
+        help="Dot-notation key=value overrides, e.g. model.model_backbone.num_hqs_iterations=8",
     )
     return p.parse_args()
 

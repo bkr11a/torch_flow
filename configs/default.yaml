@@ -27,7 +27,6 @@ mlflow:
 # ── Model ─────────────────────────────────────────────────────────────────
 model:
   model_type: tfport              # "tfport" | "original"
-  num_stages: 12                  # K unrolled HQS iterations
   upsample_scale: 8               # 1/upsample_scale encoder resolution → full res
 
   corr:                           # correlation pyramid (shared keys)
@@ -54,7 +53,7 @@ model:
     motion_dim: 64               # MotionEncoder output channels
 
     # ── Iteration parameters ─────────────────────────────────────────────
-    num_hqs_iterations: 12        # overrides model.num_stages if set
+    num_hqs_iterations: 12        # K unrolled HQS iterations (authoritative)
     max_displacement: 4           # correlation lookup radius
     num_corr_levels: 4            # correlation pyramid levels
     prox_jacobi_iters: 3          # inner Jacobi iterations for TV prox step

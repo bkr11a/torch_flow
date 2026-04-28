@@ -74,6 +74,7 @@ class SequenceLoss(nn.Module):
         """
         K = len(flow_preds)
         total_loss = flow_gt.new_zeros(())
+        total_weight = 0.0
 
         # Exclude GT-invalid and too-large-flow pixels
         mag = (flow_gt ** 2).sum(dim=1).sqrt()   # (B, H, W)
@@ -81,6 +82,7 @@ class SequenceLoss(nn.Module):
 
         for k, pred in enumerate(flow_preds):
             weight = self.gamma ** (K - k - 1)
+            total_weight += float(weight)
 
             # Upsample GT to match prediction resolution (should already match)
             gt_k = flow_gt
@@ -101,6 +103,9 @@ class SequenceLoss(nn.Module):
             loss_k = self._point_loss(pred, gt_k)    # (B, H, W)
             if vm.any():
                 total_loss = total_loss + weight * loss_k[vm].mean()
+
+        if total_weight > 0.0:
+            total_loss = total_loss / total_weight
 
         # EPE at the final stage
         epe = (flow_preds[-1] - flow_gt).pow(2).sum(dim=1).sqrt()

@@ -171,7 +171,7 @@ Helps inspect convergence behavior across unrolled HQS stages.
 ### 11) Run a quick ablation (number of stages)
 
 ```bash
-python train.py --config configs/default.yaml model.num_stages=8 run_name=ablate_stages_8
+python train.py --config configs/default.yaml model.model_backbone.num_hqs_iterations=8 run_name=ablate_stages_8
 ```
 
 Overrides config values directly from CLI.

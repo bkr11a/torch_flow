@@ -44,12 +44,13 @@ def main():
 
     logger.info("Output keys: {}", out.keys())
     logger.info("Output \'flow_preds\' length: {}", len(out['flow_preds']))
+    expected_iters = cfg.model.model_backbone.num_hqs_iterations
 
-    assert len(out['flow_preds']) == cfg.model.num_stages, (
-        f"Expected {cfg.model.num_stages} flow predictions, "
+    assert len(out['flow_preds']) == expected_iters, (
+        f"Expected {expected_iters} flow predictions, "
         f"but got {len(out['flow_preds'])}."
     )
-    logger.success("Output flow_preds length matches num_stages in config.")
+    logger.success("Output flow_preds length matches model_backbone.num_hqs_iterations.")
 
     logger.info("Final Predicted Flow Shape: {}", out['flow_preds'][-1].shape)
     logger.success("Model build successful!")

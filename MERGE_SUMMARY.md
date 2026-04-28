@@ -144,7 +144,7 @@ model = build_model(cfg)
 
 ### Benefit
 - Config-driven experimentation
-- Easy stage count changes: `model.num_stages=10`
+- Easy stage count changes: `model.model_backbone.num_hqs_iterations=10`
 - Weight sharing flexibility
 - Unified evaluation pipeline
 

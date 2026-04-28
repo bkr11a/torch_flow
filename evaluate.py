@@ -17,7 +17,7 @@ python evaluate.py --config configs/default.yaml \
 python evaluate.py --config configs/default.yaml \
                    --checkpoint checkpoints/hqs_flow/best.pth \
                    --datasets sintel \
-                   model.num_stages=8
+                   model.model_backbone.num_hqs_iterations=8
 """
 from __future__ import annotations
 
