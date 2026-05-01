@@ -907,7 +907,7 @@ class Trainer:
         if not (self.use_mlflow and self.mlflow_run_id):
             return
 
-        artifact_path = f"models/best_step_{self.global_step:07d}"
+        artifact_path = f"best_step_{self.global_step:07d}"
         model_info = self._mlflow_safe(
             "log_best_model",
             lambda: mlflow.pytorch.log_model(
