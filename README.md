@@ -205,6 +205,16 @@ Recommended defaults:
 - valid CA chain installed on clients
 - artifact storage path writable by MLflow server process
 
+For local development, create a `.env` file in the repository root and set:
+
+```bash
+MLFLOW_TRACKING_SERVER_CART_PATH=/absolute/path/to/mlflow-ca-bundle.pem
+```
+
+`train.py` automatically loads `.env` via `python-dotenv` and maps
+`MLFLOW_TRACKING_SERVER_CART_PATH` to MLflow's standard
+`MLFLOW_TRACKING_SERVER_CERT_PATH` environment variable.
+
 If you need local runs without server interaction, set `mlflow.enabled=false`.
 
 ## Typical Workflow

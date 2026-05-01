@@ -9,6 +9,7 @@ import logging
 import sys
 
 from omegaconf import OmegaConf, DictConfig, open_dict
+from dotenv import load_dotenv
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,6 +46,9 @@ def setup_logging(log_dir: str, run_name: str) -> None:
 
 
 def main() -> None:
+    # Load local environment variables (e.g. MLflow TLS/cert settings).
+    load_dotenv(override=False)
+
     args = parse_args()
 
     # Load base config

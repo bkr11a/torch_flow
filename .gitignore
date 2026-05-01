@@ -29,5 +29,8 @@ results/
 .vscode/
 .idea/
 
+# Local environment variables
+.env
+
 # Windows metadata artifacts
 *:Zone.Identifier

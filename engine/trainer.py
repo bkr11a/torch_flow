@@ -823,6 +823,14 @@ class Trainer:
             raise RuntimeError("mlflow is not installed. Add mlflow to requirements.")
 
         mcfg = self.cfg.get("mlflow", {})
+
+        # Backward-compatible alias: allow user-provided CART path to feed
+        # MLflow's standard CERT environment variable.
+        tracking_cert_path = os.getenv("MLFLOW_TRACKING_SERVER_CERT_PATH")
+        tracking_cart_path = os.getenv("MLFLOW_TRACKING_SERVER_CART_PATH")
+        if tracking_cart_path and not tracking_cert_path:
+            os.environ["MLFLOW_TRACKING_SERVER_CERT_PATH"] = tracking_cart_path
+
         tracking_uri = mcfg.get("tracking_uri", None)
         if tracking_uri:
             mlflow.set_tracking_uri(tracking_uri)
