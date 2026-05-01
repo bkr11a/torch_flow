@@ -15,6 +15,8 @@ import logging
 import json
 import os
 import math
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -39,6 +41,210 @@ from utils import (
 
 
 logger = logging.getLogger(__name__)
+
+
+_WORKER_SMOOTH_LOSS: Optional[SmoothnessLoss] = None
+_WORKER_OFCE_LOSS: Optional[OFCELoss] = None
+
+
+def _get_worker_losses() -> Tuple[SmoothnessLoss, OFCELoss]:
+    """Lazily initialize worker-local loss modules."""
+    global _WORKER_SMOOTH_LOSS
+    global _WORKER_OFCE_LOSS
+
+    if _WORKER_SMOOTH_LOSS is None:
+        _WORKER_SMOOTH_LOSS = SmoothnessLoss()
+    if _WORKER_OFCE_LOSS is None:
+        _WORKER_OFCE_LOSS = OFCELoss()
+
+    return _WORKER_SMOOTH_LOSS, _WORKER_OFCE_LOSS
+
+
+def _compute_stage_mean_epe_np(
+    flow_stages: List[np.ndarray],
+    flow_gt: np.ndarray,
+    valid: np.ndarray,
+) -> np.ndarray:
+    """Compute per-stage mean EPE against GT, respecting valid mask."""
+    flow_gt_t = torch.from_numpy(flow_gt)
+    valid_t = torch.from_numpy(valid).bool()
+    epe_stages: List[float] = []
+
+    for flow_k_np in flow_stages:
+        flow_k_t = torch.from_numpy(flow_k_np)
+        vm = valid_t
+
+        if flow_k_t.shape != flow_gt_t.shape:
+            scale_h = flow_gt_t.shape[-2] / flow_k_t.shape[-2]
+            scale_w = flow_gt_t.shape[-1] / flow_k_t.shape[-1]
+            flow_k_t = F.interpolate(
+                flow_k_t.unsqueeze(0),
+                size=flow_gt_t.shape[-2:],
+                mode="bilinear",
+                align_corners=True,
+            ).squeeze(0)
+            flow_k_t[0] *= scale_w
+            flow_k_t[1] *= scale_h
+            vm = F.interpolate(
+                vm.float().unsqueeze(0).unsqueeze(0),
+                size=flow_gt_t.shape[-2:],
+                mode="nearest",
+            ).squeeze(0).squeeze(0).bool()
+
+        epe = torch.sqrt(((flow_k_t - flow_gt_t) ** 2).sum(dim=0))
+        epe_stages.append(epe[vm].mean().item() if vm.any() else epe.mean().item())
+
+    return np.asarray(epe_stages, dtype=np.float32)
+
+
+def _save_stage_convergence_plot(output_dir: str, sample_name: str, epe_stages: np.ndarray) -> None:
+    """Save visualization of how flow improves across stages."""
+    import matplotlib
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    K = int(epe_stages.shape[0])
+    stages = list(range(1, K + 1))
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(stages, epe_stages, "o-", linewidth=2, markersize=8)
+    ax.set_xlabel("HQS Stage", fontsize=12)
+    ax.set_ylabel("Mean EPE (pixels)", fontsize=12)
+    ax.set_title(f"Flow Convergence: {sample_name}", fontsize=14)
+    ax.grid(True, alpha=0.3)
+    ax.set_xticks(stages)
+
+    plot_path = Path(output_dir) / "stage_convergence" / f"{sample_name}_convergence.png"
+    plt.savefig(plot_path, dpi=100, bbox_inches="tight")
+    plt.close()
+
+
+def _save_intermediate_states_plot(
+    output_dir: str,
+    sample_name: str,
+    flow_stages: List[np.ndarray],
+    flow_gt: np.ndarray,
+    valid: np.ndarray,
+) -> None:
+    """Save detailed intermediate flow states for visual inspection."""
+    import matplotlib
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+
+    flow_gt_t = torch.from_numpy(flow_gt)
+    valid_t = torch.from_numpy(valid).bool()
+
+    K = len(flow_stages)
+    cols = min(3, K)
+    rows = math.ceil(K / cols) + 1
+
+    fig = plt.figure(figsize=(5 * cols, 4 * rows))
+    gs = GridSpec(rows, cols, figure=fig, hspace=0.3, wspace=0.3)
+
+    for k, flow_k_np in enumerate(flow_stages):
+        ax = fig.add_subplot(gs[k // cols, k % cols])
+        flow_k_t = torch.from_numpy(flow_k_np)
+
+        if flow_k_t.shape != flow_gt_t.shape:
+            scale_h = flow_gt_t.shape[-2] / flow_k_t.shape[-2]
+            scale_w = flow_gt_t.shape[-1] / flow_k_t.shape[-1]
+            flow_k_up = F.interpolate(
+                flow_k_t.unsqueeze(0),
+                size=flow_gt_t.shape[-2:],
+                mode="bilinear",
+                align_corners=True,
+            ).squeeze(0)
+            flow_k_up[0] *= scale_w
+            flow_k_up[1] *= scale_h
+        else:
+            flow_k_up = flow_k_t
+
+        flow_hsv = flow_to_hsv(flow_k_up)
+        epe = torch.sqrt(((flow_k_up - flow_gt_t) ** 2).sum(dim=0))
+        epe_mean = epe[valid_t].mean().item() if valid_t.any() else epe.mean().item()
+
+        ax.imshow(flow_hsv)
+        ax.set_title(f"Stage {k + 1}\\nMean EPE: {epe_mean:.3f}px", fontsize=11)
+        ax.axis("off")
+
+    ax_gt = fig.add_subplot(gs[rows - 1, :])
+    ax_gt.imshow(flow_to_hsv(flow_gt_t))
+    ax_gt.set_title("Ground Truth", fontsize=12)
+    ax_gt.axis("off")
+
+    plot_path = Path(output_dir) / "intermediate_stages" / f"{sample_name}_stages.png"
+    plt.savefig(plot_path, dpi=100, bbox_inches="tight")
+    plt.close()
+
+
+def _process_sample_task(task: Dict) -> Dict:
+    """Worker task: compute metrics and save all per-sample artifacts."""
+    import cv2
+
+    smooth_loss_fn, ofce_loss_fn = _get_worker_losses()
+
+    sample_name = task["sample_name"]
+    output_dir = Path(task["output_dir"])
+
+    flow_pred_t = torch.from_numpy(task["flow_pred"])
+    flow_gt_t = torch.from_numpy(task["flow_gt"])
+    valid_t = torch.from_numpy(task["valid"])
+    img1_t = torch.from_numpy(task["img1"])
+    img2_t = torch.from_numpy(task["img2"])
+    flow_stages_np = task["flow_stages"]
+
+    metrics = compute_metrics(flow_pred_t, flow_gt_t, valid_t)
+    metrics["sample_name"] = sample_name
+
+    metrics["smoothness_loss"] = smooth_loss_fn(
+        flow_pred_t.unsqueeze(0), img1_t.unsqueeze(0)
+    ).item()
+    metrics["ofce_loss"] = ofce_loss_fn(
+        img1_t.unsqueeze(0), img2_t.unsqueeze(0), flow_pred_t.unsqueeze(0)
+    ).item()
+
+    write_flow(output_dir / "flows" / f"{sample_name}.flo", flow_pred_t.numpy())
+    write_flow(output_dir / "gt_flows" / f"{sample_name}_gt.flo", flow_gt_t.numpy())
+
+    mag = torch.sqrt((flow_pred_t ** 2).sum(dim=0))
+    flow_mag_max = float(mag.max().item())
+
+    flow_hsv = flow_to_hsv(flow_pred_t)
+    cv2.imwrite(
+        str(output_dir / "flows_hsv" / f"{sample_name}.png"),
+        cv2.cvtColor(flow_hsv, cv2.COLOR_RGB2BGR),
+    )
+
+    flow_gt_hsv = flow_to_hsv(flow_gt_t)
+    cv2.imwrite(
+        str(output_dir / "gt_flows_hsv" / f"{sample_name}_gt.png"),
+        cv2.cvtColor(flow_gt_hsv, cv2.COLOR_RGB2BGR),
+    )
+
+    epe = torch.sqrt(((flow_pred_t - flow_gt_t) ** 2).sum(dim=0))
+    epe_np = epe.numpy()
+    epe_norm = np.clip(epe_np / 5.0 * 255.0, 0, 255).astype(np.uint8)
+    epe_bgr = cv2.applyColorMap(epe_norm, cv2.COLORMAP_HOT)
+    cv2.imwrite(str(output_dir / "errors" / f"{sample_name}_epe.png"), epe_bgr)
+
+    stage_epe = _compute_stage_mean_epe_np(flow_stages_np, task["flow_gt"], task["valid"])
+    _save_stage_convergence_plot(str(output_dir), sample_name, stage_epe)
+    _save_intermediate_states_plot(
+        str(output_dir),
+        sample_name,
+        flow_stages_np,
+        task["flow_gt"],
+        task["valid"],
+    )
+
+    norm_profile = stage_epe / max(float(stage_epe[0]), 1e-6)
+
+    return {
+        "metrics": metrics,
+        "flow_mag_max": flow_mag_max,
+        "normalized_stage_profile": norm_profile,
+    }
 
 
 def setup_logging(output_dir: str) -> None:
@@ -73,11 +279,13 @@ class FlowEvaluator:
         output_dir: str,
         device: torch.device,
         cfg: Optional[Dict] = None,
+        postproc_workers: int = 1,
     ):
         self.model = model
         self.output_dir = Path(output_dir)
         self.device = device
         self.cfg = cfg or {}
+        self.postproc_workers = max(1, int(postproc_workers))
 
         # Create output subdirectories
         (self.output_dir / "flows").mkdir(parents=True, exist_ok=True)
@@ -109,12 +317,24 @@ class FlowEvaluator:
         aggregate_metrics = {}
         num_batches = 0
 
-        logger.info(f"Starting evaluation on {len(dataloader)} batches...")
+        logger.info(
+            f"Starting evaluation on {len(dataloader)} batches with "
+            f"{self.postproc_workers} post-processing worker(s)..."
+        )
 
-        with torch.no_grad():
-            pbar = tqdm(dataloader, desc="Evaluating", unit="batch")
+        dataset_len = len(dataloader.dataset) if hasattr(dataloader, "dataset") else None
+        pbar = tqdm(total=dataset_len, desc="Evaluating", unit="sample")
 
-            for batch_idx, batch in enumerate(pbar):
+        executor: Optional[ProcessPoolExecutor] = None
+        if self.postproc_workers > 1:
+            executor = ProcessPoolExecutor(
+                max_workers=self.postproc_workers,
+                mp_context=mp.get_context("spawn"),
+            )
+
+        try:
+            with torch.no_grad():
+                for batch_idx, batch in enumerate(dataloader):
                 img1 = batch["image1"].to(device, non_blocking=True)
                 img2 = batch["image2"].to(device, non_blocking=True)
                 flow_gt = batch["flow"].to(device, non_blocking=True)
@@ -125,91 +345,42 @@ class FlowEvaluator:
                 flow_preds = out["flow_preds"]
                 flow_low = out.get("flow_low", [flow_preds[-1]])
 
-                # Process each item in batch
+                # Move batch tensors once to CPU for per-sample post-processing.
+                img1_cpu = img1.detach().cpu()
+                img2_cpu = img2.detach().cpu()
+                flow_gt_cpu = flow_gt.detach().cpu()
+                valid_cpu = valid.detach().cpu()
+                flow_preds_cpu = [fp.detach().cpu() for fp in flow_preds]
+
                 B = img1.shape[0]
+                tasks: List[Dict] = []
                 for b in range(B):
                     sample_name = f"batch_{batch_idx:06d}_item_{b:02d}"
 
-                    # Get predictions for this sample
-                    flow_pred = flow_preds[-1][b]  # Final stage full-res
-                    flow_stages = [fp[b] for fp in flow_preds]  # All stages
-
-                    # Get GT
-                    flow_gt_b = flow_gt[b]
-                    valid_b = valid[b]
-
-                    # Compute metrics
-                    metrics = compute_metrics(flow_pred, flow_gt_b, valid_b)
-                    metrics["sample_name"] = sample_name
-
-                    # Add auxiliary losses
-                    smooth_loss = self.smooth_loss(
-                        flow_pred.unsqueeze(0), img1[b].unsqueeze(0)
-                    ).item()
-                    metrics["smoothness_loss"] = smooth_loss
-
-                    ofce_loss = self.ofce_loss(
-                        img1[b].unsqueeze(0), img2[b].unsqueeze(0),
-                        flow_pred.unsqueeze(0)
-                    ).item()
-                    metrics["ofce_loss"] = ofce_loss
-
-                    # Save flows (numpy .flo format)
-                    flow_path = (
-                        self.output_dir / "flows" / f"{sample_name}.flo"
-                    )
-                    write_flow(flow_path, flow_pred.cpu().numpy())
-
-                    # Save GT flow
-                    gt_path = (
-                        self.output_dir / "gt_flows" / f"{sample_name}_gt.flo"
-                    )
-                    write_flow(gt_path, flow_gt_b.cpu().numpy())
-
-                    # Save flow magnitudes for visualization scaling
-                    mag = torch.sqrt((flow_pred ** 2).sum(dim=0))
-                    self.flow_magnitudes.append(mag.max().item())
-
-                    # Save HSV visualizations
-                    flow_hsv = flow_to_hsv(flow_pred)
-                    import cv2
-                    cv2.imwrite(
-                        str(self.output_dir / "flows_hsv" / f"{sample_name}.png"),
-                        cv2.cvtColor(flow_hsv, cv2.COLOR_RGB2BGR),
+                    tasks.append(
+                        {
+                            "sample_name": sample_name,
+                            "output_dir": str(self.output_dir),
+                            "flow_pred": flow_preds_cpu[-1][b].numpy(),
+                            "flow_stages": [fp[b].numpy() for fp in flow_preds_cpu],
+                            "flow_gt": flow_gt_cpu[b].numpy(),
+                            "valid": valid_cpu[b].numpy(),
+                            "img1": img1_cpu[b].numpy(),
+                            "img2": img2_cpu[b].numpy(),
+                        }
                     )
 
-                    flow_gt_hsv = flow_to_hsv(flow_gt_b)
-                    cv2.imwrite(
-                        str(self.output_dir / "gt_flows_hsv" / f"{sample_name}_gt.png"),
-                        cv2.cvtColor(flow_gt_hsv, cv2.COLOR_RGB2BGR),
-                    )
+                if executor is None:
+                    results = [_process_sample_task(task) for task in tasks]
+                else:
+                    futures = [executor.submit(_process_sample_task, task) for task in tasks]
+                    results = [f.result() for f in futures]
 
-                    # Save error map
-                    epe = torch.sqrt(((flow_pred - flow_gt_b) ** 2).sum(dim=0))
-                    # EPE is a scalar (H, W) map — not a flow vector, so we
-                    # cannot pass it to flow_to_hsv (which expects 2 channels).
-                    # Clip at 5 px for display, apply a hot colormap.
-                    epe_np = epe.cpu().numpy()  # (H, W)
-                    epe_norm = np.clip(epe_np / 5.0 * 255.0, 0, 255).astype(np.uint8)
-                    epe_bgr = cv2.applyColorMap(epe_norm, cv2.COLORMAP_HOT)
-                    cv2.imwrite(
-                        str(self.output_dir / "errors" / f"{sample_name}_epe.png"),
-                        epe_bgr,
-                    )
+                for result in results:
+                    metrics = result["metrics"]
+                    self.flow_magnitudes.append(result["flow_mag_max"])
+                    self.normalized_stage_profiles.append(result["normalized_stage_profile"])
 
-                    # Save stage-by-stage convergence and collect normalized profile
-                    stage_epe = self._compute_stage_mean_epe(flow_stages, flow_gt_b, valid_b)
-                    self._save_stage_convergence(sample_name, stage_epe)
-                    self.normalized_stage_profiles.append(
-                        stage_epe / max(float(stage_epe[0]), 1e-6)
-                    )
-
-                    # Save intermediate states for detailed inspection
-                    self._save_intermediate_states(
-                        sample_name, flow_stages, flow_gt_b, img1[b], img2[b], valid_b
-                    )
-
-                    # Accumulate metrics
                     self.metrics_list.append(metrics)
                     for k, v in metrics.items():
                         if k != "sample_name" and not math.isnan(v):
@@ -217,9 +388,13 @@ class FlowEvaluator:
                                 aggregate_metrics.get(k, 0.0) + v
                             )
 
-                    pbar.update(1)
+                pbar.update(B)
 
                 num_batches += B
+        finally:
+            pbar.close()
+            if executor is not None:
+                executor.shutdown(wait=True)
 
         # Average metrics
         for k in aggregate_metrics:
@@ -453,6 +628,11 @@ def main() -> None:
         "--batch_size", type=int, default=4,
         help="Batch size for evaluation",
     )
+    parser.add_argument(
+        "--postproc_workers", type=int, default=None,
+        help="Number of CPU workers for per-sample post-processing. "
+             "Defaults to max(1, cpu_count - 1). Use 1 to disable parallelism.",
+    )
     args = parser.parse_args()
 
     # Setup
@@ -487,11 +667,16 @@ def main() -> None:
     logger.info(f"Evaluation set: {len(eval_data)} samples")
 
     # Evaluate
+    default_workers = max(1, (os.cpu_count() or 1) - 1)
+    postproc_workers = default_workers if args.postproc_workers is None else max(1, args.postproc_workers)
+    logger.info(f"Post-processing workers: {postproc_workers}")
+
     evaluator = FlowEvaluator(
         model,
         args.output_dir,
         device,
         cfg=model_cfg.loss if hasattr(model_cfg, "loss") else {},
+        postproc_workers=postproc_workers,
     )
     metrics = evaluator.evaluate(eval_loader)
 
