@@ -335,62 +335,62 @@ class FlowEvaluator:
         try:
             with torch.no_grad():
                 for batch_idx, batch in enumerate(dataloader):
-                img1 = batch["image1"].to(device, non_blocking=True)
-                img2 = batch["image2"].to(device, non_blocking=True)
-                flow_gt = batch["flow"].to(device, non_blocking=True)
-                valid = batch["valid"].to(device, non_blocking=True)
+                    img1 = batch["image1"].to(device, non_blocking=True)
+                    img2 = batch["image2"].to(device, non_blocking=True)
+                    flow_gt = batch["flow"].to(device, non_blocking=True)
+                    valid = batch["valid"].to(device, non_blocking=True)
 
-                # Forward pass
-                out = self.model(img1, img2)
-                flow_preds = out["flow_preds"]
-                flow_low = out.get("flow_low", [flow_preds[-1]])
+                    # Forward pass
+                    out = self.model(img1, img2)
+                    flow_preds = out["flow_preds"]
+                    flow_low = out.get("flow_low", [flow_preds[-1]])
 
-                # Move batch tensors once to CPU for per-sample post-processing.
-                img1_cpu = img1.detach().cpu()
-                img2_cpu = img2.detach().cpu()
-                flow_gt_cpu = flow_gt.detach().cpu()
-                valid_cpu = valid.detach().cpu()
-                flow_preds_cpu = [fp.detach().cpu() for fp in flow_preds]
+                    # Move batch tensors once to CPU for per-sample post-processing.
+                    img1_cpu = img1.detach().cpu()
+                    img2_cpu = img2.detach().cpu()
+                    flow_gt_cpu = flow_gt.detach().cpu()
+                    valid_cpu = valid.detach().cpu()
+                    flow_preds_cpu = [fp.detach().cpu() for fp in flow_preds]
 
-                B = img1.shape[0]
-                tasks: List[Dict] = []
-                for b in range(B):
-                    sample_name = f"batch_{batch_idx:06d}_item_{b:02d}"
+                    B = img1.shape[0]
+                    tasks: List[Dict] = []
+                    for b in range(B):
+                        sample_name = f"batch_{batch_idx:06d}_item_{b:02d}"
 
-                    tasks.append(
-                        {
-                            "sample_name": sample_name,
-                            "output_dir": str(self.output_dir),
-                            "flow_pred": flow_preds_cpu[-1][b].numpy(),
-                            "flow_stages": [fp[b].numpy() for fp in flow_preds_cpu],
-                            "flow_gt": flow_gt_cpu[b].numpy(),
-                            "valid": valid_cpu[b].numpy(),
-                            "img1": img1_cpu[b].numpy(),
-                            "img2": img2_cpu[b].numpy(),
-                        }
-                    )
+                        tasks.append(
+                            {
+                                "sample_name": sample_name,
+                                "output_dir": str(self.output_dir),
+                                "flow_pred": flow_preds_cpu[-1][b].numpy(),
+                                "flow_stages": [fp[b].numpy() for fp in flow_preds_cpu],
+                                "flow_gt": flow_gt_cpu[b].numpy(),
+                                "valid": valid_cpu[b].numpy(),
+                                "img1": img1_cpu[b].numpy(),
+                                "img2": img2_cpu[b].numpy(),
+                            }
+                        )
 
-                if executor is None:
-                    results = [_process_sample_task(task) for task in tasks]
-                else:
-                    futures = [executor.submit(_process_sample_task, task) for task in tasks]
-                    results = [f.result() for f in futures]
+                    if executor is None:
+                        results = [_process_sample_task(task) for task in tasks]
+                    else:
+                        futures = [executor.submit(_process_sample_task, task) for task in tasks]
+                        results = [f.result() for f in futures]
 
-                for result in results:
-                    metrics = result["metrics"]
-                    self.flow_magnitudes.append(result["flow_mag_max"])
-                    self.normalized_stage_profiles.append(result["normalized_stage_profile"])
+                    for result in results:
+                        metrics = result["metrics"]
+                        self.flow_magnitudes.append(result["flow_mag_max"])
+                        self.normalized_stage_profiles.append(result["normalized_stage_profile"])
 
-                    self.metrics_list.append(metrics)
-                    for k, v in metrics.items():
-                        if k != "sample_name" and not math.isnan(v):
-                            aggregate_metrics[k] = (
-                                aggregate_metrics.get(k, 0.0) + v
-                            )
+                        self.metrics_list.append(metrics)
+                        for k, v in metrics.items():
+                            if k != "sample_name" and not math.isnan(v):
+                                aggregate_metrics[k] = (
+                                    aggregate_metrics.get(k, 0.0) + v
+                                )
 
-                pbar.update(B)
+                    pbar.update(B)
 
-                num_batches += B
+                    num_batches += B
         finally:
             pbar.close()
             if executor is not None:
