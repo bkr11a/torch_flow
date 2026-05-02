@@ -1,0 +1,40 @@
+# =============================================================================
+# Tuned overrides for FlyingThings3D fine-tuning
+# Usage:
+#   python train.py --config configs/default.yaml --override configs/things_ft.yaml --override configs/tuned/things_ft.yaml
+# =============================================================================
+
+run_name: hqs_flow_things_tuned
+
+model:
+  model_type: tfport
+  model_backbone:
+    num_hqs_iterations: 14
+    prox_jacobi_iters: 3
+    refine_level1_iters: 1
+
+    beta_min: 0.06
+    beta_max: 0.46
+    lambda_ratio_min: 0.22
+    lambda_ratio_max: 0.40
+
+    correction_gate_min: 0.02
+    correction_gate_max: 0.30
+    correction_gate_nonincreasing: true
+    freeze_correction_last_n: 2
+
+loss:
+  gamma: 0.85
+  smooth_weight: 0.0
+  inter_smooth_weight: 0.012
+  boundary_weight: 0.025
+  boundary_thresh: 0.018
+  raw_final_weight: 0.20
+  iter_damp_weight: 0.025
+  iter_damp_start_frac: 0.60
+
+training:
+  lr: 1.1e-4
+
+data:
+  detail_crop_prob: 0.20

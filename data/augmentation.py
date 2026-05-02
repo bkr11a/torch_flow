@@ -45,20 +45,29 @@ class ColorJitter:
         self.asym_prob  = asymmetric_prob
 
     def _jitter(self, img: np.ndarray) -> np.ndarray:
+        params = {
+            "b": random.uniform(max(0, 1 - self.brightness), 1 + self.brightness),
+            "c": random.uniform(max(0, 1 - self.contrast), 1 + self.contrast),
+            "s": random.uniform(max(0, 1 - self.saturation), 1 + self.saturation),
+            "h": random.uniform(-self.hue, self.hue) * 180,
+        }
+        return self._jitter_with_params(img, params)
+
+    def _jitter_with_params(self, img: np.ndarray, params: Dict[str, float]) -> np.ndarray:
         img = img.astype(np.float32)
         # brightness
-        b = random.uniform(max(0, 1 - self.brightness), 1 + self.brightness)
+        b = params["b"]
         img = img * b
         # contrast
-        c = random.uniform(max(0, 1 - self.contrast), 1 + self.contrast)
+        c = params["c"]
         mean = img.mean()
         img = (img - mean) * c + mean
         # saturation (operate in BGR)
-        s = random.uniform(max(0, 1 - self.saturation), 1 + self.saturation)
+        s = params["s"]
         gray = img.mean(axis=2, keepdims=True)
         img = img * s + gray * (1 - s)
         # hue (simple hue rotation in HSV)
-        h = random.uniform(-self.hue, self.hue) * 180
+        h = params["h"]
         img_u8 = np.clip(img, 0, 255).astype(np.uint8)
         hsv = cv2.cvtColor(img_u8, cv2.COLOR_BGR2HSV).astype(np.float32)
         hsv[:, :, 0] = (hsv[:, :, 0] + h) % 180
@@ -68,12 +77,19 @@ class ColorJitter:
     def __call__(self, sample: Dict) -> Dict:
         img1 = sample["image1"].copy()
         img2 = sample["image2"].copy()
-        # Symmetric jitter (same params for both)
-        img1 = self._jitter(img1)
+        # Symmetric jitter uses the same photometric parameters for both views.
         if random.random() < self.asym_prob:
+            img1 = self._jitter(img1)
             img2 = self._jitter(img2)
         else:
-            img2 = self._jitter(img2)
+            shared = {
+                "b": random.uniform(max(0, 1 - self.brightness), 1 + self.brightness),
+                "c": random.uniform(max(0, 1 - self.contrast), 1 + self.contrast),
+                "s": random.uniform(max(0, 1 - self.saturation), 1 + self.saturation),
+                "h": random.uniform(-self.hue, self.hue) * 180,
+            }
+            img1 = self._jitter_with_params(img1, shared)
+            img2 = self._jitter_with_params(img2, shared)
         sample["image1"] = img1
         sample["image2"] = img2
         return sample
@@ -175,11 +191,30 @@ class RandomScaleAndCrop:
         min_scale: float = -0.2,
         max_scale: float = 0.5,
         stretch_prob: float = 0.8,
+        detail_crop_prob: float = 0.0,
     ) -> None:
         self.crop_h, self.crop_w = crop_size
         self.min_scale = min_scale
         self.max_scale = max_scale
         self.stretch_prob = stretch_prob
+        self.detail_crop_prob = detail_crop_prob
+
+    def _sample_crop(self, img: np.ndarray, new_h: int, new_w: int) -> Tuple[int, int]:
+        max_y = new_h - self.crop_h
+        max_x = new_w - self.crop_w
+
+        if self.detail_crop_prob > 0 and random.random() < self.detail_crop_prob:
+            gray = cv2.cvtColor(np.clip(img, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
+            gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+            gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+            mag = np.sqrt(gx * gx + gy * gy)
+            yy, xx = np.unravel_index(np.argmax(mag), mag.shape)
+
+            y0 = int(np.clip(yy - self.crop_h // 2, 0, max_y))
+            x0 = int(np.clip(xx - self.crop_w // 2, 0, max_x))
+            return y0, x0
+
+        return random.randint(0, max_y), random.randint(0, max_x)
 
     def __call__(self, sample: Dict) -> Dict:
         H, W = sample["image1"].shape[:2]
@@ -232,8 +267,7 @@ class RandomScaleAndCrop:
             ).astype(bool)
 
         # Random crop
-        y0 = random.randint(0, new_H - self.crop_h)
-        x0 = random.randint(0, new_W - self.crop_w)
+        y0, x0 = self._sample_crop(sample["image1"], new_H, new_W)
 
         def _crop(arr: np.ndarray) -> np.ndarray:
             return arr[y0:y0 + self.crop_h, x0:x0 + self.crop_w]
@@ -290,11 +324,12 @@ class FlowAugmentor:
         crop_size: Tuple[int, int],
         min_scale: float = -0.2,
         max_scale: float = 0.5,
+        detail_crop_prob: float = 0.0,
     ) -> None:
         self.transforms = [
             ColorJitter(),
             GrayScaleTransform(),
-            RandomScaleAndCrop(crop_size, min_scale, max_scale),
+            RandomScaleAndCrop(crop_size, min_scale, max_scale, detail_crop_prob=detail_crop_prob),
             RandomHorizontalFlip(),
             RandomVerticalFlip(),
             RandomErase(),

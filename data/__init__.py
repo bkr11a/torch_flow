@@ -40,6 +40,7 @@ def build_dataset(cfg, split: str = "train"):
             crop_size=crop,
             min_scale=cfg.get("min_scale", -0.2),
             max_scale=cfg.get("max_scale",  0.5),
+            detail_crop_prob=cfg.get("detail_crop_prob", 0.0),
         )
 
     names = cfg.name if isinstance(cfg.name, list) else [cfg.name]

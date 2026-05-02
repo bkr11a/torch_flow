@@ -1,0 +1,41 @@
+# =============================================================================
+# Tuned overrides for Sintel fine-tuning
+# Usage:
+#   python train.py --config configs/default.yaml --override configs/sintel_ft.yaml --override configs/tuned/sintel_ft.yaml
+# =============================================================================
+
+run_name: hqs_flow_sintel_tuned
+
+model:
+  model_type: tfport
+  model_backbone:
+    num_hqs_iterations: 14
+    prox_jacobi_iters: 4
+    refine_level1_iters: 2
+
+    beta_min: 0.07
+    beta_max: 0.50
+    lambda_ratio_min: 0.20
+    lambda_ratio_max: 0.36
+
+    correction_gate_min: 0.01
+    correction_gate_max: 0.25
+    correction_gate_nonincreasing: true
+    freeze_correction_last_n: 3
+
+loss:
+  gamma: 0.85
+  smooth_weight: 0.0
+  inter_smooth_weight: 0.008
+  boundary_weight: 0.040
+  boundary_thresh: 0.015
+  raw_final_weight: 0.25
+  iter_damp_weight: 0.035
+  iter_damp_start_frac: 0.55
+
+training:
+  lr: 8.5e-5
+
+data:
+  max_scale: 0.7
+  detail_crop_prob: 0.35

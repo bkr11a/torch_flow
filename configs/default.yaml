@@ -57,6 +57,17 @@ model:
     max_displacement: 4           # correlation lookup radius
     num_corr_levels: 4            # correlation pyramid levels
     prox_jacobi_iters: 3          # inner Jacobi iterations for TV prox step
+    refine_level1_iters: 0        # optional extra HQS refinement loop at 1/4 scale
+
+    # ── HQS schedule / correction stability ────────────────────────────
+    beta_min: 0.05
+    beta_max: 0.50
+    lambda_ratio_min: 0.25
+    lambda_ratio_max: 0.45
+    correction_gate_min: 0.05
+    correction_gate_max: 0.50
+    correction_gate_nonincreasing: true
+    freeze_correction_last_n: 1
 
 # ── Loss ──────────────────────────────────────────────────────────────────
 loss:
@@ -64,6 +75,12 @@ loss:
   max_flow: 400.0                 # ignore GT with magnitude > this (px)
   loss_fn: charbonnier            # "charbonnier" | "l1" | "l2"
   smooth_weight: 0.0
+  inter_smooth_weight: 0.0        # edge-aware smoothness on intermediate stages
+  boundary_weight: 0.0            # GT flow-boundary supervision
+  boundary_thresh: 0.03           # GT gradient threshold for boundary mask
+  raw_final_weight: 0.0           # supervise raw pre-refinement final flow
+  iter_damp_weight: 0.0           # late-iteration update damping
+  iter_damp_start_frac: 0.5       # apply damping from this fraction of iterations onward
   photo_weight: 0.0
   ofce_weight: 0.0                # Optical Flow Constraint Equation loss
 
@@ -89,6 +106,7 @@ data:
   crop_size: [368, 496]
   min_scale: -0.1
   max_scale: 1.0
+  detail_crop_prob: 0.0           # chance to bias crops toward high-detail regions
   dstype: clean
 
 val_data:

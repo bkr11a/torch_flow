@@ -286,6 +286,12 @@ class HQSFlowLoss(nn.Module):
         max_flow:          float (default 400)
         loss_fn:           str   (default "charbonnier")
         smooth_weight:     float (default 0.0)
+        inter_smooth_weight: float (default 0.0)
+        boundary_weight:   float (default 0.0)
+        boundary_thresh:   float (default 0.03)
+        raw_final_weight:  float (default 0.0)
+        iter_damp_weight:  float (default 0.0)
+        iter_damp_start_frac: float (default 0.5)
         photo_weight:      float (default 0.0)
         ofce_weight:       float (default 0.0)
     """
@@ -298,6 +304,12 @@ class HQSFlowLoss(nn.Module):
             loss_fn=cfg.get("loss_fn", "charbonnier"),
         )
         self.smooth_weight = cfg.get("smooth_weight", 0.0)
+        self.inter_smooth_weight = cfg.get("inter_smooth_weight", 0.0)
+        self.boundary_weight = cfg.get("boundary_weight", 0.0)
+        self.boundary_thresh = cfg.get("boundary_thresh", 0.03)
+        self.raw_final_weight = cfg.get("raw_final_weight", 0.0)
+        self.iter_damp_weight = cfg.get("iter_damp_weight", 0.0)
+        self.iter_damp_start_frac = cfg.get("iter_damp_start_frac", 0.5)
         self.photo_weight  = cfg.get("photo_weight",  0.0)
         self.ofce_weight   = cfg.get("ofce_weight",   0.0)
 
@@ -307,6 +319,56 @@ class HQSFlowLoss(nn.Module):
         self.photo_loss = PhotometricLoss()
         self.ofce_loss = OFCELoss()
 
+    @staticmethod
+    def _flow_grad(flow: torch.Tensor):
+        dx = flow[:, :, :, 1:] - flow[:, :, :, :-1]
+        dy = flow[:, :, 1:, :] - flow[:, :, :-1, :]
+        return dx, dy
+
+    def _boundary_loss(
+        self,
+        pred: torch.Tensor,
+        gt: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        pdx, pdy = self._flow_grad(pred)
+        gdx, gdy = self._flow_grad(gt)
+
+        gmag_x = (gdx.pow(2).sum(dim=1) + 1e-9).sqrt()
+        gmag_y = (gdy.pow(2).sum(dim=1) + 1e-9).sqrt()
+
+        vx = valid[:, :, 1:] & valid[:, :, :-1]
+        vy = valid[:, 1:, :] & valid[:, :-1, :]
+        bx = vx & (gmag_x > self.boundary_thresh)
+        by = vy & (gmag_y > self.boundary_thresh)
+
+        loss = gt.new_zeros(())
+        count = 0
+
+        if bx.any():
+            loss = loss + (pdx - gdx).abs().mean(dim=1)[bx].mean()
+            count += 1
+        if by.any():
+            loss = loss + (pdy - gdy).abs().mean(dim=1)[by].mean()
+            count += 1
+
+        if count == 0:
+            return loss
+        return loss / float(count)
+
+    def _iteration_damping(self, flow_preds: List[torch.Tensor]) -> torch.Tensor:
+        if len(flow_preds) < 2:
+            return flow_preds[0].new_zeros(())
+
+        start_idx = int(len(flow_preds) * self.iter_damp_start_frac)
+        start_idx = max(1, min(start_idx, len(flow_preds) - 1))
+        terms = []
+        for i in range(start_idx, len(flow_preds)):
+            terms.append((flow_preds[i] - flow_preds[i - 1]).abs().mean())
+        if not terms:
+            return flow_preds[0].new_zeros(())
+        return torch.stack(terms).mean()
+
     def forward(
         self,
         flow_preds: List[torch.Tensor],
@@ -314,10 +376,34 @@ class HQSFlowLoss(nn.Module):
         valid: torch.Tensor,
         image1: Optional[torch.Tensor] = None,
         image2: Optional[torch.Tensor] = None,
+        model_outputs: Optional[Dict[str, object]] = None,
     ) -> Dict[str, torch.Tensor]:
         out = self.seq_loss(flow_preds, flow_gt, valid)
         total = out["loss"]
         pred_final = flow_preds[-1]
+        valid_mask = valid.bool()
+
+        raw_preds = None
+        if isinstance(model_outputs, dict):
+            candidate = model_outputs.get("flow_preds_raw", None)
+            if isinstance(candidate, list) and len(candidate) > 0:
+                raw_preds = candidate
+
+        if self.raw_final_weight > 0 and raw_preds is not None:
+            raw_final_dict = self.seq_loss([raw_preds[-1]], flow_gt, valid)
+            out["raw_final"] = raw_final_dict["loss"]
+            total = total + self.raw_final_weight * raw_final_dict["loss"]
+
+        if self.iter_damp_weight > 0:
+            damp_source = raw_preds if raw_preds is not None else flow_preds
+            damp = self._iteration_damping(damp_source)
+            out["iter_damp"] = damp
+            total = total + self.iter_damp_weight * damp
+
+        if self.boundary_weight > 0:
+            bnd = self._boundary_loss(pred_final, flow_gt, valid_mask)
+            out["boundary"] = bnd
+            total = total + self.boundary_weight * bnd
 
         if image1 is not None:
             if self.smooth_weight > 0:
@@ -328,6 +414,14 @@ class HQSFlowLoss(nn.Module):
             out["smooth"] = s
             if self.smooth_weight > 0:
                 total = total + self.smooth_weight * s
+
+            if self.inter_smooth_weight > 0 and len(flow_preds) > 1:
+                inter_terms = []
+                for pred in flow_preds[:-1]:
+                    inter_terms.append(self.smooth_loss(pred, image1))
+                inter_smooth = torch.stack(inter_terms).mean()
+                out["smooth_inter"] = inter_smooth
+                total = total + self.inter_smooth_weight * inter_smooth
 
         if image1 is not None and image2 is not None:
             if self.photo_weight > 0:

@@ -355,6 +355,7 @@ class HQSFlowModelTFPort(nn.Module):
         self.max_displacement = int(_cfg_get(mb, "max_displacement", _cfg_get(corr_cfg, "radius", 4)))
         self.num_corr_levels = int(_cfg_get(mb, "num_corr_levels", _cfg_get(corr_cfg, "num_levels", 4)))
         self.prox_jacobi_iters = int(_cfg_get(mb, "prox_jacobi_iters", 3))
+        self.refine_level1_iters = int(_cfg_get(mb, "refine_level1_iters", 0))
 
         base_channels = int(_cfg_get(mb, "base_channels", 32))
         channel_multiplier = tuple(_cfg_get(mb, "channel_multiplier", (1, 2, 4)))
@@ -388,11 +389,16 @@ class HQSFlowModelTFPort(nn.Module):
 
         # Bounded monotone HQS schedules reduce late-iteration instability while
         # preserving the unrolled physics-inspired structure.
-        self.beta_min = 0.05
-        self.beta_max = 0.50
-        self.lambda_ratio_min = 0.25
-        self.lambda_ratio_max = 0.45
-        self.correction_gate_max = 0.50
+        self.beta_min = float(_cfg_get(mb, "beta_min", 0.05))
+        self.beta_max = float(_cfg_get(mb, "beta_max", 0.50))
+        self.lambda_ratio_min = float(_cfg_get(mb, "lambda_ratio_min", 0.25))
+        self.lambda_ratio_max = float(_cfg_get(mb, "lambda_ratio_max", 0.45))
+        self.correction_gate_min = float(_cfg_get(mb, "correction_gate_min", 0.05))
+        self.correction_gate_max = float(_cfg_get(mb, "correction_gate_max", 0.50))
+        self.correction_gate_nonincreasing = bool(
+            _cfg_get(mb, "correction_gate_nonincreasing", True)
+        )
+        self.freeze_correction_last_n = int(_cfg_get(mb, "freeze_correction_last_n", 1))
 
         self.hqs_beta_steps = nn.Parameter(torch.zeros(self.num_hqs_iterations))
         self.hqs_lambda_ratio_steps = nn.Parameter(torch.zeros(self.num_hqs_iterations))
@@ -706,7 +712,18 @@ class HQSFlowModelTFPort(nn.Module):
         return beta, lam
 
     def _correction_gates(self) -> torch.Tensor:
-        return self.correction_gate_max * torch.sigmoid(self.delta_gate_logits)
+        if not self.correction_gate_nonincreasing:
+            gates = torch.sigmoid(self.delta_gate_logits)
+            return self.correction_gate_min + (self.correction_gate_max - self.correction_gate_min) * gates
+
+        # Force a non-increasing gate schedule so late iterations become
+        # contractive instead of equally aggressive.
+        steps = F.softplus(self.delta_gate_logits) + 1e-4
+        cumulative = steps.cumsum(dim=0)
+        normalized = cumulative / cumulative[-1].clamp_min(1e-6)
+        return self.correction_gate_max - (
+            self.correction_gate_max - self.correction_gate_min
+        ) * normalized
 
     @staticmethod
     def convex_upsample(flow_lr: torch.Tensor, mask_logits: torch.Tensor, rate: int = 8) -> torch.Tensor:
@@ -792,6 +809,10 @@ class HQSFlowModelTFPort(nn.Module):
         hidden_states: List[torch.Tensor] = []
         beta_schedule, lambda_schedule = self._hqs_penalties()
         correction_gates = self._correction_gates()
+        if self.freeze_correction_last_n > 0:
+            freeze_n = min(self.freeze_correction_last_n, iters)
+            correction_gates = correction_gates.clone()
+            correction_gates[iters - freeze_n:iters] = 0.0
 
         for k in range(iters):
             beta = beta_schedule[k]
@@ -840,6 +861,56 @@ class HQSFlowModelTFPort(nn.Module):
             flow_lows.append(torch.stack([flow_yx[:, 1], flow_yx[:, 0]], dim=1))
             flow_preds.append(flow_up_xy)
             hidden_states.append(net)
+
+        if self.refine_level1_iters > 0 and "level1" in feat1 and "level1" in feat2:
+            f1_l1 = feat1["level1"]
+            f2_l1 = feat2["level1"]
+            _, _, h1, w1 = f1_l1.shape
+
+            flow_l1 = self._resize_flow_yx(flow_yx, h1, w1)
+            aux_l1 = self._resize_flow_yx(aux_yx, h1, w1)
+            i1_l1 = F.interpolate(i1, size=(h1, w1), mode="bilinear", align_corners=True)
+            i2_l1 = F.interpolate(i2, size=(h1, w1), mode="bilinear", align_corners=True)
+            context_l1 = F.interpolate(context_feat, size=(h1, w1), mode="bilinear", align_corners=False)
+            net_l1 = F.interpolate(net, size=(h1, w1), mode="bilinear", align_corners=False)
+
+            corr_l1 = self.build_all_pairs_correlation(f1_l1, f2_l1)
+            corr_pyr_l1 = self.build_corr_pyramid_from_all_pairs(
+                corr_l1, num_levels=self.num_corr_levels
+            )
+            coords_l1 = self._coords_grid(b, h1, w1, device=f1.device, dtype=f1.dtype)
+
+            beta_l1 = beta_schedule[iters - 1]
+            lam_l1 = lambda_schedule[iters - 1]
+            gate_l1 = correction_gates[iters - 1]
+
+            for _ in range(self.refine_level1_iters):
+                coords_query_l1 = coords_l1 + flow_l1.permute(0, 2, 3, 1)
+                corr_feat_l1 = self.sample_all_pairs_corr_pyramid(
+                    corr_pyr_l1, coords_query_l1, radius=self.max_displacement
+                )
+                corr_feat_l1_chw = corr_feat_l1.permute(0, 3, 1, 2).contiguous()
+                confidence_l1 = self.iter_conf_head(corr_feat_l1_chw)
+
+                ix, iy, it, _ = self.compute_ofce_derivatives(i1_l1, i2_l1, flow_l1)
+                flow_l1, _, _ = self.hqs_data_step(
+                    ix, iy, it, aux_l1, confidence_l1, flow_l1, beta_l1
+                )
+                aux_l1, _, _ = self.hqs_prox_step(
+                    flow_l1, i1_l1, beta_l1, lam_l1, num_iter=self.prox_jacobi_iters
+                )
+
+                hqs_resid_l1 = flow_l1 - aux_l1
+                motion_l1 = self.motion_encoder(corr_feat_l1_chw, flow_l1, hqs_resid_l1)
+                delta_l1, _, net_l1 = self.update_unit(motion_l1, context_l1, net_l1)
+                flow_l1 = flow_l1 + gate_l1 * delta_l1
+                aux_l1, _, _ = self.hqs_prox_step(
+                    flow_l1, i1_l1, beta_l1, lam_l1, num_iter=self.prox_jacobi_iters
+                )
+
+            flow_yx = self._resize_flow_yx(flow_l1, h, w)
+            aux_yx = self._resize_flow_yx(aux_l1, h, w)
+            net = F.interpolate(net_l1, size=(h, w), mode="bilinear", align_corners=False)
 
         raw_flow_preds = list(flow_preds)
         raw_flow_lows = list(flow_lows)

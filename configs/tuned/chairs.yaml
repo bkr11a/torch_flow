@@ -1,0 +1,40 @@
+# =============================================================================
+# Tuned overrides for Chairs pretraining
+# Usage:
+#   python train.py --config configs/default.yaml --override configs/tuned/chairs.yaml
+# =============================================================================
+
+run_name: hqs_flow_chairs_tuned
+
+model:
+  model_type: tfport
+  model_backbone:
+    num_hqs_iterations: 12
+    prox_jacobi_iters: 3
+    refine_level1_iters: 1
+
+    beta_min: 0.06
+    beta_max: 0.42
+    lambda_ratio_min: 0.22
+    lambda_ratio_max: 0.38
+
+    correction_gate_min: 0.03
+    correction_gate_max: 0.35
+    correction_gate_nonincreasing: true
+    freeze_correction_last_n: 2
+
+loss:
+  gamma: 0.85
+  smooth_weight: 0.0
+  inter_smooth_weight: 0.010
+  boundary_weight: 0.020
+  boundary_thresh: 0.020
+  raw_final_weight: 0.15
+  iter_damp_weight: 0.020
+  iter_damp_start_frac: 0.60
+
+training:
+  lr: 3.5e-4
+
+data:
+  detail_crop_prob: 0.25

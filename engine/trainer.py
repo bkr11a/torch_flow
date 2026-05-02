@@ -639,7 +639,9 @@ class Trainer:
 
         with torch.autocast(device_type=self.device.type, enabled=self._use_amp):
             out       = self.model(img1, img2)
-            loss_dict = self.criterion(out["flow_preds"], flow, valid, img1, img2)
+            loss_dict = self.criterion(
+                out["flow_preds"], flow, valid, img1, img2, model_outputs=out
+            )
 
         self.scaler.scale(loss_dict["loss"]).backward()
         self.scaler.unscale_(self.optimizer)
