@@ -29,15 +29,31 @@ class SequenceLoss(nn.Module):
     """
     Compute a weighted sum of per-stage endpoint errors.
 
-    Loss = Σ_k  γ^{K-k-1}  ·  mean_valid( charbonnier(||u^k - u_gt||) )
+    Two weighting modes:
 
-    where K is the total number of stages, γ∈(0,1) favours later stages.
+    ``geometric`` (default):
+        Loss = Σ_k  γ^{K-k-1}  ·  mean_valid( charbonnier(||u^k - u_gt||) )
+        where K is the total number of stages, γ∈(0,1) favours later stages.
+
+    ``learnable``:
+        Per-stage weights are learned via a softmax over ``stage_logits``.  A
+        uniform-floor mixture prevents the trivial solution of collapsing all
+        weight onto a single stage (which would short-circuit early-stage
+        training)::
+
+            w_k = (1 - min_frac) * softmax(logits)[k] + min_frac * (1/K)
+
+        This guarantees every stage receives at least ``stage_weight_min_frac``
+        of its fair-share weight regardless of what gradient descent does.
 
     Args:
-        gamma:   Geometric decay (default 0.85).
-        max_flow: Ignore pixels with GT flow magnitude above this threshold
-                  (default 400 px, consistent with RAFT).
+        gamma:   Geometric decay (default 0.85, only used in geometric mode).
+        max_flow: Ignore pixels with GT flow magnitude above this threshold.
         loss_fn: "charbonnier" | "l1" | "l2"
+        stage_weight_mode: "geometric" | "learnable"
+        num_stages: Number of stages to initialise learnable logits for.
+                    Extra runtime stages are handled by zero-padding.
+        stage_weight_min_frac: Minimum fractional weight floor (learnable mode).
     """
 
     def __init__(
@@ -45,11 +61,20 @@ class SequenceLoss(nn.Module):
         gamma: float = 0.85,
         max_flow: float = 400.0,
         loss_fn: str = "charbonnier",
+        stage_weight_mode: str = "geometric",
+        num_stages: int = 12,
+        stage_weight_min_frac: float = 0.15,
     ) -> None:
         super().__init__()
         self.gamma    = gamma
         self.max_flow = max_flow
         self.loss_fn  = loss_fn
+        self.stage_weight_mode = stage_weight_mode
+        self.stage_weight_min_frac = float(stage_weight_min_frac)
+        if stage_weight_mode == "learnable":
+            # Initialised to zero so softmax starts near-uniform; training will
+            # adapt the distribution.  The minimum floor prevents collapse.
+            self.stage_logits = nn.Parameter(torch.zeros(num_stages))
 
     def _point_loss(self, pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
         diff = pred - gt
@@ -60,6 +85,34 @@ class SequenceLoss(nn.Module):
         if self.loss_fn == "l2":
             return (diff ** 2).mean(dim=1).sqrt()
         raise ValueError(self.loss_fn)
+
+    def get_stage_weights(self, K: int, device: torch.device) -> torch.Tensor:
+        """Return per-stage loss weights of shape (K,), normalised to sum to 1.
+
+        Geometric mode reproduces the classic \u03b3^{K-k-1} schedule.
+        Learnable mode mixes softmax weights with a uniform floor so no stage
+        can be completely ignored during training.
+        """
+        if self.stage_weight_mode == "learnable":
+            n_init = self.stage_logits.shape[0]
+            if K <= n_init:
+                logits = self.stage_logits[:K]
+            else:
+                # Zero-pad for any extra stages beyond the initialised count.
+                pad = self.stage_logits.new_zeros(K - n_init)
+                logits = torch.cat([self.stage_logits, pad])
+            logits = logits.to(device)
+            soft = torch.softmax(logits, dim=0)
+            uniform = torch.ones(K, device=device, dtype=soft.dtype) / K
+            weights = (1.0 - self.stage_weight_min_frac) * soft + self.stage_weight_min_frac * uniform
+            return weights / weights.sum()
+        else:
+            weights = torch.tensor(
+                [self.gamma ** (K - k - 1) for k in range(K)],
+                dtype=torch.float32,
+                device=device,
+            )
+            return weights / weights.sum()
 
     def forward(
         self,
@@ -74,15 +127,15 @@ class SequenceLoss(nn.Module):
         """
         K = len(flow_preds)
         total_loss = flow_gt.new_zeros(())
-        total_weight = 0.0
 
         # Exclude GT-invalid and too-large-flow pixels
         mag = (flow_gt ** 2).sum(dim=1).sqrt()   # (B, H, W)
         valid_mask = valid.bool() & (mag < self.max_flow)
 
+        stage_weights = self.get_stage_weights(K, flow_gt.device)
+
         for k, pred in enumerate(flow_preds):
-            weight = self.gamma ** (K - k - 1)
-            total_weight += float(weight)
+            weight = stage_weights[k]
 
             # Upsample GT to match prediction resolution (should already match)
             gt_k = flow_gt
@@ -103,9 +156,6 @@ class SequenceLoss(nn.Module):
             loss_k = self._point_loss(pred, gt_k)    # (B, H, W)
             if vm.any():
                 total_loss = total_loss + weight * loss_k[vm].mean()
-
-        if total_weight > 0.0:
-            total_loss = total_loss / total_weight
 
         # EPE at the final stage
         epe = (flow_preds[-1] - flow_gt).pow(2).sum(dim=1).sqrt()
@@ -302,6 +352,9 @@ class HQSFlowLoss(nn.Module):
             gamma=cfg.get("gamma", 0.85),
             max_flow=cfg.get("max_flow", 400.0),
             loss_fn=cfg.get("loss_fn", "charbonnier"),
+            stage_weight_mode=cfg.get("stage_weight_mode", "geometric"),
+            num_stages=cfg.get("num_stages", 12),
+            stage_weight_min_frac=cfg.get("stage_weight_min_frac", 0.15),
         )
         self.smooth_weight = cfg.get("smooth_weight", 0.0)
         self.inter_smooth_weight = cfg.get("inter_smooth_weight", 0.0)

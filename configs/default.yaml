@@ -35,29 +35,30 @@ model:
 
   model_backbone:                 # TFPort encoder / ConvGRU architecture
     # ── Shared encoder backbone ──────────────────────────────────────────
-    base_channels: 32             # stem output channels
+    base_channels: 64             # stem output channels [1.1: 32→64]
     channel_multiplier: [1, 2, 4] # per-stage channel scale (3 stages)
     blocks_per_stage: [2, 2, 2]   # residual blocks per stage
     groups: 8                     # GroupNorm groups
     dropout_rate: 0.0
 
     # ── Feature encoder ──────────────────────────────────────────────────
-    feature_dim: 64              # projected feature dim (level2 used for corr)
+    feature_dim: 128             # projected feature dim (level2 used for corr) [1.1: 64→128]
 
     # ── Context encoder ──────────────────────────────────────────────────
-    context_dim: 64              # context features passed to update unit each iter
-    hidden_dim: 32                # context encoder seed dim (projected to gru_hidden_dim)
+    context_dim: 128             # context features passed to update unit each iter [1.1: 64→128]
+    hidden_dim: 64               # context encoder seed dim (projected to gru_hidden_dim) [1.1: 32→64]
 
     # ── ConvGRU update unit ───────────────────────────────────────────────
-    gru_hidden_dim: 64           # GRU hidden state channels
-    motion_dim: 64               # MotionEncoder output channels
+    gru_hidden_dim: 128          # GRU hidden state channels [1.1: 64→128]
+    motion_dim: 128              # MotionEncoder output channels [1.1: 64→128]
 
     # ── Iteration parameters ─────────────────────────────────────────────
     num_hqs_iterations: 12        # K unrolled HQS iterations (authoritative)
-    max_displacement: 4           # correlation lookup radius
-    num_corr_levels: 4            # correlation pyramid levels
+    max_displacement: 8           # correlation lookup radius [1.3: 4→8]
+    num_corr_levels: 5            # correlation pyramid levels [1.3: 4→5]
     prox_jacobi_iters: 3          # inner Jacobi iterations for TV prox step
-    refine_level1_iters: 0        # optional extra HQS refinement loop at 1/4 scale
+    refine_level1_iters: 0        # legacy level1 loop (superseded by pyramid_l1_iters)
+    pyramid_l1_iters: 4           # 2.1: multi-scale HQS at level1 (1/4-scale) after main loop
 
     # ── HQS schedule / correction stability ────────────────────────────
     beta_min: 0.05
@@ -71,9 +72,13 @@ model:
 
 # ── Loss ──────────────────────────────────────────────────────────────────
 loss:
-  gamma: 0.85                     # geometric decay over stages
+  gamma: 0.85                     # geometric decay over stages (used when stage_weight_mode: geometric)
   max_flow: 400.0                 # ignore GT with magnitude > this (px)
   loss_fn: charbonnier            # "charbonnier" | "l1" | "l2"
+  # 2.2 adaptive stage weighting: prevents trivial collapse via min-floor mixture
+  stage_weight_mode: learnable    # "geometric" | "learnable"
+  num_stages: 16                  # num_hqs_iterations(12) + pyramid_l1_iters(4)
+  stage_weight_min_frac: 0.15     # each stage gets >= min_frac/K total weight
   smooth_weight: 0.0
   inter_smooth_weight: 0.0        # edge-aware smoothness on intermediate stages
   boundary_weight: 0.0            # GT flow-boundary supervision

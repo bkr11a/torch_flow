@@ -259,8 +259,11 @@ class Trainer:
         self.criterion = HQSFlowLoss(cfg.loss).to(self.device)
 
         # ── Optimiser ────────────────────────────────────────────────────────
+        # Include learnable loss parameters (e.g. adaptive stage weights from
+        # SequenceLoss when stage_weight_mode="learnable").
+        _opt_params = list(self.model.parameters()) + list(self.criterion.parameters())
         self.optimizer = optim.AdamW(
-            self.model.parameters(),
+            _opt_params,
             lr=cfg.training.lr,
             weight_decay=cfg.training.get("weight_decay", 1e-4),
             eps=1e-8,

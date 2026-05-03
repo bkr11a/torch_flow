@@ -312,12 +312,15 @@ class HQSUpdateUnit(nn.Module):
         )
         nn.init.zeros_(self.flow_head[-1].weight)
         nn.init.zeros_(self.flow_head[-1].bias)
-        self.mask_head = nn.Conv2d(
-            hidden_dim,
-            upsample_scale * upsample_scale * 9,
-            kernel_size=3,
-            padding=1,
+        # Image-guided upsampling: mask head fuses GRU hidden state with raw
+        # context features so the upsampling can attend directly to image
+        # structure (edges, boundaries) rather than only to the recurrent state.
+        self.mask_head = nn.Sequential(
+            nn.Conv2d(hidden_dim + context_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, upsample_scale * upsample_scale * 9, kernel_size=3, padding=1),
         )
+        self._context_dim = context_dim
 
     def forward(
         self,
@@ -328,7 +331,8 @@ class HQSUpdateUnit(nn.Module):
         x = torch.cat([motion_feat, context_feat], dim=1)
         net = self.gru(x, net)
         delta = self.flow_head(net)
-        mask_logits = self.mask_head(net)
+        # Fuse GRU state with context features for image-aware upsampling weights.
+        mask_logits = self.mask_head(torch.cat([net, context_feat], dim=1))
         return delta, mask_logits, net
 
 
@@ -405,6 +409,17 @@ class HQSFlowModelTFPort(nn.Module):
         self.delta_gate_logits = nn.Parameter(
             torch.full((self.num_hqs_iterations,), _inv_sigmoid(0.40))
         )
+
+        # ── Level-1 pyramid schedule parameters (2.1 Multi-Scale HQS) ────────
+        # Dedicated learnable penalty and gate schedules for the level1 (1/4-scale)
+        # refinement loop, independent of the main loop's schedule.
+        self.pyramid_l1_iters = int(_cfg_get(mb, "pyramid_l1_iters", 0))
+        if self.pyramid_l1_iters > 0:
+            self.hqs_beta_steps_l1 = nn.Parameter(torch.zeros(self.pyramid_l1_iters))
+            self.hqs_lambda_ratio_steps_l1 = nn.Parameter(torch.zeros(self.pyramid_l1_iters))
+            self.delta_gate_logits_l1 = nn.Parameter(
+                torch.full((self.pyramid_l1_iters,), _inv_sigmoid(0.40))
+            )
 
         corr_channels = self.num_corr_levels * (2 * self.max_displacement + 1) ** 2
 
@@ -701,29 +716,38 @@ class HQSFlowModelTFPort(nn.Module):
         normalized = cumulative / cumulative[-1].clamp_min(1e-6)
         return lower + (upper - lower) * normalized
 
-    def _hqs_penalties(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        beta = self._monotone_schedule(self.hqs_beta_steps, self.beta_min, self.beta_max)
+    def _compute_hqs_penalties_from(
+        self,
+        beta_steps: torch.Tensor,
+        lambda_ratio_steps: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Generic HQS penalty computation, reused across pyramid scales."""
+        beta = self._monotone_schedule(beta_steps, self.beta_min, self.beta_max)
         lam_ratio = self._monotone_schedule(
-            self.hqs_lambda_ratio_steps,
+            lambda_ratio_steps,
             self.lambda_ratio_min,
             self.lambda_ratio_max,
         )
-        lam = beta * lam_ratio
-        return beta, lam
+        return beta, beta * lam_ratio
 
-    def _correction_gates(self) -> torch.Tensor:
+    def _compute_correction_gates_from(self, gate_logits: torch.Tensor) -> torch.Tensor:
+        """Generic correction gate schedule, reused across pyramid scales.
+        Freeze logic is applied by the caller in the forward pass."""
         if not self.correction_gate_nonincreasing:
-            gates = torch.sigmoid(self.delta_gate_logits)
+            gates = torch.sigmoid(gate_logits)
             return self.correction_gate_min + (self.correction_gate_max - self.correction_gate_min) * gates
-
-        # Force a non-increasing gate schedule so late iterations become
-        # contractive instead of equally aggressive.
-        steps = F.softplus(self.delta_gate_logits) + 1e-4
+        steps = F.softplus(gate_logits) + 1e-4
         cumulative = steps.cumsum(dim=0)
         normalized = cumulative / cumulative[-1].clamp_min(1e-6)
         return self.correction_gate_max - (
             self.correction_gate_max - self.correction_gate_min
         ) * normalized
+
+    def _hqs_penalties(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self._compute_hqs_penalties_from(self.hqs_beta_steps, self.hqs_lambda_ratio_steps)
+
+    def _correction_gates(self) -> torch.Tensor:
+        return self._compute_correction_gates_from(self.delta_gate_logits)
 
     @staticmethod
     def convex_upsample(flow_lr: torch.Tensor, mask_logits: torch.Tensor, rate: int = 8) -> torch.Tensor:
@@ -862,7 +886,85 @@ class HQSFlowModelTFPort(nn.Module):
             flow_preds.append(flow_up_xy)
             hidden_states.append(net)
 
-        if self.refine_level1_iters > 0 and "level1" in feat1 and "level1" in feat2:
+        if self.pyramid_l1_iters > 0 and "level1" in feat1 and "level1" in feat2:
+            # ── Feature-pyramid multi-scale refinement (1.2 + 2.1) ──────────
+            # Runs a dedicated HQS loop at level1 (1/4-scale) features using
+            # its own learnable penalty and gate schedules.  Each iteration
+            # appends a full-resolution prediction to flow_preds so the sequence
+            # loss supervises convergence at this finer scale.  The refined flow
+            # is transferred back to level2 so the post-loop network starts from
+            # the best available state.
+            f1_l1 = feat1["level1"]
+            f2_l1 = feat2["level1"]
+            _, _, h1, w1 = f1_l1.shape
+
+            flow_l1 = self._resize_flow_yx(flow_yx, h1, w1)
+            aux_l1 = self._resize_flow_yx(aux_yx, h1, w1)
+            i1_l1 = F.interpolate(i1, size=(h1, w1), mode="bilinear", align_corners=True)
+            i2_l1 = F.interpolate(i2, size=(h1, w1), mode="bilinear", align_corners=True)
+            context_l1 = F.interpolate(context_feat, size=(h1, w1), mode="bilinear", align_corners=False)
+            net_l1 = F.interpolate(net, size=(h1, w1), mode="bilinear", align_corners=False)
+
+            corr_l1 = self.build_all_pairs_correlation(f1_l1, f2_l1)
+            corr_pyr_l1 = self.build_corr_pyramid_from_all_pairs(
+                corr_l1, num_levels=self.num_corr_levels
+            )
+            coords_l1 = self._coords_grid(b, h1, w1, device=f1.device, dtype=f1.dtype)
+
+            # Dedicated schedules — independent of the main loop's trajectory.
+            beta_l1_sched, lam_l1_sched = self._compute_hqs_penalties_from(
+                self.hqs_beta_steps_l1, self.hqs_lambda_ratio_steps_l1
+            )
+            gates_l1 = self._compute_correction_gates_from(self.delta_gate_logits_l1)
+            freeze_n_l1 = min(self.freeze_correction_last_n, self.pyramid_l1_iters)
+            if freeze_n_l1 > 0:
+                gates_l1 = gates_l1.clone()
+                gates_l1[self.pyramid_l1_iters - freeze_n_l1:] = 0.0
+
+            for k_l1 in range(self.pyramid_l1_iters):
+                beta = beta_l1_sched[k_l1]
+                lam = lam_l1_sched[k_l1]
+
+                coords_query_l1 = coords_l1 + flow_l1.permute(0, 2, 3, 1)
+                corr_feat_l1 = self.sample_all_pairs_corr_pyramid(
+                    corr_pyr_l1, coords_query_l1, radius=self.max_displacement
+                )
+                corr_feat_l1_chw = corr_feat_l1.permute(0, 3, 1, 2).contiguous()
+                confidence_l1 = self.iter_conf_head(corr_feat_l1_chw)
+
+                ix, iy, it, _ = self.compute_ofce_derivatives(i1_l1, i2_l1, flow_l1)
+                flow_l1, _, _ = self.hqs_data_step(
+                    ix, iy, it, aux_l1, confidence_l1, flow_l1, beta
+                )
+                aux_l1, _, _ = self.hqs_prox_step(
+                    flow_l1, i1_l1, beta, lam, num_iter=self.prox_jacobi_iters
+                )
+
+                hqs_resid_l1 = flow_l1 - aux_l1
+                motion_l1 = self.motion_encoder(corr_feat_l1_chw, flow_l1, hqs_resid_l1)
+                delta_l1, _, net_l1 = self.update_unit(motion_l1, context_l1, net_l1)
+                flow_l1 = flow_l1 + gates_l1[k_l1] * delta_l1
+                aux_l1, _, _ = self.hqs_prox_step(
+                    flow_l1, i1_l1, beta, lam, num_iter=self.prox_jacobi_iters
+                )
+
+                # Full-res prediction from 1/4-scale flow via bilinear upsampling.
+                # Higher quality than main-loop predictions (finer features),
+                # and supervised by the sequence loss at each step.
+                flow_up_l1 = self._resize_flow_yx(flow_l1, image1.shape[-2], image1.shape[-1])
+                flow_up_l1_xy = torch.stack([flow_up_l1[:, 1], flow_up_l1[:, 0]], dim=1)
+                flow_preds.append(flow_up_l1_xy)
+                flow_lows.append(torch.stack([flow_l1[:, 1], flow_l1[:, 0]], dim=1))
+                hidden_states.append(net_l1)
+
+            # Transfer refined flow back to level2 for post-loop refinement.
+            flow_yx = self._resize_flow_yx(flow_l1, h, w)
+            aux_yx = self._resize_flow_yx(aux_l1, h, w)
+            net = F.interpolate(net_l1, size=(h, w), mode="bilinear", align_corners=False)
+
+        elif self.refine_level1_iters > 0 and "level1" in feat1 and "level1" in feat2:
+            # Legacy simple level1 refinement (no dedicated schedules, no
+            # intermediate predictions).  Superseded by pyramid_l1_iters.
             f1_l1 = feat1["level1"]
             f2_l1 = feat2["level1"]
             _, _, h1, w1 = f1_l1.shape
