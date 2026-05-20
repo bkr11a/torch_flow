@@ -642,9 +642,14 @@ class HQSFlowModelTFPort(nn.Module):
         v0 = flow0_yx[:, 0:1]
         u0 = flow0_yx[:, 1:2]
 
+        du_prior = p - u0
+        dv_prior = q - v0
+
         c = confidence.clamp(0.05, 1.0)
         if robust:
-            r = ix * u0 + iy * v0 + it
+            # Since we've already warped i2 with the current flow estimate, the residual r is just the photometric error it.
+            # r = ix * u0 + iy * v0 + it
+            r = it
             wd = 1.0 / (r.square() + eps ** 2).sqrt()
         else:
             wd = torch.ones_like(ix)
@@ -653,12 +658,16 @@ class HQSFlowModelTFPort(nn.Module):
         a11 = w * ix * ix + beta
         a12 = w * ix * iy
         a22 = w * iy * iy + beta
-        b1 = -w * ix * it + beta * p
-        b2 = -w * iy * it + beta * q
+        b1 = -w * ix * it + beta * du_prior
+        b2 = -w * iy * it + beta * dv_prior
 
         det = a11 * a22 - a12 * a12
-        u = (a22 * b1 - a12 * b2) / (det + 1e-6)
-        v = (-a12 * b1 + a11 * b2) / (det + 1e-6)
+        du = (a22 * b1 - a12 * b2) / (det + 1e-6)
+        dv = (-a12 * b1 + a11 * b2) / (det + 1e-6)
+        
+        u = u0 + du
+        v = v0 + dv
+
         flow_yx = torch.cat([v, u], dim=1)
         return flow_yx, wd, det
 
