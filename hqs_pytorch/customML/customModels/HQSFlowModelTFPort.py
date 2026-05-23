@@ -840,6 +840,9 @@ class HQSFlowModelTFPort(nn.Module):
         flow_preds: List[torch.Tensor] = []
         flow_lows: List[torch.Tensor] = []
         hidden_states: List[torch.Tensor] = []
+        aux_lows: List[torch.Tensor] = []
+        delta_lows: List[torch.Tensor] = []
+        coupling_residual_lows: List[torch.Tensor] = []
         beta_schedule, lambda_schedule = self._hqs_penalties()
         correction_gates = self._correction_gates()
         if self.freeze_correction_last_n > 0:
@@ -894,6 +897,11 @@ class HQSFlowModelTFPort(nn.Module):
             flow_lows.append(torch.stack([flow_yx[:, 1], flow_yx[:, 0]], dim=1))
             flow_preds.append(flow_up_xy)
             hidden_states.append(net)
+            aux_lows.append(torch.stack([aux_yx[:, 1], aux_yx[:, 0]], dim=1))
+            delta_lows.append(torch.stack([delta[:, 1], delta[:, 0]], dim=1))
+            coupling_residual_lows.append(
+                torch.stack([(flow_yx - aux_yx)[:, 1], (flow_yx - aux_yx)[:, 0]], dim=1)
+            )
 
         if self.pyramid_l1_iters > 0 and "level1" in feat1 and "level1" in feat2:
             # ── Feature-pyramid multi-scale refinement (1.2 + 2.1) ──────────
@@ -965,6 +973,11 @@ class HQSFlowModelTFPort(nn.Module):
                 flow_preds.append(flow_up_l1_xy)
                 flow_lows.append(torch.stack([flow_l1[:, 1], flow_l1[:, 0]], dim=1))
                 hidden_states.append(net_l1)
+                aux_lows.append(torch.stack([aux_l1[:, 1], aux_l1[:, 0]], dim=1))
+                delta_lows.append(torch.stack([delta_l1[:, 1], delta_l1[:, 0]], dim=1))
+                coupling_residual_lows.append(
+                    torch.stack([(flow_l1 - aux_l1)[:, 1], (flow_l1 - aux_l1)[:, 0]], dim=1)
+                )
 
             # Transfer refined flow back to level2 for post-loop refinement.
             flow_yx = self._resize_flow_yx(flow_l1, h, w)
@@ -1039,16 +1052,30 @@ class HQSFlowModelTFPort(nn.Module):
         if flow_preds:
             flow_preds[-1] = flow_up_xy
             flow_lows[-1] = torch.stack([flow_yx[:, 1], flow_yx[:, 0]], dim=1)
+            if aux_lows:
+                aux_lows[-1] = torch.stack([aux_yx[:, 1], aux_yx[:, 0]], dim=1)
+            if coupling_residual_lows:
+                coupling_residual_lows[-1] = torch.stack(
+                    [(flow_yx - aux_yx)[:, 1], (flow_yx - aux_yx)[:, 0]], dim=1
+                )
         else:
             flow_preds = [flow_up_xy]
             flow_lows = [torch.stack([flow_yx[:, 1], flow_yx[:, 0]], dim=1)]
             hidden_states = [net]
+            aux_lows = [torch.stack([aux_yx[:, 1], aux_yx[:, 0]], dim=1)]
+            delta_lows = [torch.zeros_like(flow_lows[0])]
+            coupling_residual_lows = [
+                torch.stack([(flow_yx - aux_yx)[:, 1], (flow_yx - aux_yx)[:, 0]], dim=1)
+            ]
 
         return {
             "flow_preds": flow_preds,
             "flow_preds_raw": raw_flow_preds,
             "flow_low": flow_lows,
             "flow_low_raw": raw_flow_lows,
+            "aux_low": aux_lows,
+            "delta_low": delta_lows,
+            "coupling_residual_low": coupling_residual_lows,
             "hidden_states": hidden_states,
             "flow_final_raw": raw_flow_preds[-1] if raw_flow_preds else flow_up_xy,
             "flow_final_refined": flow_up_xy,
