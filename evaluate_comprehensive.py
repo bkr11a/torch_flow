@@ -199,7 +199,10 @@ def _build_scene_video(scene_dir: Path, output_path: Path, fps: int = 30) -> boo
     if not (img1_dir.exists() and img2_dir.exists() and gt_dir.exists() and pred_dir.exists()):
         return False
 
-    frame_files = sorted([p.name for p in img1_dir.glob("*.png")])
+    frame_files = sorted(
+        [p.name for p in img1_dir.glob("*.png")],
+        key=lambda n: (_extract_int_from_stem(Path(n).stem), n),
+    )
     if not frame_files:
         return False
 
@@ -209,9 +212,24 @@ def _build_scene_video(scene_dir: Path, output_path: Path, fps: int = 30) -> boo
     h, w = first.shape[:2]
     out_h, out_w = h * 2, w * 2
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    codec_candidates = ["mp4v", "avc1", "H264"]
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = cv2.VideoWriter(str(output_path), fourcc, float(fps), (out_w, out_h))
+    writer = None
+    for codec in codec_candidates:
+        fourcc = cv2.VideoWriter_fourcc(*codec)
+        wobj = cv2.VideoWriter(str(output_path), fourcc, float(fps), (out_w, out_h))
+        if wobj.isOpened():
+            writer = wobj
+            break
+        wobj.release()
+
+    if writer is None:
+        logger.warning(
+            "Could not open VideoWriter for %s with codecs %s",
+            str(output_path),
+            codec_candidates,
+        )
+        return False
 
     for name in frame_files:
         i1 = cv2.imread(str(img1_dir / name))
@@ -232,6 +250,9 @@ def _build_scene_video(scene_dir: Path, output_path: Path, fps: int = 30) -> boo
         writer.write(frame)
 
     writer.release()
+    if not output_path.exists() or output_path.stat().st_size <= 0:
+        logger.warning("Scene video output missing or empty: %s", str(output_path))
+        return False
     return True
 
 
@@ -970,6 +991,25 @@ def _dataset_normalized_convergence(output_dir: Path, profiles: List[np.ndarray]
     if not profiles:
         return
 
+    out_plot = output_dir / "stage_convergence" / "dataset_normalized_convergence.png"
+    out_json = output_dir / "stage_convergence" / "dataset_normalized_convergence.json"
+    _save_normalized_convergence_profiles(
+        profiles,
+        out_plot,
+        out_json,
+        title="Dataset-Wide Normalized Stage Convergence",
+    )
+
+
+def _save_normalized_convergence_profiles(
+    profiles: List[np.ndarray],
+    out_plot: Path,
+    out_json: Path,
+    title: str,
+) -> None:
+    if not profiles:
+        return
+
     import matplotlib
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
@@ -990,15 +1030,15 @@ def _dataset_normalized_convergence(output_dir: Path, profiles: List[np.ndarray]
     ax.fill_between(x, lo, hi, alpha=0.3, label="+-2sigma")
     ax.set_xlabel("HQS Stage")
     ax.set_ylabel("Normalized Mean EPE")
-    ax.set_title("Dataset-Wide Normalized Stage Convergence")
+    ax.set_title(title)
     ax.grid(True, alpha=0.3)
     ax.legend()
 
-    out_plot = output_dir / "stage_convergence" / "dataset_normalized_convergence.png"
+    out_plot.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_plot, dpi=120, bbox_inches="tight")
     plt.close()
 
-    out_json = output_dir / "stage_convergence" / "dataset_normalized_convergence.json"
+    out_json.parent.mkdir(parents=True, exist_ok=True)
     with open(out_json, "w") as f:
         json.dump(
             {
@@ -1175,6 +1215,7 @@ class FlowEvaluator:
         self.metrics_list: List[Dict[str, Any]] = []
         self.flow_magnitudes: List[float] = []
         self.normalized_stage_profiles: List[np.ndarray] = []
+        self.scene_normalized_stage_profiles: Dict[str, List[np.ndarray]] = {}
         self.iter_profiles: List[Dict[str, List[float]]] = []
         self.qualitative_paths: List[str] = []
 
@@ -1279,6 +1320,11 @@ class FlowEvaluator:
                         metrics = result["metrics"]
                         self.flow_magnitudes.append(result["flow_mag_max"])
                         self.normalized_stage_profiles.append(result["normalized_stage_profile"])
+                        scene_name = str(result.get("scene", "") or "")
+                        if scene_name:
+                            self.scene_normalized_stage_profiles.setdefault(scene_name, []).append(
+                                result["normalized_stage_profile"]
+                            )
                         self.iter_profiles.append(result["iter_metrics"])
 
                         self.metrics_list.append(metrics)
@@ -1319,6 +1365,7 @@ class FlowEvaluator:
         )
 
         _dataset_normalized_convergence(self.output_dir, self.normalized_stage_profiles)
+        self._save_scene_normalized_convergence()
 
         self._build_scene_videos()
 
@@ -1354,6 +1401,7 @@ class FlowEvaluator:
     def _build_scene_videos(self) -> None:
         scene_root = self.output_dir / "scene_frames"
         if not scene_root.exists():
+            logger.info("No scene_frames directory found; skipping scene video render.")
             return
 
         built: List[str] = []
@@ -1368,6 +1416,23 @@ class FlowEvaluator:
             logger.info("Built scene videos:")
             for path in built:
                 logger.info(f"  - {path}")
+        else:
+            logger.info("No scene videos were generated (no valid scene folders or codec failure).")
+
+    def _save_scene_normalized_convergence(self) -> None:
+        if not self.scene_normalized_stage_profiles:
+            logger.info("No scene metadata resolved; skipping per-scene convergence aggregation.")
+            return
+
+        for scene, profiles in sorted(self.scene_normalized_stage_profiles.items()):
+            out_plot = self.output_dir / "stage_convergence" / scene / "scene_normalized_convergence.png"
+            out_json = self.output_dir / "stage_convergence" / scene / "scene_normalized_convergence.json"
+            _save_normalized_convergence_profiles(
+                profiles,
+                out_plot,
+                out_json,
+                title=f"Scene Normalized Stage Convergence: {scene}",
+            )
 
 
 def main() -> None:
