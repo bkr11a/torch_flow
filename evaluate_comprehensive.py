@@ -183,7 +183,7 @@ def _draw_flow_arrows(flow_xy: np.ndarray, background_rgb: np.ndarray, step: int
             y2 = int(round(y + dy))
             if x2 < 0 or x2 >= w or y2 < 0 or y2 >= h:
                 continue
-            cv2.arrowedLine(vis, (x, y), (x2, y2), (255, 255, 255), 1, tipLength=0.28)
+            cv2.arrowedLine(vis, (x, y), (x2, y2), (27, 27, 27), 1, tipLength=0.28)
 
     return vis
 
@@ -191,12 +191,14 @@ def _draw_flow_arrows(flow_xy: np.ndarray, background_rgb: np.ndarray, step: int
 def _build_scene_video(scene_dir: Path, output_path: Path, fps: int = 30) -> bool:
     """Create scene video grid: I1 | I2 / GT flow | Pred flow."""
     import cv2
+    logger.info("Building scene video for %s", str(scene_dir))
 
     img1_dir = scene_dir / "image1"
     img2_dir = scene_dir / "image2"
     gt_dir = scene_dir / "gt_flow_hsv"
     pred_dir = scene_dir / "pred_flow_hsv"
     if not (img1_dir.exists() and img2_dir.exists() and gt_dir.exists() and pred_dir.exists()):
+        logger.warning("Missing directories for scene video: %s", str(scene_dir))
         return False
 
     frame_files = sorted(
@@ -248,6 +250,8 @@ def _build_scene_video(scene_dir: Path, output_path: Path, fps: int = 30) -> boo
         bot = np.concatenate([gt, pr], axis=1)
         frame = np.concatenate([top, bot], axis=0)
         writer.write(frame)
+
+    logger.success("Scene video saved to %s", str(output_path))
 
     writer.release()
     if not output_path.exists() or output_path.stat().st_size <= 0:
