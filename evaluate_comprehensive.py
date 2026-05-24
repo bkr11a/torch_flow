@@ -251,8 +251,6 @@ def _build_scene_video(scene_dir: Path, output_path: Path, fps: int = 30) -> boo
         frame = np.concatenate([top, bot], axis=0)
         writer.write(frame)
 
-    logger.success("Scene video saved to %s", str(output_path))
-
     writer.release()
     if not output_path.exists() or output_path.stat().st_size <= 0:
         logger.warning("Scene video output missing or empty: %s", str(output_path))
