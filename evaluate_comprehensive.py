@@ -1296,6 +1296,7 @@ class FlowEvaluator:
                                 "sample_id": sample_meta["sample_id"],
                                 "frame1": sample_meta["frame1"],
                                 "frame2": sample_meta["frame2"],
+                                "has_scene": sample_meta["has_scene"],
                                 "sort_key": sample_meta["sort_key"],
                                 "output_dir": str(self.output_dir),
                                 "flow_pred": flow_final_cpu[b].numpy(),
