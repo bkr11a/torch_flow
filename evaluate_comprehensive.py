@@ -20,6 +20,7 @@ import math
 import multiprocessing as mp
 import os
 import platform
+import re
 import subprocess
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -61,6 +62,171 @@ def _safe_float(v: Any, default: float = float("nan")) -> float:
         return x
     except Exception:
         return default
+
+
+def _extract_int_from_stem(stem: str) -> int:
+    m = re.findall(r"\d+", stem)
+    if not m:
+        return -1
+    return int(m[-1])
+
+
+def _resolve_dataset_record(dataset: Any, global_index: int) -> Optional[Dict[str, Any]]:
+    """Resolve raw sample record dict from dataset or ConcatDataset."""
+    if hasattr(dataset, "_samples"):
+        samples = getattr(dataset, "_samples")
+        if 0 <= global_index < len(samples):
+            return samples[global_index]
+        return None
+
+    if hasattr(dataset, "datasets") and hasattr(dataset, "cumulative_sizes"):
+        cum = dataset.cumulative_sizes
+        sub_idx = 0
+        while sub_idx < len(cum) and global_index >= cum[sub_idx]:
+            sub_idx += 1
+        if sub_idx >= len(dataset.datasets):
+            return None
+        prev = 0 if sub_idx == 0 else cum[sub_idx - 1]
+        local = global_index - prev
+        return _resolve_dataset_record(dataset.datasets[sub_idx], local)
+
+    return None
+
+
+def _infer_scene_and_sample(record: Optional[Dict[str, Any]], fallback_name: str) -> Dict[str, Any]:
+    """Infer scene folder and stable sample id from source file paths."""
+    if record is None:
+        return {
+            "scene": "scene_unknown",
+            "sample_id": fallback_name,
+            "frame1": fallback_name,
+            "frame2": fallback_name,
+            "sort_key": -1,
+        }
+
+    img1 = record.get("image1")
+    img2 = record.get("image2")
+    if not img1:
+        return {
+            "scene": "scene_unknown",
+            "sample_id": fallback_name,
+            "frame1": fallback_name,
+            "frame2": fallback_name,
+            "sort_key": -1,
+        }
+
+    p1 = Path(img1)
+    p2 = Path(img2) if img2 else p1
+    frame1 = p1.stem
+    frame2 = p2.stem
+
+    parent = p1.parent.name
+    grand = p1.parent.parent.name if p1.parent.parent is not None else ""
+    scene = parent
+
+    if parent in {
+        "left", "right", "image_2", "data", "frame_left", "frame_right",
+        "flow_FW_left", "flow_BW_left", "flow_FW_right", "flow_BW_right",
+    } and grand:
+        scene = grand
+
+    if scene in {"clean", "final", "flow", "training", "test", "train", "testing"}:
+        scene = "scene_unknown"
+
+    if not scene:
+        scene = "scene_unknown"
+
+    sample_id = f"{frame1}__{frame2}"
+    sample_id = sample_id.replace("/", "_")
+    return {
+        "scene": scene,
+        "sample_id": sample_id,
+        "frame1": frame1,
+        "frame2": frame2,
+        "sort_key": _extract_int_from_stem(frame1),
+    }
+
+
+def _qualitative_selection(request: str, dataset_len: int, seed: int) -> Optional[set]:
+    req = str(request).strip().lower()
+    if req == "all":
+        return None
+
+    n = int(req)
+    if n <= 0:
+        return set()
+    n = min(n, dataset_len)
+
+    g = np.random.default_rng(seed)
+    chosen = g.choice(dataset_len, size=n, replace=False)
+    return set(int(x) for x in chosen.tolist())
+
+
+def _draw_flow_arrows(flow_xy: np.ndarray, background_rgb: np.ndarray, step: int = 16, scale: float = 1.0) -> np.ndarray:
+    """Render quiver-like arrows from a regular pixel grid over background image."""
+    import cv2
+
+    h, w, _ = flow_xy.shape
+    vis = np.clip(background_rgb * 255.0, 0, 255).astype(np.uint8).copy()
+
+    for y in range(step // 2, h, step):
+        for x in range(step // 2, w, step):
+            dx = float(flow_xy[y, x, 0]) * scale
+            dy = float(flow_xy[y, x, 1]) * scale
+            x2 = int(round(x + dx))
+            y2 = int(round(y + dy))
+            if x2 < 0 or x2 >= w or y2 < 0 or y2 >= h:
+                continue
+            cv2.arrowedLine(vis, (x, y), (x2, y2), (255, 255, 255), 1, tipLength=0.28)
+
+    return vis
+
+
+def _build_scene_video(scene_dir: Path, output_path: Path, fps: int = 12) -> bool:
+    """Create scene video grid: I1 | I2 / GT flow | Pred flow."""
+    import cv2
+
+    img1_dir = scene_dir / "image1"
+    img2_dir = scene_dir / "image2"
+    gt_dir = scene_dir / "gt_flow_hsv"
+    pred_dir = scene_dir / "pred_flow_hsv"
+    if not (img1_dir.exists() and img2_dir.exists() and gt_dir.exists() and pred_dir.exists()):
+        return False
+
+    frame_files = sorted([p.name for p in img1_dir.glob("*.png")])
+    if not frame_files:
+        return False
+
+    first = cv2.imread(str(img1_dir / frame_files[0]))
+    if first is None:
+        return False
+    h, w = first.shape[:2]
+    out_h, out_w = h * 2, w * 2
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(str(output_path), fourcc, float(fps), (out_w, out_h))
+
+    for name in frame_files:
+        i1 = cv2.imread(str(img1_dir / name))
+        i2 = cv2.imread(str(img2_dir / name))
+        gt = cv2.imread(str(gt_dir / name))
+        pr = cv2.imread(str(pred_dir / name))
+        if any(x is None for x in (i1, i2, gt, pr)):
+            continue
+
+        i1 = cv2.resize(i1, (w, h), interpolation=cv2.INTER_LINEAR)
+        i2 = cv2.resize(i2, (w, h), interpolation=cv2.INTER_LINEAR)
+        gt = cv2.resize(gt, (w, h), interpolation=cv2.INTER_LINEAR)
+        pr = cv2.resize(pr, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        top = np.concatenate([i1, i2], axis=1)
+        bot = np.concatenate([gt, pr], axis=1)
+        frame = np.concatenate([top, bot], axis=0)
+        writer.write(frame)
+
+    writer.release()
+    return True
 
 
 def _to_rgb_np(img_chw: np.ndarray) -> np.ndarray:
@@ -199,7 +365,7 @@ def _compute_iteration_metrics_np(
     }
 
 
-def _save_stage_convergence_plot(output_dir: str, sample_name: str, epe_stages: np.ndarray) -> None:
+def _save_stage_convergence_plot(output_dir: str, scene: str, sample_id: str, epe_stages: np.ndarray) -> None:
     import matplotlib
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
@@ -211,17 +377,19 @@ def _save_stage_convergence_plot(output_dir: str, sample_name: str, epe_stages: 
     ax.plot(xs, epe_stages, "o-", linewidth=2, markersize=7)
     ax.set_xlabel("HQS Stage")
     ax.set_ylabel("Mean EPE (px)")
-    ax.set_title(f"Convergence: {sample_name}")
+    ax.set_title(f"Convergence: {scene}/{sample_id}")
     ax.grid(True, alpha=0.3)
     ax.set_xticks(xs)
-    path = Path(output_dir) / "stage_convergence" / f"{sample_name}_convergence.png"
+    path = Path(output_dir) / "stage_convergence" / scene / f"{sample_id}_convergence.png"
+    path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(path, dpi=120, bbox_inches="tight")
     plt.close()
 
 
 def _save_intermediate_states_plot(
     output_dir: str,
-    sample_name: str,
+    scene: str,
+    sample_id: str,
     flow_stages: List[np.ndarray],
     flow_gt: np.ndarray,
     valid: np.ndarray,
@@ -255,14 +423,16 @@ def _save_intermediate_states_plot(
     ax_gt.set_title("Ground Truth Flow")
     ax_gt.axis("off")
 
-    path = Path(output_dir) / "intermediate_stages" / f"{sample_name}_stages.png"
+    path = Path(output_dir) / "intermediate_stages" / scene / f"{sample_id}_stages.png"
+    path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(path, dpi=120, bbox_inches="tight")
     plt.close()
 
 
 def _save_qualitative_panels(
     output_dir: str,
-    sample_name: str,
+    scene: str,
+    sample_id: str,
     flow_pred: np.ndarray,
     flow_gt: np.ndarray,
     img1: np.ndarray,
@@ -276,7 +446,7 @@ def _save_qualitative_panels(
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
-    out_dir = Path(output_dir) / "qualitative"
+    out_dir = Path(output_dir) / "qualitative" / scene
     out_dir.mkdir(parents=True, exist_ok=True)
 
     flow_pred_t = torch.from_numpy(flow_pred)
@@ -297,7 +467,7 @@ def _save_qualitative_panels(
     resid_bgr = cv2.applyColorMap(resid_u8, cv2.COLORMAP_TURBO)
     resid_rgb = cv2.cvtColor(resid_bgr, cv2.COLOR_BGR2RGB)
 
-    overview_path = out_dir / f"{sample_name}_overview.png"
+    overview_path = out_dir / f"{sample_id}_overview.png"
     fig, axes = plt.subplots(2, 4, figsize=(18, 9))
     axs = axes.ravel()
     axs[0].imshow(_to_rgb_np(img1))
@@ -340,14 +510,14 @@ def _save_qualitative_panels(
         plt.savefig(out_path, dpi=120, bbox_inches="tight")
         plt.close()
 
-    flow_stage_path = out_dir / f"{sample_name}_flow_stages.png"
+    flow_stage_path = out_dir / f"{sample_id}_flow_stages.png"
     _save_stage_grid(flow_stages, flow_stage_path, "w^k")
 
-    delta_path = out_dir / f"{sample_name}_delta_stages.png"
+    delta_path = out_dir / f"{sample_id}_delta_stages.png"
     if delta_stages is not None and len(delta_stages) > 0:
         _save_stage_grid(delta_stages, delta_path, "delta w^k")
 
-    coupling_path = out_dir / f"{sample_name}_coupling_stages.png"
+    coupling_path = out_dir / f"{sample_id}_coupling_stages.png"
     if coupling_stages is not None and len(coupling_stages) > 0:
         _save_stage_grid(coupling_stages, coupling_path, "w^k-q^k")
 
@@ -368,6 +538,9 @@ def _process_sample_task(task: Dict[str, Any]) -> Dict[str, Any]:
     smooth_loss_fn, ofce_loss_fn = _get_worker_losses()
 
     sample_name = task["sample_name"]
+    scene = task.get("scene", "scene_unknown")
+    sample_id = task.get("sample_id", sample_name)
+    frame1 = task.get("frame1", sample_id)
     output_dir = Path(task["output_dir"])
 
     flow_pred_t = torch.from_numpy(task["flow_pred"])
@@ -387,6 +560,8 @@ def _process_sample_task(task: Dict[str, Any]) -> Dict[str, Any]:
 
     metrics = compute_metrics(flow_pred_t, flow_gt_t, valid_t, occ_mask=occ_t, invalid_mask=inv_t)
     metrics["sample_name"] = sample_name
+    metrics["scene"] = scene
+    metrics["sample_id"] = sample_id
 
     metrics["smoothness_loss"] = smooth_loss_fn(
         flow_pred_t.unsqueeze(0), img1_t.unsqueeze(0)
@@ -395,35 +570,80 @@ def _process_sample_task(task: Dict[str, Any]) -> Dict[str, Any]:
         img1_t.unsqueeze(0), img2_t.unsqueeze(0), flow_pred_t.unsqueeze(0)
     ).item()
 
-    write_flow(output_dir / "flows" / f"{sample_name}.flo", flow_pred_t.numpy())
-    write_flow(output_dir / "gt_flows" / f"{sample_name}_gt.flo", flow_gt_t.numpy())
+    flow_dir = output_dir / "flows" / scene
+    flow_dir.mkdir(parents=True, exist_ok=True)
+    gt_flow_dir = output_dir / "gt_flows" / scene
+    gt_flow_dir.mkdir(parents=True, exist_ok=True)
+    write_flow(flow_dir / f"{sample_id}.flo", flow_pred_t.numpy())
+    write_flow(gt_flow_dir / f"{sample_id}_gt.flo", flow_gt_t.numpy())
 
     mag = torch.sqrt((flow_pred_t ** 2).sum(dim=0))
     flow_mag_max = float(mag.max().item())
 
     flow_hsv = flow_to_hsv(flow_pred_t)
+    flow_hsv_dir = output_dir / "flows_hsv" / scene
+    flow_hsv_dir.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(
-        str(output_dir / "flows_hsv" / f"{sample_name}.png"),
+        str(flow_hsv_dir / f"{sample_id}.png"),
         cv2.cvtColor(flow_hsv, cv2.COLOR_RGB2BGR),
     )
 
     flow_gt_hsv = flow_to_hsv(flow_gt_t)
+    gt_hsv_dir = output_dir / "gt_flows_hsv" / scene
+    gt_hsv_dir.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(
-        str(output_dir / "gt_flows_hsv" / f"{sample_name}_gt.png"),
+        str(gt_hsv_dir / f"{sample_id}_gt.png"),
         cv2.cvtColor(flow_gt_hsv, cv2.COLOR_RGB2BGR),
     )
+
+    img1_rgb = _to_rgb_np(task["img1"])
+    flow_pred_np = np.transpose(task["flow_pred"], (1, 2, 0))
+    flow_gt_np = np.transpose(task["flow_gt"], (1, 2, 0))
+    pred_arrow = _draw_flow_arrows(flow_pred_np, img1_rgb)
+    gt_arrow = _draw_flow_arrows(flow_gt_np, img1_rgb)
+    pred_arrow_dir = output_dir / "flows_arrows" / scene
+    gt_arrow_dir = output_dir / "gt_flows_arrows" / scene
+    pred_arrow_dir.mkdir(parents=True, exist_ok=True)
+    gt_arrow_dir.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(pred_arrow_dir / f"{sample_id}.png"), cv2.cvtColor(pred_arrow, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(str(gt_arrow_dir / f"{sample_id}_gt.png"), cv2.cvtColor(gt_arrow, cv2.COLOR_RGB2BGR))
 
     epe = torch.sqrt(((flow_pred_t - flow_gt_t) ** 2).sum(dim=0))
     epe_np = epe.numpy()
     epe_norm = np.clip(epe_np / 5.0 * 255.0, 0, 255).astype(np.uint8)
     epe_bgr = cv2.applyColorMap(epe_norm, cv2.COLORMAP_HOT)
-    cv2.imwrite(str(output_dir / "errors" / f"{sample_name}_epe.png"), epe_bgr)
+    err_dir = output_dir / "errors" / scene
+    err_dir.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(err_dir / f"{sample_id}_epe.png"), epe_bgr)
+
+    scene_frame_root = output_dir / "scene_frames" / scene
+    (scene_frame_root / "image1").mkdir(parents=True, exist_ok=True)
+    (scene_frame_root / "image2").mkdir(parents=True, exist_ok=True)
+    (scene_frame_root / "gt_flow_hsv").mkdir(parents=True, exist_ok=True)
+    (scene_frame_root / "pred_flow_hsv").mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(
+        str(scene_frame_root / "image1" / f"{frame1}.png"),
+        cv2.cvtColor((np.clip(img1_rgb, 0.0, 1.0) * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR),
+    )
+    cv2.imwrite(
+        str(scene_frame_root / "image2" / f"{frame1}.png"),
+        cv2.cvtColor((np.clip(_to_rgb_np(task["img2"]), 0.0, 1.0) * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR),
+    )
+    cv2.imwrite(
+        str(scene_frame_root / "gt_flow_hsv" / f"{frame1}.png"),
+        cv2.cvtColor(flow_gt_hsv, cv2.COLOR_RGB2BGR),
+    )
+    cv2.imwrite(
+        str(scene_frame_root / "pred_flow_hsv" / f"{frame1}.png"),
+        cv2.cvtColor(flow_hsv, cv2.COLOR_RGB2BGR),
+    )
 
     stage_epe = _compute_stage_mean_epe_np(flow_stages_np, task["flow_gt"], task["valid"])
-    _save_stage_convergence_plot(str(output_dir), sample_name, stage_epe)
+    _save_stage_convergence_plot(str(output_dir), scene, sample_id, stage_epe)
     _save_intermediate_states_plot(
         str(output_dir),
-        sample_name,
+        scene,
+        sample_id,
         flow_stages_np,
         task["flow_gt"],
         task["valid"],
@@ -444,7 +664,8 @@ def _process_sample_task(task: Dict[str, Any]) -> Dict[str, Any]:
     if bool(task.get("save_qualitative", False)):
         qualitative_paths = _save_qualitative_panels(
             str(output_dir),
-            sample_name,
+            scene,
+            sample_id,
             task["flow_pred"],
             task["flow_gt"],
             task["img1"],
@@ -462,6 +683,8 @@ def _process_sample_task(task: Dict[str, Any]) -> Dict[str, Any]:
         "normalized_stage_profile": norm_profile,
         "iter_metrics": iter_metrics,
         "qualitative_paths": qualitative_paths,
+        "scene": scene,
+        "frame1": frame1,
     }
 
 
@@ -827,7 +1050,6 @@ def save_model_summary(
 
     was_training = model.training
     model.eval()
-    h, w = input_shape[-2], input_shape[-1]
     x1 = torch.zeros(*input_shape, device=device)
     x2 = torch.zeros(*input_shape, device=device)
 
@@ -889,7 +1111,8 @@ class FlowEvaluator:
         device: torch.device,
         cfg: Optional[Dict[str, Any]] = None,
         postproc_workers: int = 1,
-        qualitative_samples: int = 8,
+        qualitative_samples: str = "8",
+        qualitative_seed: int = 1337,
         save_report: bool = True,
         report_template_path: Optional[str] = None,
         experiment_id: str = "HQS-EXP-AUTO",
@@ -902,7 +1125,8 @@ class FlowEvaluator:
         self.device = device
         self.cfg = cfg or {}
         self.postproc_workers = max(1, int(postproc_workers))
-        self.qualitative_samples = max(0, int(qualitative_samples))
+        self.qualitative_samples = str(qualitative_samples)
+        self.qualitative_seed = int(qualitative_seed)
         self.save_report = bool(save_report)
         self.report_template_path = report_template_path
         self.experiment_id = experiment_id
@@ -918,6 +1142,10 @@ class FlowEvaluator:
         (self.output_dir / "errors").mkdir(parents=True, exist_ok=True)
         (self.output_dir / "stage_convergence").mkdir(parents=True, exist_ok=True)
         (self.output_dir / "qualitative").mkdir(parents=True, exist_ok=True)
+        (self.output_dir / "flows_arrows").mkdir(parents=True, exist_ok=True)
+        (self.output_dir / "gt_flows_arrows").mkdir(parents=True, exist_ok=True)
+        (self.output_dir / "scene_frames").mkdir(parents=True, exist_ok=True)
+        (self.output_dir / "scene_videos").mkdir(parents=True, exist_ok=True)
 
         self.seq_loss = SequenceLoss(
             gamma=self.cfg.get("gamma", 0.85),
@@ -938,15 +1166,15 @@ class FlowEvaluator:
 
         aggregate_metrics: Dict[str, float] = {}
         num_samples = 0
-        qual_count = 0
+        dataset_len = len(dataloader.dataset) if hasattr(dataloader, "dataset") else 0
+        qual_set = _qualitative_selection(self.qualitative_samples, dataset_len, self.qualitative_seed)
 
         logger.info(
             f"Starting evaluation on {len(dataloader)} batches with "
             f"{self.postproc_workers} post-processing worker(s)..."
         )
 
-        dataset_len = len(dataloader.dataset) if hasattr(dataloader, "dataset") else None
-        pbar = tqdm(total=dataset_len, desc="Evaluating", unit="sample")
+        pbar = tqdm(total=dataset_len if dataset_len > 0 else None, desc="Evaluating", unit="sample")
 
         executor: Optional[ProcessPoolExecutor] = None
         if self.postproc_workers > 1:
@@ -989,14 +1217,23 @@ class FlowEvaluator:
                     B = img1.shape[0]
                     tasks: List[Dict[str, Any]] = []
                     for b in range(B):
+                        global_idx = num_samples + b
+                        src_record = _resolve_dataset_record(dataloader.dataset, global_idx)
+                        sample_meta = _infer_scene_and_sample(
+                            src_record,
+                            fallback_name=f"batch_{batch_idx:06d}_item_{b:02d}",
+                        )
                         sample_name = f"batch_{batch_idx:06d}_item_{b:02d}"
-                        save_q = qual_count < self.qualitative_samples
-                        if save_q:
-                            qual_count += 1
+                        save_q = True if qual_set is None else (global_idx in qual_set)
 
                         tasks.append(
                             {
                                 "sample_name": sample_name,
+                                "scene": sample_meta["scene"],
+                                "sample_id": sample_meta["sample_id"],
+                                "frame1": sample_meta["frame1"],
+                                "frame2": sample_meta["frame2"],
+                                "sort_key": sample_meta["sort_key"],
                                 "output_dir": str(self.output_dir),
                                 "flow_pred": flow_final_cpu[b].numpy(),
                                 "flow_stages": [fp[b].numpy() for fp in flow_preds_cpu],
@@ -1028,8 +1265,10 @@ class FlowEvaluator:
 
                         self.metrics_list.append(metrics)
                         for k, v in metrics.items():
-                            if k != "sample_name" and not math.isnan(v):
-                                aggregate_metrics[k] = aggregate_metrics.get(k, 0.0) + v
+                            if k in {"sample_name", "scene", "sample_id"}:
+                                continue
+                            if isinstance(v, (float, int, np.floating, np.integer)) and not math.isnan(float(v)):
+                                aggregate_metrics[k] = aggregate_metrics.get(k, 0.0) + float(v)
 
                         for p in result.get("qualitative_paths", {}).values():
                             self.qualitative_paths.append(p)
@@ -1063,6 +1302,8 @@ class FlowEvaluator:
 
         _dataset_normalized_convergence(self.output_dir, self.normalized_stage_profiles)
 
+        self._build_scene_videos()
+
         agg_iter = _aggregate_iter_profiles(self.iter_profiles)
         _save_iteration_summary(self.output_dir, agg_iter)
 
@@ -1092,6 +1333,24 @@ class FlowEvaluator:
         logger.info(f"Evaluation complete. Results saved to {self.output_dir}")
         return aggregate_metrics
 
+    def _build_scene_videos(self) -> None:
+        scene_root = self.output_dir / "scene_frames"
+        if not scene_root.exists():
+            return
+
+        built: List[str] = []
+        for scene_dir in sorted(scene_root.iterdir()):
+            if not scene_dir.is_dir():
+                continue
+            out = self.output_dir / "scene_videos" / f"{scene_dir.name}.mp4"
+            if _build_scene_video(scene_dir, out, fps=12):
+                built.append(str(out))
+
+        if built:
+            logger.info("Built scene videos:")
+            for path in built:
+                logger.info(f"  - {path}")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate optical flow model comprehensively")
@@ -1113,7 +1372,17 @@ def main() -> None:
     parser.add_argument("--experiment_title", default="Auto comprehensive evaluation")
     parser.add_argument("--status", default="completed", choices=["planned", "running", "completed", "failed", "superseded"])
     parser.add_argument("--no_report", action="store_true", help="Disable auto experiment_report.md generation")
-    parser.add_argument("--qualitative_samples", type=int, default=8, help="Number of samples to render qualitative panels for")
+    parser.add_argument(
+        "--qualitative_samples",
+        default="8",
+        help="Number of random qualitative samples, or 'all' to render the full validation set",
+    )
+    parser.add_argument(
+        "--qualitative_seed",
+        type=int,
+        default=1337,
+        help="Random seed used when selecting qualitative samples",
+    )
 
     parser.add_argument("--no_model_summary", action="store_true", help="Disable TensorFlow-like model summary output")
     parser.add_argument("--summary_height", type=int, default=256, help="Dummy input height for model summary")
@@ -1190,6 +1459,7 @@ def main() -> None:
         cfg=model_cfg.loss if hasattr(model_cfg, "loss") else {},
         postproc_workers=postproc_workers,
         qualitative_samples=args.qualitative_samples,
+        qualitative_seed=args.qualitative_seed,
         save_report=not args.no_report,
         report_template_path=args.report_template,
         experiment_id=args.experiment_id,
