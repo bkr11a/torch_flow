@@ -97,22 +97,24 @@ def _infer_scene_and_sample(record: Optional[Dict[str, Any]], fallback_name: str
     """Infer scene folder and stable sample id from source file paths."""
     if record is None:
         return {
-            "scene": "scene_unknown",
+            "scene": "",
             "sample_id": fallback_name,
             "frame1": fallback_name,
             "frame2": fallback_name,
             "sort_key": -1,
+            "has_scene": False,
         }
 
     img1 = record.get("image1")
     img2 = record.get("image2")
     if not img1:
         return {
-            "scene": "scene_unknown",
+            "scene": "",
             "sample_id": fallback_name,
             "frame1": fallback_name,
             "frame2": fallback_name,
             "sort_key": -1,
+            "has_scene": False,
         }
 
     p1 = Path(img1)
@@ -131,10 +133,9 @@ def _infer_scene_and_sample(record: Optional[Dict[str, Any]], fallback_name: str
         scene = grand
 
     if scene in {"clean", "final", "flow", "training", "test", "train", "testing"}:
-        scene = "scene_unknown"
+        scene = ""
 
-    if not scene:
-        scene = "scene_unknown"
+    has_scene = bool(scene)
 
     sample_id = f"{frame1}__{frame2}"
     sample_id = sample_id.replace("/", "_")
@@ -144,7 +145,12 @@ def _infer_scene_and_sample(record: Optional[Dict[str, Any]], fallback_name: str
         "frame1": frame1,
         "frame2": frame2,
         "sort_key": _extract_int_from_stem(frame1),
+        "has_scene": has_scene,
     }
+
+
+def _scene_subdir(base: Path, scene: str) -> Path:
+    return base / scene if scene else base
 
 
 def _qualitative_selection(request: str, dataset_len: int, seed: int) -> Optional[set]:
@@ -182,7 +188,7 @@ def _draw_flow_arrows(flow_xy: np.ndarray, background_rgb: np.ndarray, step: int
     return vis
 
 
-def _build_scene_video(scene_dir: Path, output_path: Path, fps: int = 12) -> bool:
+def _build_scene_video(scene_dir: Path, output_path: Path, fps: int = 30) -> bool:
     """Create scene video grid: I1 | I2 / GT flow | Pred flow."""
     import cv2
 
@@ -380,7 +386,7 @@ def _save_stage_convergence_plot(output_dir: str, scene: str, sample_id: str, ep
     ax.set_title(f"Convergence: {scene}/{sample_id}")
     ax.grid(True, alpha=0.3)
     ax.set_xticks(xs)
-    path = Path(output_dir) / "stage_convergence" / scene / f"{sample_id}_convergence.png"
+    path = _scene_subdir(Path(output_dir) / "stage_convergence", scene) / f"{sample_id}_convergence.png"
     path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(path, dpi=120, bbox_inches="tight")
     plt.close()
@@ -423,7 +429,7 @@ def _save_intermediate_states_plot(
     ax_gt.set_title("Ground Truth Flow")
     ax_gt.axis("off")
 
-    path = Path(output_dir) / "intermediate_stages" / scene / f"{sample_id}_stages.png"
+    path = _scene_subdir(Path(output_dir) / "intermediate_stages", scene) / f"{sample_id}_stages.png"
     path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(path, dpi=120, bbox_inches="tight")
     plt.close()
@@ -446,7 +452,7 @@ def _save_qualitative_panels(
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
-    out_dir = Path(output_dir) / "qualitative" / scene
+    out_dir = _scene_subdir(Path(output_dir) / "qualitative", scene)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     flow_pred_t = torch.from_numpy(flow_pred)
@@ -538,7 +544,7 @@ def _process_sample_task(task: Dict[str, Any]) -> Dict[str, Any]:
     smooth_loss_fn, ofce_loss_fn = _get_worker_losses()
 
     sample_name = task["sample_name"]
-    scene = task.get("scene", "scene_unknown")
+    scene = task.get("scene", "")
     sample_id = task.get("sample_id", sample_name)
     frame1 = task.get("frame1", sample_id)
     output_dir = Path(task["output_dir"])
@@ -570,9 +576,9 @@ def _process_sample_task(task: Dict[str, Any]) -> Dict[str, Any]:
         img1_t.unsqueeze(0), img2_t.unsqueeze(0), flow_pred_t.unsqueeze(0)
     ).item()
 
-    flow_dir = output_dir / "flows" / scene
+    flow_dir = _scene_subdir(output_dir / "flows", scene)
     flow_dir.mkdir(parents=True, exist_ok=True)
-    gt_flow_dir = output_dir / "gt_flows" / scene
+    gt_flow_dir = _scene_subdir(output_dir / "gt_flows", scene)
     gt_flow_dir.mkdir(parents=True, exist_ok=True)
     write_flow(flow_dir / f"{sample_id}.flo", flow_pred_t.numpy())
     write_flow(gt_flow_dir / f"{sample_id}_gt.flo", flow_gt_t.numpy())
@@ -581,7 +587,7 @@ def _process_sample_task(task: Dict[str, Any]) -> Dict[str, Any]:
     flow_mag_max = float(mag.max().item())
 
     flow_hsv = flow_to_hsv(flow_pred_t)
-    flow_hsv_dir = output_dir / "flows_hsv" / scene
+    flow_hsv_dir = _scene_subdir(output_dir / "flows_hsv", scene)
     flow_hsv_dir.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(
         str(flow_hsv_dir / f"{sample_id}.png"),
@@ -589,7 +595,7 @@ def _process_sample_task(task: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     flow_gt_hsv = flow_to_hsv(flow_gt_t)
-    gt_hsv_dir = output_dir / "gt_flows_hsv" / scene
+    gt_hsv_dir = _scene_subdir(output_dir / "gt_flows_hsv", scene)
     gt_hsv_dir.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(
         str(gt_hsv_dir / f"{sample_id}_gt.png"),
@@ -599,44 +605,55 @@ def _process_sample_task(task: Dict[str, Any]) -> Dict[str, Any]:
     img1_rgb = _to_rgb_np(task["img1"])
     flow_pred_np = np.transpose(task["flow_pred"], (1, 2, 0))
     flow_gt_np = np.transpose(task["flow_gt"], (1, 2, 0))
-    pred_arrow = _draw_flow_arrows(flow_pred_np, img1_rgb)
-    gt_arrow = _draw_flow_arrows(flow_gt_np, img1_rgb)
-    pred_arrow_dir = output_dir / "flows_arrows" / scene
-    gt_arrow_dir = output_dir / "gt_flows_arrows" / scene
-    pred_arrow_dir.mkdir(parents=True, exist_ok=True)
-    gt_arrow_dir.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(pred_arrow_dir / f"{sample_id}.png"), cv2.cvtColor(pred_arrow, cv2.COLOR_RGB2BGR))
-    cv2.imwrite(str(gt_arrow_dir / f"{sample_id}_gt.png"), cv2.cvtColor(gt_arrow, cv2.COLOR_RGB2BGR))
+    # Arrow overlays on both requested backgrounds and for both GT/pred flow.
+    arrow_base = output_dir / "flows_arrows"
+    pred_img_bg = _draw_flow_arrows(flow_pred_np, img1_rgb)
+    gt_img_bg = _draw_flow_arrows(flow_gt_np, img1_rgb)
+    pred_hsv_bg = _draw_flow_arrows(flow_pred_np, flow_hsv.astype(np.float32) / 255.0)
+    gt_hsv_bg = _draw_flow_arrows(flow_gt_np, flow_gt_hsv.astype(np.float32) / 255.0)
+
+    arrow_targets = [
+        ("image_bg/pred", pred_img_bg, f"{sample_id}.png"),
+        ("image_bg/gt", gt_img_bg, f"{sample_id}_gt.png"),
+        ("flow_hsv_bg/pred", pred_hsv_bg, f"{sample_id}.png"),
+        ("flow_hsv_bg/gt", gt_hsv_bg, f"{sample_id}_gt.png"),
+    ]
+    for sub, arr, name in arrow_targets:
+        arr_dir = _scene_subdir(arrow_base / sub, scene)
+        arr_dir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(arr_dir / name), cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
 
     epe = torch.sqrt(((flow_pred_t - flow_gt_t) ** 2).sum(dim=0))
     epe_np = epe.numpy()
     epe_norm = np.clip(epe_np / 5.0 * 255.0, 0, 255).astype(np.uint8)
     epe_bgr = cv2.applyColorMap(epe_norm, cv2.COLORMAP_HOT)
-    err_dir = output_dir / "errors" / scene
+    err_dir = _scene_subdir(output_dir / "errors", scene)
     err_dir.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(err_dir / f"{sample_id}_epe.png"), epe_bgr)
 
-    scene_frame_root = output_dir / "scene_frames" / scene
-    (scene_frame_root / "image1").mkdir(parents=True, exist_ok=True)
-    (scene_frame_root / "image2").mkdir(parents=True, exist_ok=True)
-    (scene_frame_root / "gt_flow_hsv").mkdir(parents=True, exist_ok=True)
-    (scene_frame_root / "pred_flow_hsv").mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(
-        str(scene_frame_root / "image1" / f"{frame1}.png"),
-        cv2.cvtColor((np.clip(img1_rgb, 0.0, 1.0) * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR),
-    )
-    cv2.imwrite(
-        str(scene_frame_root / "image2" / f"{frame1}.png"),
-        cv2.cvtColor((np.clip(_to_rgb_np(task["img2"]), 0.0, 1.0) * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR),
-    )
-    cv2.imwrite(
-        str(scene_frame_root / "gt_flow_hsv" / f"{frame1}.png"),
-        cv2.cvtColor(flow_gt_hsv, cv2.COLOR_RGB2BGR),
-    )
-    cv2.imwrite(
-        str(scene_frame_root / "pred_flow_hsv" / f"{frame1}.png"),
-        cv2.cvtColor(flow_hsv, cv2.COLOR_RGB2BGR),
-    )
+    has_scene = bool(task.get("has_scene", False))
+    if has_scene:
+        scene_frame_root = output_dir / "scene_frames" / scene
+        (scene_frame_root / "image1").mkdir(parents=True, exist_ok=True)
+        (scene_frame_root / "image2").mkdir(parents=True, exist_ok=True)
+        (scene_frame_root / "gt_flow_hsv").mkdir(parents=True, exist_ok=True)
+        (scene_frame_root / "pred_flow_hsv").mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(
+            str(scene_frame_root / "image1" / f"{frame1}.png"),
+            cv2.cvtColor((np.clip(img1_rgb, 0.0, 1.0) * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR),
+        )
+        cv2.imwrite(
+            str(scene_frame_root / "image2" / f"{frame1}.png"),
+            cv2.cvtColor((np.clip(_to_rgb_np(task["img2"]), 0.0, 1.0) * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR),
+        )
+        cv2.imwrite(
+            str(scene_frame_root / "gt_flow_hsv" / f"{frame1}.png"),
+            cv2.cvtColor(flow_gt_hsv, cv2.COLOR_RGB2BGR),
+        )
+        cv2.imwrite(
+            str(scene_frame_root / "pred_flow_hsv" / f"{frame1}.png"),
+            cv2.cvtColor(flow_hsv, cv2.COLOR_RGB2BGR),
+        )
 
     stage_epe = _compute_stage_mean_epe_np(flow_stages_np, task["flow_gt"], task["valid"])
     _save_stage_convergence_plot(str(output_dir), scene, sample_id, stage_epe)
@@ -685,6 +702,7 @@ def _process_sample_task(task: Dict[str, Any]) -> Dict[str, Any]:
         "qualitative_paths": qualitative_paths,
         "scene": scene,
         "frame1": frame1,
+        "has_scene": has_scene,
     }
 
 
@@ -1112,7 +1130,7 @@ class FlowEvaluator:
         cfg: Optional[Dict[str, Any]] = None,
         postproc_workers: int = 1,
         qualitative_samples: str = "8",
-        qualitative_seed: int = 1337,
+        qualitative_seed: int = 42,
         save_report: bool = True,
         report_template_path: Optional[str] = None,
         experiment_id: str = "HQS-EXP-AUTO",
@@ -1343,7 +1361,7 @@ class FlowEvaluator:
             if not scene_dir.is_dir():
                 continue
             out = self.output_dir / "scene_videos" / f"{scene_dir.name}.mp4"
-            if _build_scene_video(scene_dir, out, fps=12):
+            if _build_scene_video(scene_dir, out, fps=30):
                 built.append(str(out))
 
         if built:
@@ -1380,7 +1398,7 @@ def main() -> None:
     parser.add_argument(
         "--qualitative_seed",
         type=int,
-        default=1337,
+        default=42,
         help="Random seed used when selecting qualitative samples",
     )
 
