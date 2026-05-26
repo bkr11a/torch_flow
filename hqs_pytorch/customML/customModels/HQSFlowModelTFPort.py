@@ -441,9 +441,11 @@ class HQSFlowModelTFPort(nn.Module):
         # Per-iteration confidence head: trained on localized correlation
         # features sampled around the current flow estimate, not at zero-offset.
         self.iter_conf_head = nn.Sequential(
-            nn.Conv2d(corr_channels, 64, kernel_size=3, padding=1),
+            nn.Conv2d(corr_channels+2+1+1+1+1, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 1, kernel_size=3, padding=1),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=3, padding=1),
             nn.Sigmoid(),
         )
 
@@ -471,6 +473,13 @@ class HQSFlowModelTFPort(nn.Module):
             self.upsample_scale * self.upsample_scale * 9,
             kernel_size=3,
             padding=1,
+        )
+
+        self.transition_upsample_rate = 2
+        self.level1_transition_mask = nn.Sequential(
+            nn.Conv2d(2 + feature_dim + feature_dim, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, self.transition_upsample_rate * self.transition_upsample_rate * 9, kernel_size=3, padding=1),
         )
 
     @staticmethod
@@ -522,6 +531,21 @@ class HQSFlowModelTFPort(nn.Module):
 
         grid = torch.stack([gx, gy], dim=-1)
         return F.grid_sample(x, grid, mode="bilinear", padding_mode="border", align_corners=True)
+
+    @staticmethod
+    def _valid_warp_mask(flow_yx: torch.Tensor) -> torch.Tensor:
+        """Warping near image boundaries produces invalid values. This mask identifies valid pixels."""
+        b, _, h, w = flow_yx.shape
+        ys, xs = torch.meshgrid(
+            torch.arange(h, device=flow_yx.device, dtype=flow_yx.dtype),
+            torch.arange(w, device=flow_yx.device, dtype=flow_yx.dtype),
+            indexing="ij",
+        )
+        qy = ys.view(1, h, w) + flow_yx[:, 0]
+        qx = xs.view(1, h, w) + flow_yx[:, 1]
+
+        valid = (qx >= 0) & (qx <= w - 1) & (qy >= 0) & (qy <= h - 1)
+        return valid.float().unsqueeze(1)  # [B, 1, H, W]
 
     def build_all_pairs_correlation(self, f1: torch.Tensor, f2: torch.Tensor) -> torch.Tensor:
         """Return [B, H, W, H, W] all-pairs correlation."""
@@ -645,7 +669,13 @@ class HQSFlowModelTFPort(nn.Module):
         du_prior = p - u0
         dv_prior = q - v0
 
-        c = confidence.clamp(0.05, 1.0)
+        # ----- OLD CONFIDENCE CLAMP ----- #
+        # c = confidence.clamp(0.05, 1.0)
+        # ------------------------------ #
+        
+        # New clamping strategy to ensure that invalid pixels don't influence the update causing instabilty.
+        c = confidence.clamp(0.00, 1.0)
+
         if robust:
             # Since we've already warped i2 with the current flow estimate, the residual r is just the photometric error it.
             # r = ix * u0 + iy * v0 + it
@@ -771,6 +801,39 @@ class HQSFlowModelTFPort(nn.Module):
         up_flow = up_flow.permute(0, 1, 4, 2, 5, 3).reshape(b, 2, rate * h, rate * w)
         return up_flow
 
+    def convex_transition_upsample_yx(
+        self,
+        flow_yx: torch.Tensor,
+        f1_l2: torch.Tensor,
+        f1_l1: torch.Tensor,
+        f2_l1: torch.Tensor,
+    ) -> torch.Tensor:
+        # Build low-res conditioning features at level-2 resolution.
+        f1_l1_down = F.interpolate(
+            f1_l1,
+            size=flow_yx.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        f2_l1_down = F.interpolate(
+            f2_l1,
+            size=flow_yx.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        mask_in = torch.cat([flow_yx, f1_l1_down, f2_l1_down], dim=1)
+        mask_logits = self.level1_transition_mask(mask_in)
+
+        flow_up = self.convex_upsample(flow_yx, mask_logits, rate=self.transition_upsample_rate)
+
+        # Safely resize if shapes are not exactly 2x due to odd dimensions.
+        if flow_up.shape[-2:] != f1_l1.shape[-2:]:
+            flow_up = self._resize_flow_yx(flow_up, f1_l1.shape[-2], f1_l1.shape[-1])
+
+        return flow_up
+
     def _resize_flow_yx(self, flow: torch.Tensor, out_h: int, out_w: int) -> torch.Tensor:
         in_h, in_w = flow.shape[-2:]
         if in_h == out_h and in_w == out_w:
@@ -859,11 +922,18 @@ class HQSFlowModelTFPort(nn.Module):
             corr_feat_k = self.sample_all_pairs_corr_pyramid(corr_pyr, coords_query, radius=self.max_displacement)
             corr_feat_k_chw = corr_feat_k.permute(0, 3, 1, 2).contiguous()
 
-            # Per-iteration confidence from dedicated head (not the init decoder).
-            confidence_k = self.iter_conf_head(corr_feat_k_chw)
 
             # HQS u-step: closed-form OFCE data minimisation.
             ix, iy, it, _ = self.compute_ofce_derivatives(i1_lvl, i2_lvl, flow_yx)
+            # Adjust our confidence based on the validity of the warp to prevent out-of-bounds pixels from destabilizing training.
+            valid_k = self._valid_warp_mask(flow_yx)
+            # Per-iteration confidence from dedicated head (not the init decoder).
+            conf_in = torch.cat([corr_feat_k_chw, flow_yx, ix, iy, it, valid_k], dim=1)
+
+            confidence_k = self.iter_conf_head(conf_in)
+
+            confidence_k = confidence_k * valid_k
+
             flow_yx, _, _ = self.hqs_data_step(ix, iy, it, aux_yx, confidence_k, flow_yx, beta)
 
             # HQS v-step: Jacobi TV-proximal smoothing.
@@ -915,8 +985,13 @@ class HQSFlowModelTFPort(nn.Module):
             f2_l1 = feat2["level1"]
             _, _, h1, w1 = f1_l1.shape
 
-            flow_l1 = self._resize_flow_yx(flow_yx, h1, w1)
-            aux_l1 = self._resize_flow_yx(aux_yx, h1, w1)
+            # ------ OLD Bilinear resize-based transfer (Option A) ------
+            # flow_l1 = self._resize_flow_yx(flow_yx, h1, w1)
+            # aux_l1 = self._resize_flow_yx(aux_yx, h1, w1)
+            # ------ New convex upsample-based transfer (Option B) -----
+            flow_l1 = self.convex_transition_upsample_yx(flow_yx, f1, f1_l1, f2_l1)
+            aux_l1 = self.convex_transition_upsample_yx(aux_yx, f1, f1_l1, f2_l1)
+
             i1_l1 = F.interpolate(i1, size=(h1, w1), mode="bilinear", align_corners=True)
             i2_l1 = F.interpolate(i2, size=(h1, w1), mode="bilinear", align_corners=True)
             context_l1 = F.interpolate(context_feat, size=(h1, w1), mode="bilinear", align_corners=False)
@@ -947,9 +1022,14 @@ class HQSFlowModelTFPort(nn.Module):
                     corr_pyr_l1, coords_query_l1, radius=self.max_displacement
                 )
                 corr_feat_l1_chw = corr_feat_l1.permute(0, 3, 1, 2).contiguous()
-                confidence_l1 = self.iter_conf_head(corr_feat_l1_chw)
 
                 ix, iy, it, _ = self.compute_ofce_derivatives(i1_l1, i2_l1, flow_l1)
+                
+                valid_l1 = self._valid_warp_mask(flow_l1)
+                conf_in = torch.cat([corr_feat_l1_chw, flow_l1, ix, iy, it, valid_l1], dim=1)
+                confidence_l1 = self.iter_conf_head(conf_in)
+                confidence_l1 = confidence_l1 * valid_l1
+                
                 flow_l1, _, _ = self.hqs_data_step(
                     ix, iy, it, aux_l1, confidence_l1, flow_l1, beta
                 )
@@ -1014,9 +1094,17 @@ class HQSFlowModelTFPort(nn.Module):
                     corr_pyr_l1, coords_query_l1, radius=self.max_displacement
                 )
                 corr_feat_l1_chw = corr_feat_l1.permute(0, 3, 1, 2).contiguous()
-                confidence_l1 = self.iter_conf_head(corr_feat_l1_chw)
 
                 ix, iy, it, _ = self.compute_ofce_derivatives(i1_l1, i2_l1, flow_l1)
+
+                valid_k = self._valid_warp_mask(flow_l1)
+                # Per-iteration confidence from dedicated head (not the init decoder).
+                conf_in = torch.cat([corr_feat_l1_chw, flow_l1, ix, iy, it, valid_k], dim=1)
+
+                confidence_l1 = self.iter_conf_head(conf_in)
+
+                confidence_l1 = confidence_l1 * valid_k
+
                 flow_l1, _, _ = self.hqs_data_step(
                     ix, iy, it, aux_l1, confidence_l1, flow_l1, beta_l1
                 )
