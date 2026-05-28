@@ -844,6 +844,12 @@ class HQSFlowModelTFPort(nn.Module):
         scale = flow.new_tensor([sy, sx]).view(1, 2, 1, 1)
         return resized * scale
 
+    def photometric_confidence(self, it: torch.Tensor, tau: float = 0.05) -> torch.Tensor:
+        """
+        Soft mask confidence based from photometric residual, used to emulate occlusions.
+        """
+        return torch.exp(-it.abs() / tau).clamp(0.0, 1.0)
+
     def forward(
         self,
         image1: torch.Tensor,
@@ -932,7 +938,8 @@ class HQSFlowModelTFPort(nn.Module):
 
             confidence_k = self.iter_conf_head(conf_in)
 
-            confidence_k = confidence_k * valid_k
+            photometric_conf_k = self.photometric_confidence(it)
+            confidence_k = confidence_k * valid_k * photometric_conf_k
 
             flow_yx, _, _ = self.hqs_data_step(ix, iy, it, aux_yx, confidence_k, flow_yx, beta)
 
@@ -1026,9 +1033,10 @@ class HQSFlowModelTFPort(nn.Module):
                 ix, iy, it, _ = self.compute_ofce_derivatives(i1_l1, i2_l1, flow_l1)
                 
                 valid_l1 = self._valid_warp_mask(flow_l1)
+                photometric_conf_l1 = self.photometric_confidence(it)
                 conf_in = torch.cat([corr_feat_l1_chw, flow_l1, ix, iy, it, valid_l1], dim=1)
                 confidence_l1 = self.iter_conf_head(conf_in)
-                confidence_l1 = confidence_l1 * valid_l1
+                confidence_l1 = confidence_l1 * valid_l1 * photometric_conf_l1
                 
                 flow_l1, _, _ = self.hqs_data_step(
                     ix, iy, it, aux_l1, confidence_l1, flow_l1, beta
@@ -1102,8 +1110,9 @@ class HQSFlowModelTFPort(nn.Module):
                 conf_in = torch.cat([corr_feat_l1_chw, flow_l1, ix, iy, it, valid_k], dim=1)
 
                 confidence_l1 = self.iter_conf_head(conf_in)
+                photometric_conf_l1 = self.photometric_confidence(it)
 
-                confidence_l1 = confidence_l1 * valid_k
+                confidence_l1 = confidence_l1 * valid_k * photometric_conf_l1
 
                 flow_l1, _, _ = self.hqs_data_step(
                     ix, iy, it, aux_l1, confidence_l1, flow_l1, beta_l1
