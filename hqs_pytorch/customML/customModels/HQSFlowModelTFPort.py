@@ -222,7 +222,7 @@ class MotionEncoder(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.flow_proj = nn.Sequential(
-            nn.Conv2d(4, 64, kernel_size=7, padding=3),
+            nn.Conv2d(5, 64, kernel_size=7, padding=3),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -238,9 +238,10 @@ class MotionEncoder(nn.Module):
         corr_feat: torch.Tensor,   # (B, corr_channels, H, W)
         flow_yx: torch.Tensor,     # (B, 2, H, W)
         hqs_resid: torch.Tensor,   # (B, 2, H, W)  flow_yx - aux_yx
+        confidence: torch.Tensor,       # (B, 1, H, W)  from iter_conf_head
     ) -> torch.Tensor:
         c = self.corr_proj(corr_feat)
-        f = self.flow_proj(torch.cat([flow_yx, hqs_resid], dim=1))
+        f = self.flow_proj(torch.cat([flow_yx, hqs_resid, confidence], dim=1))
         return self.fusion(torch.cat([c, f], dim=1))
 
 
@@ -951,7 +952,7 @@ class HQSFlowModelTFPort(nn.Module):
             # Motion encoding: pack correlation, flow, and HQS coupling residual.
             # Large residual (flow - aux) signals that data and prox disagree.
             hqs_resid = flow_yx - aux_yx
-            motion_feat = self.motion_encoder(corr_feat_k_chw, flow_yx, hqs_resid)
+            motion_feat = self.motion_encoder(corr_feat_k_chw, flow_yx, hqs_resid, confidence_k)
 
             # ConvGRU update: stateful, so even/odd iterations are distinguishable.
             delta, mask_logits, net = self.update_unit(motion_feat, context_feat_lvl, net)
@@ -1046,7 +1047,7 @@ class HQSFlowModelTFPort(nn.Module):
                 )
 
                 hqs_resid_l1 = flow_l1 - aux_l1
-                motion_l1 = self.motion_encoder(corr_feat_l1_chw, flow_l1, hqs_resid_l1)
+                motion_l1 = self.motion_encoder(corr_feat_l1_chw, flow_l1, hqs_resid_l1, confidence_l1)
                 delta_l1, _, net_l1 = self.update_unit(motion_l1, context_l1, net_l1)
                 flow_l1 = flow_l1 + gates_l1[k_l1] * delta_l1
                 aux_l1, _, _ = self.hqs_prox_step(
@@ -1122,7 +1123,7 @@ class HQSFlowModelTFPort(nn.Module):
                 )
 
                 hqs_resid_l1 = flow_l1 - aux_l1
-                motion_l1 = self.motion_encoder(corr_feat_l1_chw, flow_l1, hqs_resid_l1)
+                motion_l1 = self.motion_encoder(corr_feat_l1_chw, flow_l1, hqs_resid_l1, confidence_l1)
                 delta_l1, _, net_l1 = self.update_unit(motion_l1, context_l1, net_l1)
                 flow_l1 = flow_l1 + gate_l1 * delta_l1
                 aux_l1, _, _ = self.hqs_prox_step(
