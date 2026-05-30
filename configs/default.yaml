@@ -70,6 +70,17 @@ model:
     correction_gate_nonincreasing: true
     freeze_correction_last_n: 1
 
+    # ── Reliability mask update regime ─────────────────────────────────────
+    use_split_delta_update: true
+
+    # ── Alpha update parameters (for split delta update) ─────────────────────────────
+    reliability_init_alpha: 0.75
+    reliability_alpha_min: 0.05
+    reliability_alpha_max: 0.95
+
+    # ── Run: detach reliability inputs for stability ─────────────────────────────
+    detach_reliability_inputs: true
+
 # ── Loss ──────────────────────────────────────────────────────────────────
 loss:
   gamma: 0.85                     # geometric decay over stages (used when stage_weight_mode: geometric)

@@ -194,6 +194,9 @@ def _inv_sigmoid(y: float) -> float:
     y = min(max(y, 1e-4), 1.0 - 1e-4)
     return math.log(y / (1.0 - y))
 
+# ---------------------------------------------------------------------------
+# Motion Encoder:
+# ---------------------------------------------------------------------------
 
 class MotionEncoder(nn.Module):
     """
@@ -244,11 +247,124 @@ class MotionEncoder(nn.Module):
         f = self.flow_proj(torch.cat([flow_yx, hqs_resid, confidence], dim=1))
         return self.fusion(torch.cat([c, f], dim=1))
 
+# ---------------------------------------------------------------------------
+# PriorMotionEncoder
+# ---------------------------------------------------------------------------
+class PriorMotionEncoder(nn.Module):
+    """
+    Source-context / prior motion encoder.
+
+    This branch deliberately receives no correlation features.
+    It can update flow using:
+      - current flow
+      - HQS residual w - q
+      - data reliability/confidence
+      - photometric residual
+      - warp validity
+
+    The intention is to provide an inpainting / regularising update path
+    for regions where target-frame matching evidence is unreliable.
+    """
+
+    def __init__(self, motion_dim: int = 128) -> None:
+        super().__init__()
+
+        # Inputs:
+        #   flow_yx      : 2
+        #   hqs_resid    : 2
+        #   confidence   : 1
+        #   it           : 1
+        #   valid        : 1
+        # total = 7
+        self.prior_proj = nn.Sequential(
+            nn.Conv2d(7, 64, kernel_size=7, padding=3),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 96, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(96, motion_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+        self.motion_dim = motion_dim
+
+    def forward(
+        self,
+        flow_yx: torch.Tensor,
+        hqs_resid: torch.Tensor,
+        confidence: torch.Tensor,
+        it: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        x = torch.cat([flow_yx, hqs_resid, confidence, it, valid], dim=1)
+        return self.prior_proj(x)
+
+# ---------------------------------------------------------------------------
+# Reliability Gate
+# ---------------------------------------------------------------------------
+class ReliabilityGate(nn.Module):
+    """
+    Predicts alpha in [alpha_min, alpha_max].
+
+    alpha close to 1:
+        trust correlation/match branch.
+
+    alpha close to 0:
+        trust source-context/prior branch.
+
+    This gate deliberately does not consume raw correlation features.
+    It uses reliability summaries instead.
+    """
+
+    def __init__(
+        self,
+        alpha_min: float = 0.05,
+        alpha_max: float = 0.95,
+        init_alpha: float = 0.75,
+    ) -> None:
+        super().__init__()
+
+        self.alpha_min = float(alpha_min)
+        self.alpha_max = float(alpha_max)
+
+        # Inputs:
+        #   flow_yx    : 2
+        #   hqs_resid  : 2
+        #   confidence : 1
+        #   abs(it)    : 1
+        #   valid      : 1
+        # total = 7
+        self.net = nn.Sequential(
+            nn.Conv2d(7, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, kernel_size=3, padding=1),
+        )
+
+        # Initialise gate to mostly trust the match branch at the start.
+        # This avoids destroying convergence at early training.
+        p = (init_alpha - alpha_min) / max(alpha_max - alpha_min, 1e-6)
+        p = min(max(p, 1e-4), 1.0 - 1e-4)
+        bias = math.log(p / (1.0 - p))
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.constant_(self.net[-1].bias, bias)
+
+    def forward(
+        self,
+        flow_yx: torch.Tensor,
+        hqs_resid: torch.Tensor,
+        confidence: torch.Tensor,
+        it: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        x = torch.cat([flow_yx, hqs_resid, confidence, it.abs(), valid], dim=1)
+        raw = torch.sigmoid(self.net(x))
+        return self.alpha_min + (self.alpha_max - self.alpha_min) * raw
+
 
 # ---------------------------------------------------------------------------
 # ConvGRU Cell
 # ---------------------------------------------------------------------------
-
 
 class ConvGRUCell(nn.Module):
     """
@@ -453,13 +569,50 @@ class HQSFlowModelTFPort(nn.Module):
         # Project context encoder seed → GRU hidden state dimension.
         self.hidden_proj = nn.Conv2d(hidden_dim, gru_hidden_dim, kernel_size=1)
 
-        # Motion encoder: correlation + flow + HQS residual → motion feature.
+        # ---------------------------------------------------------------------
+        # Split update option:
+        #   match branch: sees correlation
+        #   prior branch: does not see correlation
+        # ---------------------------------------------------------------------
+        self.use_split_delta_update = bool(
+            _cfg_get(mb, "use_split_delta_update", True)
+        )
+
+        self.detach_reliability_inputs = bool(
+            _cfg_get(mb, "detach_reliability_inputs", True)
+        )
+
+        self.reliability_alpha_min = float(
+            _cfg_get(mb, "reliability_alpha_min", 0.05)
+        )
+        self.reliability_alpha_max = float(
+            _cfg_get(mb, "reliability_alpha_max", 0.95)
+        )
+        self.reliability_init_alpha = float(
+            _cfg_get(mb, "reliability_init_alpha", 0.75)
+        )
+
+        # Match branch: correlation + flow + HQS residual + confidence.
         self.motion_encoder = MotionEncoder(corr_channels, motion_dim)
 
-        # Per-iteration GRU update unit: flow delta + convex upsample mask.
+        # Existing update unit becomes the match update unit.
         self.update_unit = HQSUpdateUnit(
             motion_dim, context_dim, gru_hidden_dim, self.upsample_scale
         )
+
+        if self.use_split_delta_update:
+            # Prior branch: no correlation features.
+            self.prior_motion_encoder = PriorMotionEncoder(motion_dim)
+
+            self.prior_update_unit = HQSUpdateUnit(
+                motion_dim, context_dim, gru_hidden_dim, self.upsample_scale
+            )
+
+            self.reliability_gate = ReliabilityGate(
+                alpha_min=self.reliability_alpha_min,
+                alpha_max=self.reliability_alpha_max,
+                init_alpha=self.reliability_init_alpha,
+            )
 
         # Final post-loop refinement (uses context encoder hidden output directly).
         self.final_refinement_network = nn.Sequential(
@@ -912,13 +1065,20 @@ class HQSFlowModelTFPort(nn.Module):
         hidden_states: List[torch.Tensor] = []
         aux_lows: List[torch.Tensor] = []
         delta_lows: List[torch.Tensor] = []
+        alpha_lows: List[torch.Tensor] = []
+        delta_match_lows: List[torch.Tensor] = []
+        delta_prior_lows: List[torch.Tensor] = []
         coupling_residual_lows: List[torch.Tensor] = []
+
         beta_schedule, lambda_schedule = self._hqs_penalties()
         correction_gates = self._correction_gates()
         if self.freeze_correction_last_n > 0:
             freeze_n = min(self.freeze_correction_last_n, iters)
             correction_gates = correction_gates.clone()
             correction_gates[iters - freeze_n:iters] = 0.0
+
+        # Initialise prior hidden state from the same source-context seed.
+        net_prior = net.detach().clone() if self.detach_reliability_inputs else net.clone()
 
         for k in range(iters):
             beta = beta_schedule[k]
@@ -951,17 +1111,107 @@ class HQSFlowModelTFPort(nn.Module):
 
             # Motion encoding: pack correlation, flow, and HQS coupling residual.
             # Large residual (flow - aux) signals that data and prox disagree.
+            ################ OLD UPDATE
+            ################ hqs_resid = flow_yx - aux_yx
+            ################ motion_feat = self.motion_encoder(corr_feat_k_chw, flow_yx, hqs_resid, confidence_k)
+
+            ################ # ConvGRU update: stateful, so even/odd iterations are distinguishable.
+            ################ delta, mask_logits, net = self.update_unit(motion_feat, context_feat_lvl, net)
+
+            ################ # Apply learned correction, then re-establish the proximal coupling
+            ################ # variable by re-running prox on the corrected flow (Option B).
+            ################ # This ensures the next data-step anchors to prox(u_corrected)
+            ################ # rather than the drifted aux + delta.
+            ################ flow_yx = flow_yx + correction_gates[k] * delta
+
             hqs_resid = flow_yx - aux_yx
-            motion_feat = self.motion_encoder(corr_feat_k_chw, flow_yx, hqs_resid, confidence_k)
 
-            # ConvGRU update: stateful, so even/odd iterations are distinguishable.
-            delta, mask_logits, net = self.update_unit(motion_feat, context_feat_lvl, net)
+            # ------------------------------------------------------------
+            # Match branch: receives correlation.
+            # ------------------------------------------------------------
+            motion_confidence_k = confidence_k
+            if self.detach_reliability_inputs:
+                motion_confidence_k = motion_confidence_k.detach()
 
-            # Apply learned correction, then re-establish the proximal coupling
-            # variable by re-running prox on the corrected flow (Option B).
-            # This ensures the next data-step anchors to prox(u_corrected)
-            # rather than the drifted aux + delta.
+            motion_feat_match = self.motion_encoder(
+                corr_feat_k_chw,
+                flow_yx,
+                hqs_resid,
+                motion_confidence_k,
+            )
+
+            delta_match, mask_logits, net = self.update_unit(
+                motion_feat_match,
+                context_feat_lvl,
+                net,
+            )
+
+            if self.use_split_delta_update:
+                # --------------------------------------------------------
+                # Prior branch: receives no correlation.
+                # It has its own recurrent hidden state.
+                # --------------------------------------------------------
+
+                prior_confidence_k = confidence_k
+                prior_it_k = it
+                prior_valid_k = valid_k
+
+                if self.detach_reliability_inputs:
+                    prior_confidence_k = prior_confidence_k.detach()
+                    prior_it_k = prior_it_k.detach()
+                    prior_valid_k = prior_valid_k.detach()
+
+                motion_feat_prior = self.prior_motion_encoder(
+                    flow_yx,
+                    hqs_resid,
+                    prior_confidence_k,
+                    prior_it_k,
+                    prior_valid_k,
+                )
+
+                delta_prior, _, net_prior = self.prior_update_unit(
+                    motion_feat_prior,
+                    context_feat_lvl,
+                    net_prior,
+                )
+
+                gate_flow = flow_yx
+                gate_resid = hqs_resid
+                gate_conf = confidence_k
+                gate_it = it
+                gate_valid = valid_k
+
+                if self.detach_reliability_inputs:
+                    gate_flow = gate_flow.detach()
+                    gate_resid = gate_resid.detach()
+                    gate_conf = gate_conf.detach()
+                    gate_it = gate_it.detach()
+                    gate_valid = gate_valid.detach()
+
+                alpha = self.reliability_gate(
+                    gate_flow,
+                    gate_resid,
+                    gate_conf,
+                    gate_it,
+                    gate_valid,
+                )
+
+                delta = alpha * delta_match + (1.0 - alpha) * delta_prior
+            else:
+                alpha = torch.ones_like(confidence_k)
+                delta_prior = torch.zeros_like(delta_match)
+                delta = delta_match
+
+            alpha_lows.append(alpha.detach())
+            delta_match_lows.append(torch.stack([delta_match[:, 1], delta_match[:, 0]], dim=1).detach())
+
+            if self.use_split_delta_update:
+                delta_prior_lows.append(torch.stack([delta_prior[:, 1], delta_prior[:, 0]], dim=1).detach())
+            else:
+                delta_prior_lows.append(torch.zeros_like(delta_match_lows[-1]))
+
             flow_yx = flow_yx + correction_gates[k] * delta
+
             aux_yx, _, _ = self.hqs_prox_step(
                 flow_yx, i1_lvl, beta, lam, num_iter=self.prox_jacobi_iters
             )
@@ -1021,6 +1271,8 @@ class HQSFlowModelTFPort(nn.Module):
                 gates_l1 = gates_l1.clone()
                 gates_l1[self.pyramid_l1_iters - freeze_n_l1:] = 0.0
 
+            net_l1_prior = net_l1.clone()
+
             for k_l1 in range(self.pyramid_l1_iters):
                 beta = beta_l1_sched[k_l1]
                 lam = lam_l1_sched[k_l1]
@@ -1046,10 +1298,85 @@ class HQSFlowModelTFPort(nn.Module):
                     flow_l1, i1_l1, beta, lam, num_iter=self.prox_jacobi_iters
                 )
 
+                ############ OLD UPDATE
+                ############ hqs_resid_l1 = flow_l1 - aux_l1
+                ############ motion_l1 = self.motion_encoder(corr_feat_l1_chw, flow_l1, hqs_resid_l1, confidence_l1)
+                ############ delta_l1, _, net_l1 = self.update_unit(motion_l1, context_l1, net_l1)
+                ############ flow_l1 = flow_l1 + gates_l1[k_l1] * delta_l1
+                
+
                 hqs_resid_l1 = flow_l1 - aux_l1
-                motion_l1 = self.motion_encoder(corr_feat_l1_chw, flow_l1, hqs_resid_l1, confidence_l1)
-                delta_l1, _, net_l1 = self.update_unit(motion_l1, context_l1, net_l1)
+
+                motion_confidence_l1 = confidence_l1
+                if self.detach_reliability_inputs:
+                    motion_confidence_l1 = motion_confidence_l1.detach()
+
+                motion_l1_match = self.motion_encoder(
+                    corr_feat_l1_chw,
+                    flow_l1,
+                    hqs_resid_l1,
+                    motion_confidence_l1,
+                )
+
+                delta_l1_match, _, net_l1 = self.update_unit(
+                    motion_l1_match,
+                    context_l1,
+                    net_l1,
+                )
+
+                if self.use_split_delta_update:
+                    prior_confidence_l1 = confidence_l1
+                    prior_it_l1 = it
+                    prior_valid_l1 = valid_l1
+
+                    if self.detach_reliability_inputs:
+                        prior_confidence_l1 = prior_confidence_l1.detach()
+                        prior_it_l1 = prior_it_l1.detach()
+                        prior_valid_l1 = prior_valid_l1.detach()
+
+                    motion_l1_prior = self.prior_motion_encoder(
+                        flow_l1,
+                        hqs_resid_l1,
+                        prior_confidence_l1,
+                        prior_it_l1,
+                        prior_valid_l1,
+                    )
+
+                    delta_l1_prior, _, net_l1_prior = self.prior_update_unit(
+                        motion_l1_prior,
+                        context_l1,
+                        net_l1_prior,
+                    )
+
+                    gate_flow_l1 = flow_l1
+                    gate_resid_l1 = hqs_resid_l1
+                    gate_conf_l1 = confidence_l1
+                    gate_it_l1 = it
+                    gate_valid_l1 = valid_l1
+
+                    if self.detach_reliability_inputs:
+                        gate_flow_l1 = gate_flow_l1.detach()
+                        gate_resid_l1 = gate_resid_l1.detach()
+                        gate_conf_l1 = gate_conf_l1.detach()
+                        gate_it_l1 = gate_it_l1.detach()
+                        gate_valid_l1 = gate_valid_l1.detach()
+
+                    alpha_l1 = self.reliability_gate(
+                        gate_flow_l1,
+                        gate_resid_l1,
+                        gate_conf_l1,
+                        gate_it_l1,
+                        gate_valid_l1,
+                    )
+
+                    delta_l1 = alpha_l1 * delta_l1_match + (1.0 - alpha_l1) * delta_l1_prior
+                else:
+                    alpha_l1 = torch.ones_like(confidence_l1)
+                    delta_l1_prior = torch.zeros_like(delta_l1_match)
+                    delta_l1 = delta_l1_match
+
                 flow_l1 = flow_l1 + gates_l1[k_l1] * delta_l1
+
                 aux_l1, _, _ = self.hqs_prox_step(
                     flow_l1, i1_l1, beta, lam, num_iter=self.prox_jacobi_iters
                 )
@@ -1073,62 +1400,62 @@ class HQSFlowModelTFPort(nn.Module):
             aux_yx = self._resize_flow_yx(aux_l1, h, w)
             net = F.interpolate(net_l1, size=(h, w), mode="bilinear", align_corners=False)
 
-        elif self.refine_level1_iters > 0 and "level1" in feat1 and "level1" in feat2:
-            # Legacy simple level1 refinement (no dedicated schedules, no
-            # intermediate predictions).  Superseded by pyramid_l1_iters.
-            f1_l1 = feat1["level1"]
-            f2_l1 = feat2["level1"]
-            _, _, h1, w1 = f1_l1.shape
+        # elif self.refine_level1_iters > 0 and "level1" in feat1 and "level1" in feat2:
+            # # Legacy simple level1 refinement (no dedicated schedules, no
+            # # intermediate predictions).  Superseded by pyramid_l1_iters.
+            # f1_l1 = feat1["level1"]
+            # f2_l1 = feat2["level1"]
+            # _, _, h1, w1 = f1_l1.shape
 
-            flow_l1 = self._resize_flow_yx(flow_yx, h1, w1)
-            aux_l1 = self._resize_flow_yx(aux_yx, h1, w1)
-            i1_l1 = F.interpolate(i1, size=(h1, w1), mode="bilinear", align_corners=True)
-            i2_l1 = F.interpolate(i2, size=(h1, w1), mode="bilinear", align_corners=True)
-            context_l1 = F.interpolate(context_feat, size=(h1, w1), mode="bilinear", align_corners=False)
-            net_l1 = F.interpolate(net, size=(h1, w1), mode="bilinear", align_corners=False)
+            # flow_l1 = self._resize_flow_yx(flow_yx, h1, w1)
+            # aux_l1 = self._resize_flow_yx(aux_yx, h1, w1)
+            # i1_l1 = F.interpolate(i1, size=(h1, w1), mode="bilinear", align_corners=True)
+            # i2_l1 = F.interpolate(i2, size=(h1, w1), mode="bilinear", align_corners=True)
+            # context_l1 = F.interpolate(context_feat, size=(h1, w1), mode="bilinear", align_corners=False)
+            # net_l1 = F.interpolate(net, size=(h1, w1), mode="bilinear", align_corners=False)
 
-            corr_l1 = self.build_all_pairs_correlation(f1_l1, f2_l1)
-            corr_pyr_l1 = self.build_corr_pyramid_from_all_pairs(
-                corr_l1, num_levels=self.num_corr_levels
-            )
-            coords_l1 = self._coords_grid(b, h1, w1, device=f1.device, dtype=f1.dtype)
+            # corr_l1 = self.build_all_pairs_correlation(f1_l1, f2_l1)
+            # corr_pyr_l1 = self.build_corr_pyramid_from_all_pairs(
+                # corr_l1, num_levels=self.num_corr_levels
+            # )
+            # coords_l1 = self._coords_grid(b, h1, w1, device=f1.device, dtype=f1.dtype)
 
-            beta_l1 = beta_schedule[iters - 1]
-            lam_l1 = lambda_schedule[iters - 1]
-            gate_l1 = correction_gates[iters - 1]
+            # beta_l1 = beta_schedule[iters - 1]
+            # lam_l1 = lambda_schedule[iters - 1]
+            # gate_l1 = correction_gates[iters - 1]
 
-            for _ in range(self.refine_level1_iters):
-                coords_query_l1 = coords_l1 + flow_l1.permute(0, 2, 3, 1)
-                corr_feat_l1 = self.sample_all_pairs_corr_pyramid(
-                    corr_pyr_l1, coords_query_l1, radius=self.max_displacement
-                )
-                corr_feat_l1_chw = corr_feat_l1.permute(0, 3, 1, 2).contiguous()
+            # for _ in range(self.refine_level1_iters):
+                # coords_query_l1 = coords_l1 + flow_l1.permute(0, 2, 3, 1)
+                # corr_feat_l1 = self.sample_all_pairs_corr_pyramid(
+                    # corr_pyr_l1, coords_query_l1, radius=self.max_displacement
+                # )
+                # corr_feat_l1_chw = corr_feat_l1.permute(0, 3, 1, 2).contiguous()
 
-                ix, iy, it, _ = self.compute_ofce_derivatives(i1_l1, i2_l1, flow_l1)
+                # ix, iy, it, _ = self.compute_ofce_derivatives(i1_l1, i2_l1, flow_l1)
 
-                valid_k = self._valid_warp_mask(flow_l1)
-                # Per-iteration confidence from dedicated head (not the init decoder).
-                conf_in = torch.cat([corr_feat_l1_chw, flow_l1, ix, iy, it, valid_k], dim=1)
+                # valid_k = self._valid_warp_mask(flow_l1)
+                # # Per-iteration confidence from dedicated head (not the init decoder).
+                # conf_in = torch.cat([corr_feat_l1_chw, flow_l1, ix, iy, it, valid_k], dim=1)
 
-                confidence_l1 = self.iter_conf_head(conf_in)
-                photometric_conf_l1 = self.photometric_confidence(it)
+                # confidence_l1 = self.iter_conf_head(conf_in)
+                # photometric_conf_l1 = self.photometric_confidence(it)
 
-                confidence_l1 = confidence_l1 * valid_k * photometric_conf_l1
+                # confidence_l1 = confidence_l1 * valid_k * photometric_conf_l1
 
-                flow_l1, _, _ = self.hqs_data_step(
-                    ix, iy, it, aux_l1, confidence_l1, flow_l1, beta_l1
-                )
-                aux_l1, _, _ = self.hqs_prox_step(
-                    flow_l1, i1_l1, beta_l1, lam_l1, num_iter=self.prox_jacobi_iters
-                )
+                # flow_l1, _, _ = self.hqs_data_step(
+                    # ix, iy, it, aux_l1, confidence_l1, flow_l1, beta_l1
+                # )
+                # aux_l1, _, _ = self.hqs_prox_step(
+                    # flow_l1, i1_l1, beta_l1, lam_l1, num_iter=self.prox_jacobi_iters
+                # )
 
-                hqs_resid_l1 = flow_l1 - aux_l1
-                motion_l1 = self.motion_encoder(corr_feat_l1_chw, flow_l1, hqs_resid_l1, confidence_l1)
-                delta_l1, _, net_l1 = self.update_unit(motion_l1, context_l1, net_l1)
-                flow_l1 = flow_l1 + gate_l1 * delta_l1
-                aux_l1, _, _ = self.hqs_prox_step(
-                    flow_l1, i1_l1, beta_l1, lam_l1, num_iter=self.prox_jacobi_iters
-                )
+                # hqs_resid_l1 = flow_l1 - aux_l1
+                # motion_l1 = self.motion_encoder(corr_feat_l1_chw, flow_l1, hqs_resid_l1, confidence_l1)
+                # delta_l1, _, net_l1 = self.update_unit(motion_l1, context_l1, net_l1)
+                # flow_l1 = flow_l1 + gate_l1 * delta_l1
+                # aux_l1, _, _ = self.hqs_prox_step(
+                    # flow_l1, i1_l1, beta_l1, lam_l1, num_iter=self.prox_jacobi_iters
+                # )
 
             flow_yx = self._resize_flow_yx(flow_l1, h, w)
             aux_yx = self._resize_flow_yx(aux_l1, h, w)
@@ -1177,6 +1504,9 @@ class HQSFlowModelTFPort(nn.Module):
             "hidden_states": hidden_states,
             "flow_final_raw": raw_flow_preds[-1] if raw_flow_preds else flow_up_xy,
             "flow_final_refined": flow_up_xy,
+            "alpha_low": alpha_lows,
+            "delta_match_low": delta_match_lows,
+            "delta_prior_low": delta_prior_lows,
         }
 
     def param_count(self) -> Dict[str, int]:
