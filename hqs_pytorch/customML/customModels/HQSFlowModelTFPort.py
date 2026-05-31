@@ -1057,7 +1057,7 @@ class HQSFlowModelTFPort(nn.Module):
         corr_feat_0_chw = corr_feat_0.permute(0, 3, 1, 2).contiguous()
         x0 = self.allpairs_corr_decoder(corr_feat_0_chw)
         delta_init = self.allpairs_init_head(torch.cat([flow_yx, x0], dim=1))
-        # flow_yx = flow_yx + delta_init
+        flow_yx = flow_yx + delta_init
         flow_yx = flow_yx
         aux_yx = flow_yx.clone()
 
