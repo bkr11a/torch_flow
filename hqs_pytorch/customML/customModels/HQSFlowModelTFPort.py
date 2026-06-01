@@ -1394,8 +1394,8 @@ class HQSFlowModelTFPort(nn.Module):
 
                 if self.use_data_reliability_mask:
                     grad_mag = torch.sqrt(ix * ix + iy * iy + 1e-6)
-                    hqs_mag = torch.norm(flow_yx - aux_yx, dim=1, keepdim=True)
-                    flow_mag = torch.norm(flow_yx, dim=1, keepdim=True)
+                    hqs_mag = torch.norm(flow_l1 - aux_l1, dim=1, keepdim=True)
+                    flow_mag = torch.norm(flow_l1, dim=1, keepdim=True)
 
                     rel_inputs = torch.cat(
                         [
