@@ -361,6 +361,38 @@ class ReliabilityGate(nn.Module):
         raw = torch.sigmoid(self.net(x))
         return self.alpha_min + (self.alpha_max - self.alpha_min) * raw
 
+# ---------------------------------------------------------------------------
+# Data Reliability Head
+# ---------------------------------------------------------------------------
+class DataReliabilityHead(nn.Module):
+    """
+    Predicts a soft visibility/reliability mask for the OFCE data term.
+
+    Output:
+        m_data in [m_min, 1]
+        high  -> trust warped I2 residual
+        low   -> suppress warped I2 residual and rely on prox/prior update
+    """
+
+    def __init__(self, in_channels: int = 6, hidden: int = 32, m_min: float = 0.02):
+        super().__init__()
+        self.m_min = float(m_min)
+
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, hidden, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, 1, kernel_size=3, padding=1),
+        )
+
+        # Start close to trusting the data term, so training does not collapse.
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.constant_(self.net[-1].bias, 2.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raw = torch.sigmoid(self.net(x))
+        return self.m_min + (1.0 - self.m_min) * raw
 
 # ---------------------------------------------------------------------------
 # ConvGRU Cell
@@ -634,6 +666,36 @@ class HQSFlowModelTFPort(nn.Module):
             nn.Conv2d(2 + feature_dim + feature_dim, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, self.transition_upsample_rate * self.transition_upsample_rate * 9, kernel_size=3, padding=1),
+        )
+
+        self.use_data_reliability_mask = bool(
+            _cfg_get(mb, "use_data_reliability_mask", True)
+        )
+
+        self.detach_data_reliability_inputs = bool(
+            _cfg_get(mb, "detach_data_reliability_inputs", True)
+        )
+
+        self.data_reliability_m_min = float(
+            _cfg_get(mb, "data_reliability_m_min", 0.02)
+        )
+
+        self.data_reliability_hidden_dim = int(
+            _cfg_get(mb, "data_reliability_hidden_dim", 32)
+        )
+
+        # Inputs:
+        # abs(it)      : 1
+        # grad_mag     : 1
+        # valid        : 1
+        # confidence   : 1
+        # ||w-q||      : 1
+        # ||flow||     : 1
+        # total = 6
+        self.data_reliability_head = DataReliabilityHead(
+            in_channels=6,
+            hidden=self.data_reliability_hidden_dim,
+            m_min=self.data_reliability_m_min,
         )
 
     @staticmethod
@@ -1092,9 +1154,10 @@ class HQSFlowModelTFPort(nn.Module):
 
 
             # HQS u-step: closed-form OFCE data minimisation.
-            ix, iy, it, _ = self.compute_ofce_derivatives(i1_lvl, i2_lvl, flow_yx)
+            ix, iy, it, i2_warp = self.compute_ofce_derivatives(i1_lvl, i2_lvl, flow_yx)
             # Adjust our confidence based on the validity of the warp to prevent out-of-bounds pixels from destabilizing training.
             valid_k = self._valid_warp_mask(flow_yx)
+
             # Per-iteration confidence from dedicated head (not the init decoder).
             conf_in = torch.cat([corr_feat_k_chw, flow_yx, ix, iy, it, valid_k], dim=1)
 
@@ -1103,7 +1166,44 @@ class HQSFlowModelTFPort(nn.Module):
             photometric_conf_k = self.photometric_confidence(it)
             confidence_k = confidence_k * valid_k * photometric_conf_k
 
-            flow_yx, _, _ = self.hqs_data_step(ix, iy, it, aux_yx, confidence_k, flow_yx, beta)
+            if self.use_data_reliability_mask:
+                grad_mag = torch.sqrt(ix * ix + iy * iy + 1e-6)
+                hqs_mag = torch.norm(flow_yx - aux_yx, dim=1, keepdim=True)
+                flow_mag = torch.norm(flow_yx, dim=1, keepdim=True)
+
+                rel_inputs = torch.cat(
+                    [
+                        it.abs(),
+                        grad_mag,
+                        valid_k,
+                        confidence_k,
+                        hqs_mag,
+                        flow_mag,
+                    ],
+                    dim=1,
+                )
+
+                # Detach the inputs if you want the reliability head to learn
+                # from these diagnostics without pushing gradients back through
+                # the diagnostic construction itself.
+                if self.detach_data_reliability_inputs:
+                    rel_inputs = rel_inputs.detach()
+
+                # IMPORTANT:
+                # Do NOT detach data_reliability if you want the head to learn.
+                data_reliability = self.data_reliability_head(rel_inputs)
+
+                data_weight = valid_k * data_reliability
+            else:
+                data_reliability = valid_k
+                data_weight = valid_k
+
+            # Mask the OFCE coefficients before they enter the analytic data update.
+            ix_data = ix * data_weight
+            iy_data = iy * data_weight
+            it_data = it * data_weight
+
+            flow_yx, _, _ = self.hqs_data_step(ix_data, iy_data, it_data, aux_yx, confidence_k, flow_yx, beta)
 
             # HQS v-step: Jacobi TV-proximal smoothing.
             aux_yx, _, _ = self.hqs_prox_step(
@@ -1291,9 +1391,46 @@ class HQSFlowModelTFPort(nn.Module):
                 conf_in = torch.cat([corr_feat_l1_chw, flow_l1, ix, iy, it, valid_l1], dim=1)
                 confidence_l1 = self.iter_conf_head(conf_in)
                 confidence_l1 = confidence_l1 * valid_l1 * photometric_conf_l1
+
+                if self.use_data_reliability_mask:
+                    grad_mag = torch.sqrt(ix * ix + iy * iy + 1e-6)
+                    hqs_mag = torch.norm(flow_yx - aux_yx, dim=1, keepdim=True)
+                    flow_mag = torch.norm(flow_yx, dim=1, keepdim=True)
+
+                    rel_inputs = torch.cat(
+                        [
+                            it.abs(),
+                            grad_mag,
+                            valid_l1,
+                            confidence_l1,
+                            hqs_mag,
+                            flow_mag,
+                        ],
+                        dim=1,
+                    )
+
+                    # Detach the inputs if you want the reliability head to learn
+                    # from these diagnostics without pushing gradients back through
+                    # the diagnostic construction itself.
+                    if self.detach_data_reliability_inputs:
+                        rel_inputs = rel_inputs.detach()
+
+                    # IMPORTANT:
+                    # Do NOT detach data_reliability if you want the head to learn.
+                    data_reliability = self.data_reliability_head(rel_inputs)
+
+                    data_weight = valid_l1 * data_reliability
+                else:
+                    data_reliability = valid_l1
+                    data_weight = valid_l1
+
+                # Mask the OFCE coefficients before they enter the analytic data update.
+                ix_data = ix * data_weight
+                iy_data = iy * data_weight
+                it_data = it * data_weight
                 
                 flow_l1, _, _ = self.hqs_data_step(
-                    ix, iy, it, aux_l1, confidence_l1, flow_l1, beta
+                    ix_data, iy_data, it_data, aux_l1, confidence_l1, flow_l1, beta
                 )
                 aux_l1, _, _ = self.hqs_prox_step(
                     flow_l1, i1_l1, beta, lam, num_iter=self.prox_jacobi_iters
@@ -1401,67 +1538,6 @@ class HQSFlowModelTFPort(nn.Module):
             aux_yx = self._resize_flow_yx(aux_l1, h, w)
             net = F.interpolate(net_l1, size=(h, w), mode="bilinear", align_corners=False)
 
-        # elif self.refine_level1_iters > 0 and "level1" in feat1 and "level1" in feat2:
-            # # Legacy simple level1 refinement (no dedicated schedules, no
-            # # intermediate predictions).  Superseded by pyramid_l1_iters.
-            # f1_l1 = feat1["level1"]
-            # f2_l1 = feat2["level1"]
-            # _, _, h1, w1 = f1_l1.shape
-
-            # flow_l1 = self._resize_flow_yx(flow_yx, h1, w1)
-            # aux_l1 = self._resize_flow_yx(aux_yx, h1, w1)
-            # i1_l1 = F.interpolate(i1, size=(h1, w1), mode="bilinear", align_corners=True)
-            # i2_l1 = F.interpolate(i2, size=(h1, w1), mode="bilinear", align_corners=True)
-            # context_l1 = F.interpolate(context_feat, size=(h1, w1), mode="bilinear", align_corners=False)
-            # net_l1 = F.interpolate(net, size=(h1, w1), mode="bilinear", align_corners=False)
-
-            # corr_l1 = self.build_all_pairs_correlation(f1_l1, f2_l1)
-            # corr_pyr_l1 = self.build_corr_pyramid_from_all_pairs(
-                # corr_l1, num_levels=self.num_corr_levels
-            # )
-            # coords_l1 = self._coords_grid(b, h1, w1, device=f1.device, dtype=f1.dtype)
-
-            # beta_l1 = beta_schedule[iters - 1]
-            # lam_l1 = lambda_schedule[iters - 1]
-            # gate_l1 = correction_gates[iters - 1]
-
-            # for _ in range(self.refine_level1_iters):
-                # coords_query_l1 = coords_l1 + flow_l1.permute(0, 2, 3, 1)
-                # corr_feat_l1 = self.sample_all_pairs_corr_pyramid(
-                    # corr_pyr_l1, coords_query_l1, radius=self.max_displacement
-                # )
-                # corr_feat_l1_chw = corr_feat_l1.permute(0, 3, 1, 2).contiguous()
-
-                # ix, iy, it, _ = self.compute_ofce_derivatives(i1_l1, i2_l1, flow_l1)
-
-                # valid_k = self._valid_warp_mask(flow_l1)
-                # # Per-iteration confidence from dedicated head (not the init decoder).
-                # conf_in = torch.cat([corr_feat_l1_chw, flow_l1, ix, iy, it, valid_k], dim=1)
-
-                # confidence_l1 = self.iter_conf_head(conf_in)
-                # photometric_conf_l1 = self.photometric_confidence(it)
-
-                # confidence_l1 = confidence_l1 * valid_k * photometric_conf_l1
-
-                # flow_l1, _, _ = self.hqs_data_step(
-                    # ix, iy, it, aux_l1, confidence_l1, flow_l1, beta_l1
-                # )
-                # aux_l1, _, _ = self.hqs_prox_step(
-                    # flow_l1, i1_l1, beta_l1, lam_l1, num_iter=self.prox_jacobi_iters
-                # )
-
-                # hqs_resid_l1 = flow_l1 - aux_l1
-                # motion_l1 = self.motion_encoder(corr_feat_l1_chw, flow_l1, hqs_resid_l1, confidence_l1)
-                # delta_l1, _, net_l1 = self.update_unit(motion_l1, context_l1, net_l1)
-                # flow_l1 = flow_l1 + gate_l1 * delta_l1
-                # aux_l1, _, _ = self.hqs_prox_step(
-                    # flow_l1, i1_l1, beta_l1, lam_l1, num_iter=self.prox_jacobi_iters
-                # )
-
-            flow_yx = self._resize_flow_yx(flow_l1, h, w)
-            aux_yx = self._resize_flow_yx(aux_l1, h, w)
-            net = F.interpolate(net_l1, size=(h, w), mode="bilinear", align_corners=False)
-
         raw_flow_preds = list(flow_preds)
         raw_flow_lows = list(flow_lows)
 
@@ -1508,6 +1584,7 @@ class HQSFlowModelTFPort(nn.Module):
             "alpha_low": alpha_lows,
             "delta_match_low": delta_match_lows,
             "delta_prior_low": delta_prior_lows,
+            "data_reliability_low": data_reliability.detach() if self.use_data_reliability_mask else None,
         }
 
     def param_count(self) -> Dict[str, int]:

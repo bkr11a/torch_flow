@@ -81,6 +81,12 @@ model:
     # ── Run: detach reliability inputs for stability ─────────────────────────────
     detach_reliability_inputs: true
 
+    # Data reliability mask head (ablation: use GT-based mask instead)
+    use_data_reliability_mask: true
+    detach_data_reliability_inputs: true
+    data_reliability_m_min: 0.02
+    data_reliability_hidden_dim: 32
+
 # ── Loss ──────────────────────────────────────────────────────────────────
 loss:
   gamma: 0.85                     # geometric decay over stages (used when stage_weight_mode: geometric)
