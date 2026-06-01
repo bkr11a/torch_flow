@@ -1254,7 +1254,7 @@ class HQSFlowModelTFPort(nn.Module):
                 # --------------------------------------------------------
 
                 prior_confidence_k = confidence_k
-                prior_it_k = it
+                prior_it_k = it_data
                 prior_valid_k = valid_k
 
                 if self.detach_reliability_inputs:
@@ -1279,7 +1279,7 @@ class HQSFlowModelTFPort(nn.Module):
                 gate_flow = flow_yx
                 gate_resid = hqs_resid
                 gate_conf = confidence_k
-                gate_it = it
+                gate_it = it_data
                 gate_valid = valid_k
 
                 if self.detach_reliability_inputs:
@@ -1464,7 +1464,7 @@ class HQSFlowModelTFPort(nn.Module):
 
                 if self.use_split_delta_update:
                     prior_confidence_l1 = confidence_l1
-                    prior_it_l1 = it
+                    prior_it_l1 = it_data
                     prior_valid_l1 = valid_l1
 
                     if self.detach_reliability_inputs:
@@ -1489,7 +1489,7 @@ class HQSFlowModelTFPort(nn.Module):
                     gate_flow_l1 = flow_l1
                     gate_resid_l1 = hqs_resid_l1
                     gate_conf_l1 = confidence_l1
-                    gate_it_l1 = it
+                    gate_it_l1 = it_data
                     gate_valid_l1 = valid_l1
 
                     if self.detach_reliability_inputs:
