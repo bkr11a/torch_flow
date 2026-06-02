@@ -13,7 +13,7 @@ import logging
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, TypeVar
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -87,6 +87,15 @@ def extract_tensors(value: Any, prefix: str = "") -> List[Tuple[str, torch.Tenso
             child_prefix = f"{prefix}[{index}]" if prefix else f"[{index}]"
             tensors.extend(extract_tensors(item, child_prefix))
     return tensors
+
+
+T = TypeVar("T")
+
+
+def truncate_items(items: Sequence[T], max_items: int) -> Sequence[T]:
+    if max_items <= 0:
+        return items
+    return items[:max_items]
 
 
 def tensor_stats(tensor: torch.Tensor) -> Dict[str, float]:
@@ -214,6 +223,106 @@ def matches_patterns(name: str, patterns: Sequence[re.Pattern[str]]) -> bool:
     return any(pattern.search(name) for pattern in patterns)
 
 
+def _extract_int_from_stem(stem: str) -> int:
+    numbers = re.findall(r"\d+", stem)
+    if not numbers:
+        return -1
+    return int(numbers[-1])
+
+
+def _resolve_dataset_record(dataset: Any, global_index: int) -> Optional[Dict[str, Any]]:
+    if hasattr(dataset, "_samples"):
+        samples = getattr(dataset, "_samples")
+        if 0 <= global_index < len(samples):
+            return samples[global_index]
+        return None
+
+    if hasattr(dataset, "datasets") and hasattr(dataset, "cumulative_sizes"):
+        cum = dataset.cumulative_sizes
+        sub_idx = 0
+        while sub_idx < len(cum) and global_index >= cum[sub_idx]:
+            sub_idx += 1
+        if sub_idx >= len(dataset.datasets):
+            return None
+        prev = 0 if sub_idx == 0 else cum[sub_idx - 1]
+        local = global_index - prev
+        return _resolve_dataset_record(dataset.datasets[sub_idx], local)
+
+    return None
+
+
+def _infer_scene_and_sample(record: Optional[Dict[str, Any]], fallback_name: str) -> Dict[str, Any]:
+    if record is None:
+        return {
+            "scene": "",
+            "sample_id": fallback_name,
+            "frame1": fallback_name,
+            "frame2": fallback_name,
+            "sort_key": -1,
+            "has_scene": False,
+        }
+
+    image1 = record.get("image1")
+    image2 = record.get("image2")
+    if not image1:
+        return {
+            "scene": "",
+            "sample_id": fallback_name,
+            "frame1": fallback_name,
+            "frame2": fallback_name,
+            "sort_key": -1,
+            "has_scene": False,
+        }
+
+    p1 = Path(image1)
+    p2 = Path(image2) if image2 else p1
+    frame1 = p1.stem
+    frame2 = p2.stem
+
+    parent = p1.parent.name
+    grand = p1.parent.parent.name if p1.parent.parent is not None else ""
+    scene = parent
+
+    if parent in {
+        "left", "right", "image_2", "data", "frame_left", "frame_right",
+        "flow_FW_left", "flow_BW_left", "flow_FW_right", "flow_BW_right",
+    } and grand:
+        scene = grand
+
+    if scene in {"clean", "final", "flow", "training", "test", "train", "testing"}:
+        scene = ""
+
+    has_scene = bool(scene)
+    sample_id = f"{frame1}__{frame2}".replace("/", "_")
+    return {
+        "scene": scene,
+        "sample_id": sample_id,
+        "frame1": frame1,
+        "frame2": frame2,
+        "sort_key": _extract_int_from_stem(frame1),
+        "has_scene": has_scene,
+    }
+
+
+def _scene_subdir(base: Path, scene: str) -> Path:
+    return base / scene if scene else base
+
+
+def _qualitative_selection(request: str, dataset_len: int, seed: int) -> Optional[Set[int]]:
+    req = str(request).strip().lower()
+    if req == "all":
+        return None
+
+    n = int(req)
+    if n <= 0:
+        return set()
+    n = min(n, dataset_len)
+
+    rng = np.random.default_rng(seed)
+    chosen = rng.choice(dataset_len, size=n, replace=False)
+    return set(int(x) for x in chosen.tolist())
+
+
 def register_activation_hooks(
     model: nn.Module,
     include_patterns: Sequence[re.Pattern[str]],
@@ -278,10 +387,162 @@ def plot_flow_series(
     plt.close(fig)
 
 
+def to_sample_map(tensor: torch.Tensor, batch_index: int = 0) -> Optional[torch.Tensor]:
+    sample = tensor.detach().float().cpu()
+    if sample.ndim == 4:
+        sample = sample[batch_index]
+    if sample.ndim == 2:
+        return sample
+    if sample.ndim == 3:
+        return sample
+    return None
+
+
+def collect_stage_tensor_groups(outputs: Dict[str, Any]) -> Dict[str, List[torch.Tensor]]:
+    grouped: Dict[str, List[torch.Tensor]] = {}
+    for key, value in outputs.items():
+        if isinstance(value, torch.Tensor):
+            grouped[key] = [value]
+        elif isinstance(value, (list, tuple)) and value and all(isinstance(item, torch.Tensor) for item in value):
+            grouped[key] = list(value)
+    return grouped
+
+
+def plot_grouped_stage_tensors(
+    grouped: Dict[str, List[torch.Tensor]],
+    output_path: Path,
+    title: str,
+    batch_index: int,
+    mode: str,
+) -> None:
+    if not grouped:
+        return
+
+    keys = list(grouped.keys())
+    nrows = len(keys)
+    ncols = max(len(grouped[key]) for key in keys)
+    fig_w = min(4.0 * ncols, 24.0)
+    fig_h = max(3.0 * nrows, 3.5)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(fig_w, fig_h), squeeze=False)
+
+    for row, key in enumerate(keys):
+        series = grouped[key]
+        for col in range(ncols):
+            axis = axes[row, col]
+            axis.axis("off")
+            if col >= len(series):
+                continue
+
+            sample = to_sample_map(series[col], batch_index=batch_index)
+            if sample is None:
+                continue
+
+            if mode == "flow" and sample.ndim == 3 and sample.shape[0] == 2:
+                axis.imshow(flow_to_hsv(sample))
+            elif mode == "scalar":
+                if sample.ndim == 3 and sample.shape[0] > 1:
+                    axis.imshow(sample.mean(dim=0).numpy(), cmap="viridis")
+                elif sample.ndim == 3:
+                    axis.imshow(sample[0].numpy(), cmap="viridis")
+                else:
+                    axis.imshow(sample.numpy(), cmap="viridis", aspect="auto")
+            elif mode == "feature":
+                if sample.ndim != 3:
+                    continue
+                axis.imshow(sample.mean(dim=0).numpy(), cmap="magma")
+            else:
+                continue
+
+            axis.set_title(f"{key} [{col}]", fontsize=9)
+
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_grouped_public_outputs(
+    sample_dir: Path,
+    outputs: Dict[str, Any],
+    file_prefix: str,
+    batch_index: int = 0,
+) -> None:
+    grouped = collect_stage_tensor_groups(outputs)
+    flow_groups: Dict[str, List[torch.Tensor]] = {}
+    scalar_groups: Dict[str, List[torch.Tensor]] = {}
+    feature_groups: Dict[str, List[torch.Tensor]] = {}
+
+    for key, series in grouped.items():
+        sample = to_sample_map(series[0], batch_index=batch_index)
+        if sample is None:
+            continue
+        if sample.ndim == 3 and sample.shape[0] == 2:
+            flow_groups[key] = series
+        elif sample.ndim == 2 or (sample.ndim == 3 and sample.shape[0] == 1):
+            scalar_groups[key] = series
+        elif sample.ndim == 3:
+            feature_groups[key] = series
+
+    plot_grouped_stage_tensors(
+        grouped=flow_groups,
+        output_path=sample_dir / f"{file_prefix}_stage_flows_grouped.png",
+        title="Stage Flow Outputs (HSV)",
+        batch_index=batch_index,
+        mode="flow",
+    )
+    plot_grouped_stage_tensors(
+        grouped=scalar_groups,
+        output_path=sample_dir / f"{file_prefix}_stage_scalars_grouped.png",
+        title="Stage Scalar/Mask Outputs",
+        batch_index=batch_index,
+        mode="scalar",
+    )
+    plot_grouped_stage_tensors(
+        grouped=feature_groups,
+        output_path=sample_dir / f"{file_prefix}_stage_features_grouped.png",
+        title="Stage Feature Outputs (Channel Mean)",
+        batch_index=batch_index,
+        mode="feature",
+    )
+
+
+def plot_master_dashboard(sample_dir: Path, file_prefix: str) -> None:
+    panel_paths = [
+        sample_dir / f"{file_prefix}_sample_overview.png",
+        sample_dir / f"{file_prefix}_stage_flows_grouped.png",
+        sample_dir / f"{file_prefix}_stage_scalars_grouped.png",
+        sample_dir / f"{file_prefix}_stage_features_grouped.png",
+    ]
+    existing = [path for path in panel_paths if path.exists()]
+    if not existing:
+        return
+
+    n_panels = len(existing)
+    ncols = 2 if n_panels > 1 else 1
+    nrows = int(np.ceil(n_panels / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(10 * ncols, 6 * nrows), squeeze=False)
+
+    for index, axis in enumerate(axes.ravel()):
+        axis.axis("off")
+        if index >= n_panels:
+            continue
+
+        panel_path = existing[index]
+        image = plt.imread(panel_path)
+        axis.imshow(image)
+        axis.set_title(panel_path.stem.replace("_", " ").title(), fontsize=11)
+
+    fig.suptitle("Model Internal Debug Dashboard", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(sample_dir / f"{file_prefix}_master_dashboard.png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_sample_overview(
     sample_dir: Path,
     batch: Dict[str, torch.Tensor],
     outputs: Dict[str, Any],
+    file_prefix: str,
     batch_index: int = 0,
 ) -> None:
     has_gt = "flow" in batch and isinstance(batch["flow"], torch.Tensor)
@@ -305,34 +566,29 @@ def plot_sample_overview(
         axes[2].axis("off")
 
     fig.tight_layout()
-    fig.savefig(sample_dir / "sample_overview.png", dpi=120, bbox_inches="tight")
+    fig.savefig(sample_dir / f"{file_prefix}_sample_overview.png", dpi=120, bbox_inches="tight")
     plt.close(fig)
-
-    if "flow_preds" in outputs:
-        plot_flow_series(outputs["flow_preds"], sample_dir / "flow_preds.png", "Stage")
-    if "flow_preds_raw" in outputs:
-        plot_flow_series(outputs["flow_preds_raw"], sample_dir / "flow_preds_raw.png", "Raw Stage")
-    if "flow_low" in outputs:
-        plot_flow_series(outputs["flow_low"], sample_dir / "flow_low.png", "Low-Res Stage")
+    if isinstance(outputs, dict):
+        plot_grouped_public_outputs(sample_dir, outputs, file_prefix=file_prefix, batch_index=batch_index)
+    plot_master_dashboard(sample_dir, file_prefix=file_prefix)
 
 
 def inspect_sample(
-    model: nn.Module,
     batch: Dict[str, Any],
+    outputs: Any,
+    model: nn.Module,
     sample_dir: Path,
+    sample_id: str,
+    batch_index: int,
     selected_module_names: Sequence[str],
     captured_outputs: Dict[str, Any],
     max_channels: int,
     max_tensors_per_module: int,
 ) -> None:
-    image1 = batch["image1"]
-    image2 = batch["image2"]
-    outputs = model(image1, image2)
-
     sample_dir.mkdir(parents=True, exist_ok=True)
-    plot_sample_overview(sample_dir, batch, outputs)
+    plot_sample_overview(sample_dir, batch, outputs, file_prefix=sample_id, batch_index=batch_index)
 
-    activation_dir = sample_dir / "activations"
+    activation_dir = sample_dir / "activations" / sample_id
     activation_dir.mkdir(parents=True, exist_ok=True)
 
     records: List[ActivationRecord] = []
@@ -342,7 +598,8 @@ def inspect_sample(
             continue
 
         tensors = extract_tensors(module_output)
-        for tensor_index, (_, tensor) in enumerate(tensors[:max_tensors_per_module]):
+        selected_tensors = truncate_items(tensors, max_tensors_per_module)
+        for tensor_index, (_, tensor) in enumerate(selected_tensors):
             if tensor.ndim == 0:
                 tensor = tensor.reshape(1)
             figure_name = f"{len(records):04d}_{sanitise_name(module_name)}_{tensor_index}.png"
@@ -352,6 +609,7 @@ def inspect_sample(
                 title=f"{module_name} :: tensor {tensor_index}",
                 output_path=figure_path,
                 max_channels=max_channels,
+                batch_index=batch_index,
             )
             stats = tensor_stats(tensor)
             records.append(
@@ -373,9 +631,10 @@ def inspect_sample(
 
     for public_name, public_value in public_items:
         public_tensors = extract_tensors(public_value, public_name)
-        public_dir = sample_dir / "public_outputs"
+        public_dir = sample_dir / "public_outputs" / sample_id
         public_dir.mkdir(parents=True, exist_ok=True)
-        for tensor_index, (tensor_name, tensor) in enumerate(public_tensors[:max_tensors_per_module * 4]):
+        selected_public_tensors = truncate_items(public_tensors, max_tensors_per_module)
+        for tensor_index, (tensor_name, tensor) in enumerate(selected_public_tensors):
             if tensor.ndim == 0:
                 tensor = tensor.reshape(1)
             figure_name = f"{sanitise_name(tensor_name)}_{tensor_index}.png"
@@ -384,9 +643,10 @@ def inspect_sample(
                 title=tensor_name,
                 output_path=public_dir / figure_name,
                 max_channels=max_channels,
+                batch_index=batch_index,
             )
 
-    with open(sample_dir / "activation_index.json", "w") as handle:
+    with open(sample_dir / f"{sample_id}_activation_index.json", "w") as handle:
         json.dump([asdict(record) for record in records], handle, indent=2)
 
 
@@ -406,12 +666,29 @@ def move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[st
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect intermediate HQSFlow activations")
-    parser.add_argument("--config", required=True, help="Path to model config YAML")
-    parser.add_argument("--checkpoint", required=True, help="Path to model checkpoint")
-    parser.add_argument("--data_config", required=True, help="Path to data config YAML")
-    parser.add_argument("--output_dir", required=True, help="Directory for plots")
-    parser.add_argument("--num_samples", type=int, default=2, help="Number of validation samples")
+    parser.add_argument("--config", "-c", required=True, help="Path to model config YAML")
+    parser.add_argument("--checkpoint", "-ckpt", required=True, help="Path to model checkpoint")
+    parser.add_argument("--data_config", "-dc", required=True, help="Path to data config YAML")
+    parser.add_argument("--output_dir", "-o", required=True, help="Directory for plots")
     parser.add_argument("--device", default=None, help="Device override: cuda, mps, or cpu")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for inspection")
+    parser.add_argument(
+        "--qualitative_samples",
+        default="8",
+        help="Number of random qualitative samples, or 'all' to render the full validation set",
+    )
+    parser.add_argument(
+        "--qualitative_seed",
+        type=int,
+        default=42,
+        help="Random seed used when selecting qualitative samples",
+    )
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=None,
+        help="Deprecated alias for qualitative sample count; use --qualitative_samples",
+    )
     parser.add_argument(
         "--include",
         nargs="*",
@@ -434,8 +711,8 @@ def main() -> None:
     parser.add_argument(
         "--max_tensors_per_module",
         type=int,
-        default=2,
-        help="Maximum plotted tensors per module output",
+        default=0,
+        help="Maximum plotted tensors per module output (0 = all)",
     )
     parser.add_argument(
         "--all_modules",
@@ -471,16 +748,27 @@ def main() -> None:
     logger.info("Hooked %d modules", len(selected_module_names))
 
     val_cfg = data_cfg.get("val_data") or data_cfg.get("data") or data_cfg
-    val_cfg = OmegaConf.merge(val_cfg, {"batch_size": 1})
+    val_cfg = OmegaConf.merge(val_cfg, {"batch_size": args.batch_size})
     dataset = build_dataset(val_cfg, split="val")
     dataloader = build_dataloader(dataset, val_cfg, split="val")
     logger.info("Validation samples available: %d", len(dataset))
+
+    qualitative_request = str(args.num_samples) if args.num_samples is not None else args.qualitative_samples
+    qual_set = _qualitative_selection(qualitative_request, len(dataset), args.qualitative_seed)
+    target_count = len(dataset) if qual_set is None else len(qual_set)
+    logger.info("Qualitative selection: %s (%d samples)", qualitative_request, target_count)
+
+    qualitative_root = output_dir / "qualitative"
+    qualitative_root.mkdir(parents=True, exist_ok=True)
 
     manifest = {
         "config": args.config,
         "checkpoint": args.checkpoint,
         "data_config": args.data_config,
         "device": str(device),
+        "batch_size": args.batch_size,
+        "qualitative_samples": qualitative_request,
+        "qualitative_seed": args.qualitative_seed,
         "hooked_modules": selected_module_names,
         "samples": [],
     }
@@ -488,22 +776,53 @@ def main() -> None:
     try:
         with torch.no_grad():
             processed = 0
-            for batch in tqdm(dataloader, desc="Inspecting"):
-                if processed >= args.num_samples:
-                    break
-                batch = move_batch_to_device(batch, device)
-                sample_dir = output_dir / f"sample_{processed:04d}"
-                inspect_sample(
-                    model=model,
-                    batch=batch,
-                    sample_dir=sample_dir,
-                    selected_module_names=selected_module_names,
-                    captured_outputs=captured_outputs,
-                    max_channels=args.max_channels,
-                    max_tensors_per_module=args.max_tensors_per_module,
-                )
-                manifest["samples"].append(str(sample_dir.relative_to(output_dir)))
-                processed += 1
+            global_offset = 0
+            with tqdm(total=target_count, desc="Saving qualitative samples", unit="sample") as sample_pbar:
+                for batch_idx, batch in enumerate(tqdm(dataloader, desc="Inspecting", unit="batch")):
+                    if processed >= target_count:
+                        break
+                    batch = move_batch_to_device(batch, device)
+
+                    captured_outputs.clear()
+                    outputs = model(batch["image1"], batch["image2"])
+
+                    batch_size = int(batch["image1"].shape[0])
+                    for batch_item in range(batch_size):
+                        global_idx = global_offset + batch_item
+                        if qual_set is not None and global_idx not in qual_set:
+                            continue
+
+                        sample_name = f"batch_{batch_idx:06d}_item_{batch_item:02d}"
+                        record = _resolve_dataset_record(dataset, global_idx)
+                        sample_meta = _infer_scene_and_sample(record, fallback_name=sample_name)
+                        scene_dir = _scene_subdir(qualitative_root, sample_meta["scene"])
+                        sample_dir = scene_dir
+
+                        inspect_sample(
+                            batch=batch,
+                            outputs=outputs,
+                            model=model,
+                            sample_dir=sample_dir,
+                            sample_id=sample_meta["sample_id"],
+                            batch_index=batch_item,
+                            selected_module_names=selected_module_names,
+                            captured_outputs=captured_outputs,
+                            max_channels=args.max_channels,
+                            max_tensors_per_module=args.max_tensors_per_module,
+                        )
+                        manifest["samples"].append(
+                            {
+                                "scene": sample_meta["scene"],
+                                "sample_id": sample_meta["sample_id"],
+                                "path": str((sample_dir / f"{sample_meta['sample_id']}_master_dashboard.png").relative_to(output_dir)),
+                            }
+                        )
+                        processed += 1
+                        sample_pbar.update(1)
+                        if processed >= target_count:
+                            break
+
+                    global_offset += batch_size
     finally:
         remove_hooks(handles)
 
