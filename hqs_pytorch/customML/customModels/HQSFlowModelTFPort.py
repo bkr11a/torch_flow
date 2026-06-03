@@ -746,7 +746,7 @@ class HQSFlowModelTFPort(nn.Module):
             gx = torch.zeros_like(qx)
 
         grid = torch.stack([gx, gy], dim=-1)
-        return F.grid_sample(x, grid, mode="bilinear", padding_mode="border", align_corners=True)
+        return F.grid_sample(x, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
 
     @staticmethod
     def _valid_warp_mask(flow_yx: torch.Tensor) -> torch.Tensor:
@@ -1203,6 +1203,8 @@ class HQSFlowModelTFPort(nn.Module):
             iy_data = iy * data_weight
             it_data = it * data_weight
 
+            confidence_k = confidence_k * data_weight
+
             flow_yx, _, _ = self.hqs_data_step(ix_data, iy_data, it_data, aux_yx, confidence_k, flow_yx, beta)
 
             # HQS v-step: Jacobi TV-proximal smoothing.
@@ -1428,6 +1430,8 @@ class HQSFlowModelTFPort(nn.Module):
                 ix_data = ix * data_weight
                 iy_data = iy * data_weight
                 it_data = it * data_weight
+
+                confidence_l1 = confidence_l1 * data_weight
                 
                 flow_l1, _, _ = self.hqs_data_step(
                     ix_data, iy_data, it_data, aux_l1, confidence_l1, flow_l1, beta
