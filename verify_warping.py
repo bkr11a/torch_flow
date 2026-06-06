@@ -66,6 +66,21 @@ def build_synthetic_pair(
         square_mask: (1, 1, H, W) where image1 square exists
     """
     x0, y0 = square_top_left_xy
+    x1 = x0 + shift_dx
+    y1 = y0 + shift_dy
+
+    if square_size <= 0:
+        raise ValueError(f"square_size must be > 0, got {square_size}")
+    if not (0 <= x0 <= w - square_size and 0 <= y0 <= h - square_size):
+        raise ValueError(
+            f"Square in image1 is out of bounds: top-left=({x0},{y0}), "
+            f"size={square_size}, image=({w}x{h})"
+        )
+    if not (0 <= x1 <= w - square_size and 0 <= y1 <= h - square_size):
+        raise ValueError(
+            f"Shifted square in image2 is out of bounds: top-left=({x1},{y1}), "
+            f"size={square_size}, image=({w}x{h})"
+        )
 
     image1 = torch.zeros((1, 1, h, w), dtype=torch.float32)
     image2 = torch.zeros((1, 1, h, w), dtype=torch.float32)
@@ -74,8 +89,6 @@ def build_synthetic_pair(
     image1[:, :, y0 : y0 + square_size, x0 : x0 + square_size] = square_value
     mask[:, :, y0 : y0 + square_size, x0 : x0 + square_size] = 1.0
 
-    x1 = x0 + shift_dx
-    y1 = y0 + shift_dy
     image2[:, :, y1 : y1 + square_size, x1 : x1 + square_size] = square_value
 
     flow_yx = torch.zeros((1, 2, h, w), dtype=torch.float32)
@@ -85,21 +98,60 @@ def build_synthetic_pair(
     return image1, image2, flow_yx, mask
 
 
-def manual_expected_warp(image2: torch.Tensor, flow_yx: torch.Tensor) -> torch.Tensor:
-    """Manual reference for integer-flow sampling: out(y,x)=image2(y+dy, x+dx)."""
+def manual_in_bounds_mask(flow_yx: torch.Tensor) -> torch.Tensor:
+    """Manual in-bounds mask using the same geometry as _valid_warp_mask."""
+    b, _, h, w = flow_yx.shape
+    ys, xs = torch.meshgrid(
+        torch.arange(h, device=flow_yx.device, dtype=flow_yx.dtype),
+        torch.arange(w, device=flow_yx.device, dtype=flow_yx.dtype),
+        indexing="ij",
+    )
+    qy = ys.view(1, h, w) + flow_yx[:, 0]
+    qx = xs.view(1, h, w) + flow_yx[:, 1]
+    valid = (qx >= 0) & (qx <= w - 1) & (qy >= 0) & (qy <= h - 1)
+    return valid.unsqueeze(1)
+
+
+def manual_expected_warp(image2: torch.Tensor, flow_yx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Manual bilinear warp reference with independent validity mask.
+
+    Returns:
+        expected: bilinear-sampled warp using out(y,x)=image2(y+dy, x+dx)
+        valid: in-bounds sampling mask (B,1,H,W)
+    """
     b, c, h, w = image2.shape
     expected = torch.zeros_like(image2)
+    valid = manual_in_bounds_mask(flow_yx)
 
     for bi in range(b):
         for yi in range(h):
             for xi in range(w):
-                dy = int(flow_yx[bi, 0, yi, xi].item())
-                dx = int(flow_yx[bi, 1, yi, xi].item())
-                sy = yi + dy
-                sx = xi + dx
-                if 0 <= sy < h and 0 <= sx < w:
-                    expected[bi, :, yi, xi] = image2[bi, :, sy, sx]
-    return expected
+                if not valid[bi, 0, yi, xi]:
+                    continue
+
+                qy = float(yi + flow_yx[bi, 0, yi, xi].item())
+                qx = float(xi + flow_yx[bi, 1, yi, xi].item())
+
+                y0 = int(np.floor(qy))
+                x0 = int(np.floor(qx))
+                y1 = min(y0 + 1, h - 1)
+                x1 = min(x0 + 1, w - 1)
+
+                wy = qy - y0
+                wx = qx - x0
+
+                v00 = image2[bi, :, y0, x0]
+                v01 = image2[bi, :, y0, x1]
+                v10 = image2[bi, :, y1, x0]
+                v11 = image2[bi, :, y1, x1]
+
+                expected[bi, :, yi, xi] = (
+                    (1.0 - wy) * (1.0 - wx) * v00
+                    + (1.0 - wy) * wx * v01
+                    + wy * (1.0 - wx) * v10
+                    + wy * wx * v11
+                )
+    return expected, valid
 
 
 def compute_metrics(
@@ -107,6 +159,7 @@ def compute_metrics(
     image1: torch.Tensor,
     warped: torch.Tensor,
     expected: torch.Tensor,
+    expected_valid: torch.Tensor,
     square_mask: torch.Tensor,
 ) -> dict:
     """Compute quantitative checks for warp correctness."""
@@ -116,8 +169,18 @@ def compute_metrics(
     abs_photometric_residual = photometric_residual.abs()
 
     valid_warp_mask = HQSFlowModelTFPort._valid_warp_mask(flow_yx).bool()
+    manual_valid_mask = expected_valid.bool()
     valid_mask = square_mask.bool() & valid_warp_mask.bool()
     masked_photometric_residual = abs_photometric_residual[valid_mask]
+
+    if masked_photometric_residual.numel() > 0:
+        masked_mae = masked_photometric_residual.mean().item()
+        masked_maxae = masked_photometric_residual.max().item()
+    else:
+        masked_mae = float("nan")
+        masked_maxae = float("nan")
+
+    valid_mask_mismatch = (valid_warp_mask ^ manual_valid_mask).sum().item()
 
     metrics = {
         "mae_vs_manual_expected": abs_err_expected.mean().item(),
@@ -126,9 +189,10 @@ def compute_metrics(
         "mae_vs_image1_full": abs_err_img1.mean().item(),
         "mae_photometric_residual_full": abs_photometric_residual.mean().item(),
         "maxae_photometric_residual_full": abs_photometric_residual.max().item(),
-        "mae_photometric_residual_masked": masked_photometric_residual.mean().item(),
-        "maxae_photometric_residual_masked": masked_photometric_residual.max().item(),
+        "mae_photometric_residual_masked": masked_mae,
+        "maxae_photometric_residual_masked": masked_maxae,
         "valid_pixel_count": int(valid_mask.sum().item()),
+        "valid_mask_mismatch_count": int(valid_mask_mismatch),
     }
 
     square_pixels = square_mask.bool()
@@ -217,7 +281,10 @@ def visualize_all(
     axes[0, 5].set_title("|Photometric residual|")
     plt.colorbar(axes[0, 5].images[0], ax=axes[0, 5], fraction=0.046, pad=0.04)
 
-    masked_limit = max(float(np.nanmax(np.abs(masked_residual))), 1.0)
+    if np.any(masked_valid):
+        masked_limit = max(float(np.nanmax(np.abs(masked_residual))), 1.0)
+    else:
+        masked_limit = 1.0
     im_masked_abs = axes[0, 6].imshow(abs_masked_residual, cmap="magma", interpolation="nearest")
     axes[0, 6].set_title("|Masked photometric residual|")
     plt.colorbar(im_masked_abs, ax=axes[0, 6], fraction=0.046, pad=0.04)
@@ -284,6 +351,8 @@ def visualize_all(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Verify _warp_yx with synthetic translation data")
     parser.add_argument("--out_dir", type=str, default="verify_warping_out", help="Directory for outputs")
+    parser.add_argument("--height", type=int, default=10, help="Image height")
+    parser.add_argument("--width", type=int, default=10, help="Image width")
     # Add starting point and shift parameters if desired for more flexible testing
     parser.add_argument("--square_top_left_x", type=int, default=3, help="Square top-left x coordinate in image1")
     parser.add_argument("--square_top_left_y", type=int, default=2, help="Square top-left y coordinate in image1")
@@ -299,6 +368,8 @@ def main() -> None:
     os.makedirs(args.out_dir, exist_ok=True)
 
     image1, image2, flow_yx, square_mask = build_synthetic_pair(
+        h=args.height,
+        w=args.width,
         square_top_left_xy=(args.square_top_left_x, args.square_top_left_y),
         shift_dx=args.shift_dx,
         shift_dy=args.shift_dy,
@@ -309,8 +380,15 @@ def main() -> None:
     with torch.no_grad():
         warped = HQSFlowModelTFPort._warp_yx(image2, flow_yx)
 
-    expected = manual_expected_warp(image2, flow_yx)
-    metrics = compute_metrics(flow_yx=flow_yx, image1=image1, warped=warped, expected=expected, square_mask=square_mask)
+    expected, expected_valid = manual_expected_warp(image2, flow_yx)
+    metrics = compute_metrics(
+        flow_yx=flow_yx,
+        image1=image1,
+        warped=warped,
+        expected=expected,
+        expected_valid=expected_valid,
+        square_mask=square_mask,
+    )
     photometric_residual = image1 - warped
 
     fig_path = os.path.join(args.out_dir, "warping_verification.png")
@@ -329,12 +407,13 @@ def main() -> None:
     np.save(os.path.join(args.out_dir, "flow_dy_dx.npy"), flow_yx[0].numpy())
     np.save(os.path.join(args.out_dir, "warped.npy"), warped[0, 0].numpy())
     np.save(os.path.join(args.out_dir, "expected.npy"), expected[0, 0].numpy())
+    np.save(os.path.join(args.out_dir, "expected_valid_mask.npy"), expected_valid[0, 0].numpy().astype(np.uint8))
     np.save(os.path.join(args.out_dir, "photometric_residual.npy"), photometric_residual[0, 0].numpy())
 
 
     print("=== verify_warping results ===")
     print("Synthetic setup:")
-    print("  image size        : 10x10")
+    print(f"  image size        : {args.width}x{args.height}")
     print(f"  square top-left   : (x={args.square_top_left_x}, y={args.square_top_left_y})")
     print(f"  square size       : {args.square_size}x{args.square_size}")
     print(f"  square value      : {args.square_value}")
@@ -343,7 +422,10 @@ def main() -> None:
     print()
     print("Metrics:")
     for k, v in metrics.items():
-        print(f"  {k:28s}: {v:.6f}")
+        if "count" in k:
+            print(f"  {k:28s}: {int(v)}")
+        else:
+            print(f"  {k:28s}: {v:.6f}")
     print()
     print(f"Saved figure: {fig_path}")
 
