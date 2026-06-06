@@ -299,8 +299,7 @@ def main() -> None:
     os.makedirs(args.out_dir, exist_ok=True)
 
     image1, image2, flow_yx, square_mask = build_synthetic_pair(
-        square_top_left_x=args.square_top_left_x,
-        square_top_left_y=args.square_top_left_y,
+        square_top_left_xy=(args.square_top_left_x, args.square_top_left_y),
         shift_dx=args.shift_dx,
         shift_dy=args.shift_dy,
         square_value=args.square_value,
