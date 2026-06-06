@@ -284,6 +284,13 @@ def visualize_all(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Verify _warp_yx with synthetic translation data")
     parser.add_argument("--out_dir", type=str, default="verify_warping_out", help="Directory for outputs")
+    # Add starting point and shift parameters if desired for more flexible testing
+    parser.add_argument("--square_top_left_x", type=int, default=3, help="Square top-left x coordinate in image1")
+    parser.add_argument("--square_top_left_y", type=int, default=2, help="Square top-left y coordinate in image1")
+    parser.add_argument("--shift_dx", type=int, default=1, help="Horizontal shift (dx) applied to square in image2")
+    parser.add_argument("--shift_dy", type=int, default=2, help="Vertical shift (dy) applied to square in image2")
+    parser.add_argument("--square_value", type=float, default=255.0, help="Pixel value for the square region")
+    parser.add_argument("--square_size", type=int, default=3, help="Size of the square region (square_size x square_size)")
     return parser.parse_args()
 
 
@@ -291,7 +298,14 @@ def main() -> None:
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
-    image1, image2, flow_yx, square_mask = build_synthetic_pair()
+    image1, image2, flow_yx, square_mask = build_synthetic_pair(
+        square_top_left_x=args.square_top_left_x,
+        square_top_left_y=args.square_top_left_y,
+        shift_dx=args.shift_dx,
+        shift_dy=args.shift_dy,
+        square_value=args.square_value,
+        square_size=args.square_size,
+    )
 
     with torch.no_grad():
         warped = HQSFlowModelTFPort._warp_yx(image2, flow_yx)
@@ -322,10 +336,11 @@ def main() -> None:
     print("=== verify_warping results ===")
     print("Synthetic setup:")
     print("  image size        : 10x10")
-    print("  square top-left   : (x=2, y=1)")
-    print("  square size       : 3x3")
-    print("  shift (dx, dy)    : (1, 2)")
-    print("  forward flow (yx) : (2, 1) on image1 square")
+    print(f"  square top-left   : (x={args.square_top_left_x}, y={args.square_top_left_y})")
+    print(f"  square size       : {args.square_size}x{args.square_size}")
+    print(f"  square value      : {args.square_value}")
+    print(f"  shift (dx, dy)    : ({args.shift_dx}, {args.shift_dy})")
+    print(f"  forward flow (yx) : ({args.shift_dy}, {args.shift_dx}) on image1 square")
     print()
     print("Metrics:")
     for k, v in metrics.items():
