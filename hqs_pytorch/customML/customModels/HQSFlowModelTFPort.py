@@ -762,6 +762,141 @@ class HQSFlowModelTFPort(nn.Module):
 
         valid = (qx >= 0) & (qx <= w - 1) & (qy >= 0) & (qy <= h - 1)
         return valid.float().unsqueeze(1)  # [B, 1, H, W]
+    
+    @staticmethod
+    def forward_splat(
+        src: torch.Tensor,
+        flow_yx: torch.Tensor,
+        normalize: bool = False,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """
+        Differentiable forward splatting with bilinear weights.
+
+        Args:
+            src:
+                Tensor to splat from source/image-1 coordinates.
+                Shape: (B, C, H, W)
+
+            flow_yx:
+                Forward flow from image 1 to image 2.
+                Channel order: [dy, dx].
+                Shape: (B, 2, H, W)
+
+            normalize:
+                If False:
+                    return accumulated splat values.
+                    This is what you want for occupancy splatting.
+
+                If True:
+                    return splatted values divided by splatted weights.
+                    This is useful if splatting images/features.
+
+            eps:
+                Numerical stability constant.
+
+        Returns:
+            out:
+                Forward-splatted tensor in target/image-2 coordinates.
+                Shape: (B, C, H, W)
+        """
+
+        if src.ndim != 4:
+            raise ValueError(f"src must have shape (B, C, H, W), got {src.shape}")
+
+        if flow_yx.ndim != 4 or flow_yx.shape[1] != 2:
+            raise ValueError(f"flow_yx must have shape (B, 2, H, W), got {flow_yx.shape}")
+
+        B, C, H, W = src.shape
+
+        if flow_yx.shape[0] != B or flow_yx.shape[2:] != (H, W):
+            raise ValueError(
+                f"src and flow_yx spatial sizes must match. "
+                f"src={src.shape}, flow_yx={flow_yx.shape}"
+            )
+
+        device = src.device
+        dtype = src.dtype
+
+        # Source pixel coordinates.
+        yy, xx = torch.meshgrid(
+            torch.arange(H, device=device, dtype=dtype),
+            torch.arange(W, device=device, dtype=dtype),
+            indexing="ij",
+        )
+
+        yy = yy[None, None, :, :]  # (1, 1, H, W)
+        xx = xx[None, None, :, :]  # (1, 1, H, W)
+
+        # Target coordinates induced by forward flow.
+        y_t = yy + flow_yx[:, 0:1]
+        x_t = xx + flow_yx[:, 1:2]
+
+        # Four bilinear neighbours.
+        y0 = torch.floor(y_t)
+        x0 = torch.floor(x_t)
+        y1 = y0 + 1.0
+        x1 = x0 + 1.0
+
+        # Bilinear weights.
+        wy1 = y_t - y0
+        wx1 = x_t - x0
+        wy0 = 1.0 - wy1
+        wx0 = 1.0 - wx1
+
+        y0_long = y0.long()
+        x0_long = x0.long()
+        y1_long = y1.long()
+        x1_long = x1.long()
+
+        out = src.new_zeros(B, C, H * W)
+
+        if normalize:
+            weight_accum = src.new_zeros(B, 1, H * W)
+        else:
+            weight_accum = None
+
+        def splat_to(y_idx, x_idx, weight):
+            nonlocal out, weight_accum
+
+            valid = (
+                (y_idx >= 0)
+                & (y_idx < H)
+                & (x_idx >= 0)
+                & (x_idx < W)
+            )
+
+            # Flatten target index.
+            linear_idx = y_idx.clamp(0, H - 1) * W + x_idx.clamp(0, W - 1)
+            linear_idx = linear_idx.view(B, 1, H * W)
+
+            valid_f = valid.to(dtype).view(B, 1, H * W)
+            weight_f = weight.view(B, 1, H * W) * valid_f
+
+            src_weighted = src.view(B, C, H * W) * weight_f
+
+            out.scatter_add_(
+                dim=2,
+                index=linear_idx.expand(B, C, H * W),
+                src=src_weighted,
+            )
+
+            if normalize:
+                weight_accum.scatter_add_(
+                    dim=2,
+                    index=linear_idx,
+                    src=weight_f,
+                )
+
+        splat_to(y0_long, x0_long, wy0 * wx0)
+        splat_to(y0_long, x1_long, wy0 * wx1)
+        splat_to(y1_long, x0_long, wy1 * wx0)
+        splat_to(y1_long, x1_long, wy1 * wx1)
+
+        if normalize:
+            out = out / weight_accum.clamp_min(eps)
+
+        return out.view(B, C, H, W)
 
     def build_all_pairs_correlation(self, f1: torch.Tensor, f2: torch.Tensor) -> torch.Tensor:
         """Return [B, H, W, H, W] all-pairs correlation."""
@@ -1132,6 +1267,7 @@ class HQSFlowModelTFPort(nn.Module):
         delta_match_lows: List[torch.Tensor] = []
         delta_prior_lows: List[torch.Tensor] = []
         coupling_residual_lows: List[torch.Tensor] = []
+        occupancy_masks: List[torch.Tensor] = []
 
         beta_schedule, lambda_schedule = self._hqs_penalties()
         correction_gates = self._correction_gates()
@@ -1157,6 +1293,16 @@ class HQSFlowModelTFPort(nn.Module):
             ix, iy, it, i2_warp = self.compute_ofce_derivatives(i1_lvl, i2_lvl, flow_yx)
             # Adjust our confidence based on the validity of the warp to prevent out-of-bounds pixels from destabilizing training.
             valid_k = self._valid_warp_mask(flow_yx)
+
+            # Compute the per iteration forward splat to build occupancy masks.
+            ones = torch.ones_like(flow_yx[:, :1, :, :])
+            occupancy = self.forward_splat(ones, flow_yx, normalize=False)
+            occupancy_mask = occupancy.clamp(0.0, 1.0)  # Optional: clamp to prevent extreme values from destabilizing training.
+
+            # Perform backwards warping of the occupancy mask to realign to image-1 coordinates.
+            occupancy_mask_warped = self._warp_yx(occupancy_mask, flow_yx)
+            occupancy_mask_warped = occupancy_mask_warped.clamp(0.0, 1.0)  # Optional: clamp to prevent extreme values from destabilizing training.
+            occupancy_masks.append(occupancy_mask_warped.detach())
 
             # Per-iteration confidence from dedicated head (not the init decoder).
             conf_in = torch.cat([corr_feat_k_chw, flow_yx, ix, iy, it, valid_k], dim=1)
@@ -1197,6 +1343,9 @@ class HQSFlowModelTFPort(nn.Module):
             else:
                 data_reliability = valid_k
                 data_weight = valid_k
+
+            # Mask off the data_weight using the occupancy mask
+            data_weight = occupancy_mask_warped * data_weight
 
             # Mask the OFCE coefficients before they enter the analytic data update.
             ix_data = ix * data_weight
@@ -1389,6 +1538,17 @@ class HQSFlowModelTFPort(nn.Module):
                 ix, iy, it, _ = self.compute_ofce_derivatives(i1_l1, i2_l1, flow_l1)
                 
                 valid_l1 = self._valid_warp_mask(flow_l1)
+
+                # Compute the per iteration forward splat to build occupancy masks.
+                ones = torch.ones_like(flow_l1[:, :1, :, :])
+                occupancy = self.forward_splat(ones, flow_l1, normalize=False)
+                occupancy_mask = occupancy.clamp(0.0, 1.0)  # Optional: clamp to prevent extreme values from destabilizing training.
+
+                # Perform backwards warping of the occupancy mask to realign to image-1 coordinates.
+                occupancy_mask_warped = self._warp_yx(occupancy_mask, flow_l1)
+                occupancy_mask_warped = occupancy_mask_warped.clamp(0.0, 1.0)  # Optional: clamp to prevent extreme values from destabilizing training.
+                occupancy_masks.append(occupancy_mask_warped.detach())
+
                 photometric_conf_l1 = self.photometric_confidence(it)
                 conf_in = torch.cat([corr_feat_l1_chw, flow_l1, ix, iy, it, valid_l1], dim=1)
                 confidence_l1 = self.iter_conf_head(conf_in)
@@ -1425,6 +1585,9 @@ class HQSFlowModelTFPort(nn.Module):
                 else:
                     data_reliability = valid_l1
                     data_weight = valid_l1
+
+                # Mask off the data_weight using the occupancy mask
+                data_weight = occupancy_mask_warped * data_weight
 
                 # Mask the OFCE coefficients before they enter the analytic data update.
                 ix_data = ix * data_weight
@@ -1589,6 +1752,7 @@ class HQSFlowModelTFPort(nn.Module):
             "delta_match_low": delta_match_lows,
             "delta_prior_low": delta_prior_lows,
             "data_reliability_low": data_reliability.detach() if self.use_data_reliability_mask else None,
+            "occupancy_masks": occupancy_masks,
         }
 
     def param_count(self) -> Dict[str, int]:
