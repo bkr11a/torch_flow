@@ -469,6 +469,7 @@ def plot_grouped_public_outputs(
 ) -> None:
     grouped = collect_stage_tensor_groups(outputs)
     flow_groups: Dict[str, List[torch.Tensor]] = {}
+    occupancy_groups: Dict[str, List[torch.Tensor]] = {}
     scalar_groups: Dict[str, List[torch.Tensor]] = {}
     feature_groups: Dict[str, List[torch.Tensor]] = {}
 
@@ -478,6 +479,8 @@ def plot_grouped_public_outputs(
             continue
         if sample.ndim == 3 and sample.shape[0] == 2:
             flow_groups[key] = series
+        elif "occupancy" in key.lower() and (sample.ndim == 2 or (sample.ndim == 3 and sample.shape[0] == 1)):
+            occupancy_groups[key] = series
         elif sample.ndim == 2 or (sample.ndim == 3 and sample.shape[0] == 1):
             scalar_groups[key] = series
         elif sample.ndim == 3:
@@ -489,6 +492,13 @@ def plot_grouped_public_outputs(
         title="Stage Flow Outputs (HSV)",
         batch_index=batch_index,
         mode="flow",
+    )
+    plot_grouped_stage_tensors(
+        grouped=occupancy_groups,
+        output_path=sample_dir / f"{file_prefix}_stage_occupancy_grouped.png",
+        title="Stage Occupancy Masks",
+        batch_index=batch_index,
+        mode="scalar",
     )
     plot_grouped_stage_tensors(
         grouped=scalar_groups,
@@ -510,6 +520,7 @@ def plot_master_dashboard(sample_dir: Path, file_prefix: str) -> None:
     panel_paths = [
         sample_dir / f"{file_prefix}_sample_overview.png",
         sample_dir / f"{file_prefix}_stage_flows_grouped.png",
+        sample_dir / f"{file_prefix}_stage_occupancy_grouped.png",
         sample_dir / f"{file_prefix}_stage_scalars_grouped.png",
         sample_dir / f"{file_prefix}_stage_features_grouped.png",
     ]
@@ -546,10 +557,16 @@ def plot_sample_overview(
     batch_index: int = 0,
 ) -> None:
     has_gt = "flow" in batch and isinstance(batch["flow"], torch.Tensor)
-    cols = 3 if has_gt else 2
+    has_occupancy = (
+        isinstance(outputs, dict)
+        and isinstance(outputs.get("occupancy_masks"), (list, tuple))
+        and len(outputs["occupancy_masks"]) > 0
+        and isinstance(outputs["occupancy_masks"][0], torch.Tensor)
+    )
+
+    cols = 2 + int(has_gt) + int(has_occupancy)
     fig, axes = plt.subplots(1, cols, figsize=(5 * cols, 4))
-    if cols == 2:
-        axes = [axes[0], axes[1]]
+    axes = np.atleast_1d(axes)
 
     image1 = batch["image1"][batch_index]
     image2 = batch["image2"][batch_index]
@@ -560,10 +577,22 @@ def plot_sample_overview(
     axes[1].set_title("Image 2")
     axes[1].axis("off")
 
+    col = 2
     if has_gt:
-        axes[2].imshow(flow_to_hsv(batch["flow"][batch_index].detach().cpu()))
-        axes[2].set_title("Ground Truth Flow")
-        axes[2].axis("off")
+        axes[col].imshow(flow_to_hsv(batch["flow"][batch_index].detach().cpu()))
+        axes[col].set_title("Ground Truth Flow")
+        axes[col].axis("off")
+        col += 1
+
+    if has_occupancy:
+        occupancy_series = outputs["occupancy_masks"]
+        occupancy_map = to_sample_map(occupancy_series[-1], batch_index=batch_index)
+        if occupancy_map is not None:
+            if occupancy_map.ndim == 3 and occupancy_map.shape[0] == 1:
+                occupancy_map = occupancy_map[0]
+            axes[col].imshow(occupancy_map.numpy(), cmap="viridis", vmin=0.0, vmax=1.0)
+            axes[col].set_title("Occupancy Mask (latest)")
+            axes[col].axis("off")
 
     fig.tight_layout()
     fig.savefig(sample_dir / f"{file_prefix}_sample_overview.png", dpi=120, bbox_inches="tight")
