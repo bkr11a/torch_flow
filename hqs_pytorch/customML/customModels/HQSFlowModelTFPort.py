@@ -1035,6 +1035,9 @@ class HQSFlowModelTFPort(nn.Module):
         else:
             wd = torch.ones_like(ix)
 
+        # There is a risk that low-confidence pixels with high residuals could produce extreme weights that destabilize training. Clamping the max weight can mitigate this.
+        wd = wd.clamp(max=10.0)  # Cap max weight to prevent extreme updates from outliers.
+
         w = c * wd
         a11 = w * ix * ix + beta
         a12 = w * ix * iy
@@ -1068,6 +1071,7 @@ class HQSFlowModelTFPort(nn.Module):
         lam: torch.Tensor,
         wx: torch.Tensor,
         wy: torch.Tensor,
+        validity_mask: torch.Tensor,
     ) -> torch.Tensor:
         x_up = F.pad(x[:, :, :-1, :], (0, 0, 1, 0), mode="replicate")
         x_down = F.pad(x[:, :, 1:, :], (0, 0, 0, 1), mode="replicate")
@@ -1079,8 +1083,11 @@ class HQSFlowModelTFPort(nn.Module):
         wy_u = F.pad(wy, (0, 0, 1, 0), mode="replicate")
         wy_d = F.pad(wy, (0, 0, 0, 1), mode="replicate")
 
-        numer = beta * rhs + lam * (wy_u * x_up + wy_d * x_down + wx_l * x_left + wx_r * x_right)
-        denom = beta + lam * (wy_u + wy_d + wx_l + wx_r)
+        data_weight = validity_mask * beta
+        smooth_weight = lam * (wy_u + wy_d + wx_l + wx_r)
+
+        numer = data_weight * rhs + lam * (wy_u * x_up + wy_d * x_down + wx_l * x_left + wx_r * x_right)
+        denom = data_weight + smooth_weight
         return numer / (denom + 1e-6)
 
     def hqs_prox_step(
@@ -1089,15 +1096,16 @@ class HQSFlowModelTFPort(nn.Module):
         image: torch.Tensor,
         beta: torch.Tensor,
         lam: torch.Tensor,
+        validity_mask: torch.Tensor,
         num_iter: int = 1,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        p = flow_yx[:, 0:1].clone()
-        q = flow_yx[:, 1:2].clone()
+        q = flow_yx[:, 0:1].clone()
+        p = flow_yx[:, 1:2].clone()
         wx, wy = self.edge_weights(image)
         for _ in range(num_iter):
-            p = self.jacobi_prox_step(p, flow_yx[:, 0:1], beta, lam, wx, wy)
-            q = self.jacobi_prox_step(q, flow_yx[:, 1:2], beta, lam, wx, wy)
-        return torch.cat([p, q], dim=1), wx, wy
+            q = self.jacobi_prox_step(p, flow_yx[:, 0:1], beta, lam, wx, wy, validity_mask=validity_mask)
+            p = self.jacobi_prox_step(q, flow_yx[:, 1:2], beta, lam, wx, wy, validity_mask=validity_mask)
+        return torch.cat([q, p], dim=1), wx, wy
 
     @staticmethod
     def _monotone_schedule(raw_steps: torch.Tensor, lower: float, upper: float) -> torch.Tensor:
@@ -1348,18 +1356,18 @@ class HQSFlowModelTFPort(nn.Module):
             data_weight = occupancy_mask_warped * data_weight
 
             # Mask the OFCE coefficients before they enter the analytic data update.
-            ix_data = ix * data_weight
-            iy_data = iy * data_weight
-            it_data = it * data_weight
+            ix_data = ix 
+            iy_data = iy 
+            it_data = it
 
-            confidence_k = confidence_k * data_weight
-
-            flow_yx, _, _ = self.hqs_data_step(ix_data, iy_data, it_data, aux_yx, confidence_k, flow_yx, beta)
+            confidence_k = confidence_k * data_weight.detach()
 
             # HQS v-step: Jacobi TV-proximal smoothing.
             aux_yx, _, _ = self.hqs_prox_step(
-                flow_yx, i1_lvl, beta, lam, num_iter=self.prox_jacobi_iters
+                flow_yx, i1_lvl, beta, lam, validity_mask=data_weight, num_iter=self.prox_jacobi_iters
             )
+
+            flow_yx, _, _ = self.hqs_data_step(ix_data, iy_data, it_data, aux_yx, confidence_k, flow_yx, beta)
 
             # Motion encoding: pack correlation, flow, and HQS coupling residual.
             # Large residual (flow - aux) signals that data and prox disagree.
@@ -1465,7 +1473,7 @@ class HQSFlowModelTFPort(nn.Module):
             flow_yx = flow_yx + correction_gates[k] * delta
 
             aux_yx, _, _ = self.hqs_prox_step(
-                flow_yx, i1_lvl, beta, lam, num_iter=self.prox_jacobi_iters
+                flow_yx, i1_lvl, beta, lam, validity_mask=data_weight, num_iter=self.prox_jacobi_iters
             )
 
             # Per-iteration full-resolution prediction via convex upsampling.
@@ -1590,17 +1598,18 @@ class HQSFlowModelTFPort(nn.Module):
                 data_weight = occupancy_mask_warped * data_weight
 
                 # Mask the OFCE coefficients before they enter the analytic data update.
-                ix_data = ix * data_weight
-                iy_data = iy * data_weight
-                it_data = it * data_weight
+                ix_data = ix 
+                iy_data = iy
+                it_data = it
 
-                confidence_l1 = confidence_l1 * data_weight
+                confidence_l1 = confidence_l1 * data_weight.detach()
+
+                aux_l1, _, _ = self.hqs_prox_step(
+                    flow_l1, i1_l1, beta, lam, validity_mask=data_weight, num_iter=self.prox_jacobi_iters
+                )
                 
                 flow_l1, _, _ = self.hqs_data_step(
                     ix_data, iy_data, it_data, aux_l1, confidence_l1, flow_l1, beta
-                )
-                aux_l1, _, _ = self.hqs_prox_step(
-                    flow_l1, i1_l1, beta, lam, num_iter=self.prox_jacobi_iters
                 )
 
                 ############ OLD UPDATE
@@ -1683,7 +1692,7 @@ class HQSFlowModelTFPort(nn.Module):
                 flow_l1 = flow_l1 + gates_l1[k_l1] * delta_l1
 
                 aux_l1, _, _ = self.hqs_prox_step(
-                    flow_l1, i1_l1, beta, lam, num_iter=self.prox_jacobi_iters
+                    flow_l1, i1_l1, beta, lam, validity_mask=data_weight, num_iter=self.prox_jacobi_iters
                 )
 
                 # Full-res prediction from 1/4-scale flow via bilinear upsampling.
