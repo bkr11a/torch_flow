@@ -1362,12 +1362,12 @@ class HQSFlowModelTFPort(nn.Module):
 
             confidence_k = confidence_k * data_weight.detach()
 
+            flow_yx, _, _ = self.hqs_data_step(ix_data, iy_data, it_data, aux_yx, confidence_k, flow_yx, beta)
+
             # HQS v-step: Jacobi TV-proximal smoothing.
             aux_yx, _, _ = self.hqs_prox_step(
                 flow_yx, i1_lvl, beta, lam, validity_mask=data_weight, num_iter=self.prox_jacobi_iters
             )
-
-            flow_yx, _, _ = self.hqs_data_step(ix_data, iy_data, it_data, aux_yx, confidence_k, flow_yx, beta)
 
             # Motion encoding: pack correlation, flow, and HQS coupling residual.
             # Large residual (flow - aux) signals that data and prox disagree.
@@ -1604,12 +1604,12 @@ class HQSFlowModelTFPort(nn.Module):
 
                 confidence_l1 = confidence_l1 * data_weight.detach()
 
-                aux_l1, _, _ = self.hqs_prox_step(
-                    flow_l1, i1_l1, beta, lam, validity_mask=data_weight, num_iter=self.prox_jacobi_iters
-                )
-                
                 flow_l1, _, _ = self.hqs_data_step(
                     ix_data, iy_data, it_data, aux_l1, confidence_l1, flow_l1, beta
+                )
+
+                aux_l1, _, _ = self.hqs_prox_step(
+                    flow_l1, i1_l1, beta, lam, validity_mask=data_weight, num_iter=self.prox_jacobi_iters
                 )
 
                 ############ OLD UPDATE
