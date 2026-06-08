@@ -87,6 +87,11 @@ model:
     data_reliability_m_min: 0.02
     data_reliability_hidden_dim: 32
 
+    # -- Use a learned proximal operator instead of jacobi iterations (ablation) --
+    use_learned_prox: false
+    prox_hidden_dim: 96
+    prox_scale_factor: 1.00               # scale down prox output to prevent divergence
+
 # ── Loss ──────────────────────────────────────────────────────────────────
 loss:
   gamma: 0.85                     # geometric decay over stages (used when stage_weight_mode: geometric)

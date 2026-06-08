@@ -421,6 +421,91 @@ class ConvGRUCell(nn.Module):
         h_cand = torch.tanh(self.conv_h(torch.cat([x, r * h], dim=1)))
         return (1.0 - z) * h + z * h_cand
 
+# ---------------------------------------------------------------------------
+# Learned Proximal Operator
+# ---------------------------------------------------------------------------
+
+class LearnedHQSProx(nn.Module):
+    def __init__(
+        self,
+        context_dim: int,
+        hidden_dim: int = 96,
+        prox_scale: float = 1.0,
+    ):
+        super().__init__()
+        self.prox_scale = prox_scale
+
+        # Inputs:
+        # flow_yx       : 2
+        # prev_aux_yx   : 2
+        # flow-prev_aux : 2
+        # validity      : 1
+        # source context: context_dim
+        in_ch = 2 + 2 + 2 + 1 + context_dim
+
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_ch, hidden_dim, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+        self.anchor_head = nn.Conv2d(hidden_dim, 2, 3, padding=1)
+        self.prior_head = nn.Conv2d(hidden_dim, 2, 3, padding=1)
+
+        self.mix_head = nn.Sequential(
+            nn.Conv2d(hidden_dim, 32, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, 3, padding=1),
+            nn.Sigmoid(),
+        )
+
+        # Start as near-identity prox.
+        nn.init.zeros_(self.anchor_head.weight)
+        nn.init.zeros_(self.anchor_head.bias)
+        nn.init.zeros_(self.prior_head.weight)
+        nn.init.zeros_(self.prior_head.bias)
+
+    def forward(
+        self,
+        flow_yx: torch.Tensor,
+        prev_aux_yx: torch.Tensor,
+        context_feat: torch.Tensor,
+        validity: torch.Tensor,
+    ):
+        hqs_resid = flow_yx - prev_aux_yx
+
+        x = torch.cat(
+            [
+                flow_yx,
+                prev_aux_yx,
+                hqs_resid,
+                validity,
+                context_feat,
+            ],
+            dim=1,
+        )
+
+        h = self.encoder(x)
+
+        delta_anchor = self.prox_scale * torch.tanh(self.anchor_head(h))
+        delta_prior = self.prox_scale * torch.tanh(self.prior_head(h))
+
+        q_anchor = flow_yx + delta_anchor
+        q_prior = prev_aux_yx + delta_prior
+
+        learned_mix = self.mix_head(h)
+
+        # Bias mixture toward geometric/learned validity.
+        # High validity -> anchor to flow.
+        # Low validity -> prior/inpaint from previous aux/source context.
+        mix = 0.5 * validity + 0.5 * learned_mix
+
+        aux_yx = mix * q_anchor + (1.0 - mix) * q_prior
+
+        return aux_yx, mix
 
 # ---------------------------------------------------------------------------
 # HQS Update Unit  (ConvGRU + flow head + mask head)
@@ -697,6 +782,20 @@ class HQSFlowModelTFPort(nn.Module):
             hidden=self.data_reliability_hidden_dim,
             m_min=self.data_reliability_m_min,
         )
+
+        self.use_learned_prox_net = bool(
+            _cfg_get(mb, "use_learned_proximal", False)
+        )
+
+        if self.use_learned_prox_net:
+            self.learned_prox = LearnedHQSProx(
+                context_dim=context_dim,
+                hidden_dim=int(_cfg_get(mb, "prox_hidden_dim", 96)),
+                prox_scale=float(_cfg_get(mb, "prox_scale_factor", 1.0)),
+            )
+
+        else:
+            self.learned_prox = None
 
     @staticmethod
     def _normalise(img: torch.Tensor) -> torch.Tensor:
@@ -1364,10 +1463,14 @@ class HQSFlowModelTFPort(nn.Module):
 
             flow_yx, _, _ = self.hqs_data_step(ix_data, iy_data, it_data, aux_yx, confidence_k, flow_yx, beta)
 
-            # HQS v-step: Jacobi TV-proximal smoothing.
-            aux_yx, _, _ = self.hqs_prox_step(
-                flow_yx, i1_lvl, beta, lam, validity_mask=data_weight, num_iter=self.prox_jacobi_iters
-            )
+            if self.use_learned_prox_net:
+                # Use the learned prox network to predict the smoothed flow directly, rather than running the Jacobi iterations.
+                aux_yx, _ = self.learned_prox(flow_yx=flow_yx, prev_aux_yx=aux_yx, context_feat=f1, validity=data_weight)
+            else:
+                # otherwise HQS v-step: Jacobi TV-proximal smoothing.
+                aux_yx, _, _ = self.hqs_prox_step(
+                    flow_yx, i1_lvl, beta, lam, validity_mask=data_weight, num_iter=self.prox_jacobi_iters
+                )
 
             # Motion encoding: pack correlation, flow, and HQS coupling residual.
             # Large residual (flow - aux) signals that data and prox disagree.
@@ -1472,9 +1575,13 @@ class HQSFlowModelTFPort(nn.Module):
 
             flow_yx = flow_yx + correction_gates[k] * delta
 
-            aux_yx, _, _ = self.hqs_prox_step(
-                flow_yx, i1_lvl, beta, lam, validity_mask=data_weight, num_iter=self.prox_jacobi_iters
-            )
+            if self.use_learned_prox_net:
+                # Use the learned prox network to predict the smoothed flow directly, rather than running the Jacobi iterations.
+                aux_yx, _ = self.learned_prox(flow_yx=flow_yx, prev_aux_yx=aux_yx, context_feat=f1, validity=data_weight)
+            else:
+                aux_yx, _, _ = self.hqs_prox_step(
+                    flow_yx, i1_lvl, beta, lam, validity_mask=data_weight, num_iter=self.prox_jacobi_iters
+                )
 
             # Per-iteration full-resolution prediction via convex upsampling.
             flow_up_yx = self.convex_upsample(flow_yx, mask_logits, rate=self.upsample_scale)
@@ -1608,9 +1715,15 @@ class HQSFlowModelTFPort(nn.Module):
                     ix_data, iy_data, it_data, aux_l1, confidence_l1, flow_l1, beta
                 )
 
-                aux_l1, _, _ = self.hqs_prox_step(
-                    flow_l1, i1_l1, beta, lam, validity_mask=data_weight, num_iter=self.prox_jacobi_iters
-                )
+                if self.use_learned_prox_net:
+                    # Use the learned prox network to predict the smoothed flow directly, rather than running the Jacobi iterations.
+                    aux_l1, _ = self.learned_prox(
+                        flow_yx=flow_l1, prev_aux_yx=aux_l1, context_feat=f1_l1, validity=data_weight
+                    )
+                else:
+                    aux_l1, _, _ = self.hqs_prox_step(
+                        flow_l1, i1_l1, beta, lam, validity_mask=data_weight, num_iter=self.prox_jacobi_iters
+                    )
 
                 ############ OLD UPDATE
                 ############ hqs_resid_l1 = flow_l1 - aux_l1
@@ -1691,9 +1804,15 @@ class HQSFlowModelTFPort(nn.Module):
 
                 flow_l1 = flow_l1 + gates_l1[k_l1] * delta_l1
 
-                aux_l1, _, _ = self.hqs_prox_step(
-                    flow_l1, i1_l1, beta, lam, validity_mask=data_weight, num_iter=self.prox_jacobi_iters
-                )
+                if self.use_learned_prox_net:
+                    # Use the learned prox network to predict the smoothed flow directly, rather than running the Jacobi iterations.
+                    aux_l1, _ = self.learned_prox(
+                        flow_yx=flow_l1, prev_aux_yx=aux_l1, context_feat=f1_l1, validity=data_weight
+                    )
+                else:
+                    aux_l1, _, _ = self.hqs_prox_step(
+                        flow_l1, i1_l1, beta, lam, validity_mask=data_weight, num_iter=self.prox_jacobi_iters
+                    )
 
                 # Full-res prediction from 1/4-scale flow via bilinear upsampling.
                 # Higher quality than main-loop predictions (finer features),
