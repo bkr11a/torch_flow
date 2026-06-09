@@ -1302,7 +1302,7 @@ class HQSFlowModelTFPort(nn.Module):
         scale = flow.new_tensor([sy, sx]).view(1, 2, 1, 1)
         return resized * scale
 
-    def photometric_confidence(self, it: torch.Tensor, tau: float = 0.05) -> torch.Tensor:
+    def photometric_confidence(self, it: torch.Tensor, tau: float = 0.75) -> torch.Tensor:
         """
         Soft mask confidence based from photometric residual, used to emulate occlusions.
         """
