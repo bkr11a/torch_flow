@@ -38,6 +38,7 @@ from data import build_dataloader, build_dataset
 from losses import OFCELoss, SequenceLoss, SmoothnessLoss
 from models import build_model
 from utils import compute_metrics, create_flow_colorwheel, flow_to_hsv, write_flow
+from hqs_pytorch.customML.customModels.HQSFlowModelTFPort import HQSFlowModelTFPort
 
 
 logger = logging.getLogger(__name__)
@@ -1221,6 +1222,65 @@ class FlowEvaluator:
         self.iter_profiles: List[Dict[str, List[float]]] = []
         self.qualitative_paths: List[str] = []
 
+    def build_oracle_source_target_masks(
+            self,
+            flow_gt_xy: torch.Tensor,
+            valid: Optional[torch.Tensor] = None,
+            occlusion: Optional[torch.Tensor] = None,
+            invalid: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Build source_valid and target_valid masks based on ground truth flow, for debugging leakage of target image information into the model.
+
+        flow_gt_xy: (B, 2, H, W) ground truth flow in pixel units with (x, y) order
+        valid: (B, H, W) or (B, 1, H, W) optional mask of valid flow pixels (1 for valid, 0 for invalid)
+        occlusion: (B, H, W) or (B, 1, H, W) optional mask of occluded pixels (1 for occluded/unmatachable from frame 1 to frame 2, 0 for non-occluded)
+        invalid: (B, H, W) or (B, 1, H, W) optional mask of invalid pixels (1 for invalid, 0 for valid)
+
+        Returns:
+            source_valid: (B, 1, H, W) boolean mask of pixels in source image that have valid, non-occluded correspondences in target image
+            target_valid: (B, 1, H, W) boolean mask of pixels in target image that are valid targets for the model to match to (i.e. not occluded and not invalid)
+        """
+        if flow_gt_xy.ndim != 4 or flow_gt_xy.shape[1] != 2:
+            raise ValueError(f"Expected flow_gt_xy shape (B, 2, H, W), got {flow_gt_xy.shape}")
+
+        device = flow_gt_xy.device
+        dtype = flow_gt_xy.dtype
+        b, _, h, w = flow_gt_xy.shape
+
+        def prep_mask(mask, default_value):
+            if mask is None:
+                return torch.full((b, 1, h, w), default_value, dtype=dtype, device=device)
+            if mask.ndim == 3:
+                mask = mask.unsqueeze(1)
+            mask = mask.to(dtype=dtype, device=device)
+            if mask.max() > 1.5:  # Assume binary mask is in {0, 255} format
+                mask = mask / 255.0
+            if mask.shape[-2:] != (h, w):
+                mask = F.interpolate(mask, size=(h, w), mode="nearest")
+            if mask.shape[1] != 1:
+                mask = mask.mean(dim=1, keepdim=True)
+            return mask.clamp(0.0, 1.0)
+
+        valid = prep_mask(valid, default_value=1.0)
+        occlusion = prep_mask(occlusion, default_value=0.0)
+        invalid = prep_mask(invalid, default_value=0.0)
+
+        # Convert [dx, dy] flow to our internal [dy, dx]
+        flow_gt_yx = torch.stack([flow_gt_xy[:, 1], flow_gt_xy[:, 0]], dim=1)
+
+        bounds = HQSFlowModelTFPort._valid_warp_mask(flow_gt_yx).to(device=device, dtype=dtype)
+
+        # Source-valid mask in frame-1 coordinates
+        source_valid = valid * (1.0 - occlusion) * (1.0 - invalid) * bounds
+        source_valid = source_valid.clamp(0.0, 1.0)
+
+        # Target-valid mask in frame-2 coordinates
+        # Pixels in image2 not reached by any valid source pixel are newly visible
+        target_valid = HQSFlowModelTFPort.forward_splat(source_valid, flow_gt_yx, normalize=False).clamp(0.0, 1.0)
+
+        return source_valid, target_valid
+
     def evaluate(self, dataloader: DataLoader) -> Dict[str, float]:
         self.model.eval()
         device = self.device
@@ -1256,7 +1316,16 @@ class FlowEvaluator:
                     occ_cpu = occ.detach().cpu() if occ is not None else None
                     inv_cpu = inv.detach().cpu() if inv is not None else None
 
-                    out = self.model(img1, img2)
+                    # Build oracle masks for debugging target image leakage, if occlusion/invalid masks are present
+                    # DEBUGGING ORACLE MASKS!
+                    source_valid, target_valid = self.build_oracle_source_target_masks(
+                        flow_gt_xy=flow_gt,
+                        valid=valid,
+                        occlusion=occ_cpu,
+                        invalid=inv_cpu,
+                    )
+
+                    out = self.model(img1, img2, source_valid=source_valid, target_valid=target_valid)
                     flow_preds = out.get("flow_preds_raw", out["flow_preds"])
                     flow_final = out["flow_preds"][-1]
                     flow_low = out.get("flow_low_raw", out.get("flow_low", [flow_preds[-1]]))

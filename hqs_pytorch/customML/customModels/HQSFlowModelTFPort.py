@@ -902,7 +902,7 @@ class HQSFlowModelTFPort(nn.Module):
         return img.clamp(0.0, 1.0)
 
     @staticmethod
-    def _to_grayscale(img: torch.Tensor) -> torch.Tensor:
+    def _to_greyscale(img: torch.Tensor) -> torch.Tensor:
         """Convert RGB image to grayscale using standard luminance formula."""
         if img.shape[1] == 1:
             return img  # Already grayscale
