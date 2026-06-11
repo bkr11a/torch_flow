@@ -1774,6 +1774,15 @@ class HQSFlowModelTFPort(nn.Module):
             # --------------------------------------------------------------
             # Matchability confidence
             # --------------------------------------------------------------
+
+            # Print the size of each component for debugging
+            print(f"corr_feat_k_chw: {corr_feat_k_chw.shape}")
+            print(f"flow_yx: {flow_yx.shape}")
+            print(f"ix_safe: {ix_safe.shape}")
+            print(f"iy_safe: {iy_safe.shape}")
+            print(f"it_safe: {it_safe.shape}")
+            print(f"data_valid_k: {data_valid_k.shape}")
+
             conf_in = torch.cat([
                 corr_feat_k_chw,
                 flow_yx,
