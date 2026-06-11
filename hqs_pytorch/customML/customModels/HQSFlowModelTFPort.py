@@ -797,6 +797,33 @@ class HQSFlowModelTFPort(nn.Module):
         else:
             self.learned_prox = None
 
+        # Masked OFCE warp: option to mask the warping function with a validity mask to prevent corrupting features with out-of-bounds or invalid pixel within the warps.
+        self.use_masked_ofce_warp = bool(
+            _cfg_get(mb, "use_masked_ofce_warp", True)
+        )
+
+        # Use self occupancy mask in the OFCE warp to prevent warping from or to self-occluded pixels, which can produce large errors and instability. This is a relaxation of the masked OFCE warp, where only out-of-bounds warps are masked.
+        self.use_self_occupancy_mask = bool(
+            _cfg_get(mb, "use_self_occupancy_mask", True)
+        )
+
+        # Settings for the photometric confidence settings
+        self.use_photometric_confidence = bool(
+            _cfg_get(mb, "use_photometric_confidence", True)
+        )
+        self.photometric_confidence_tau = float(
+            _cfg_get(mb, "photometric_confidence_tau", 0.25)
+        )
+
+        # Settings for inputs to the OFCE. Use either the photo for ofce and/or greyscale (since OFCE is an illumination model).
+        self.use_photo_for_ofce = bool(
+            _cfg_get(mb, "use_photo_for_ofce", True)
+        )
+
+        self.ofce_greyscale = bool(
+            _cfg_get(mb, "ofce_greyscale", True)
+        )
+
     @staticmethod
     def _normalise(img: torch.Tensor) -> torch.Tensor:
         if img.max() > 2.0:
@@ -861,7 +888,167 @@ class HQSFlowModelTFPort(nn.Module):
 
         valid = (qx >= 0) & (qx <= w - 1) & (qy >= 0) & (qy <= h - 1)
         return valid.float().unsqueeze(1)  # [B, 1, H, W]
-    
+
+    @staticmethod
+    def _photo_tensor(img: torch.Tensor) -> torch.Tensor:
+        """
+        Convert input image to [0, 1] photometric tensor.
+
+        This is intentionally different from the ImageNet Normalisation.
+        Feature encoders and correlation are trained on ImageNet-normalised features, but the OFCE is an illumination model that operates on raw photometric values, so we provide a separate normalisation here. This ensures that the residual magnitudes remain interpretable and consistent with the assumptions of the OFCE, even as the feature encoder architecture and training evolve.
+        """
+        if img.max() > 2.0:
+            img = img / 255.0
+        return img.clamp(0.0, 1.0)
+
+    @staticmethod
+    def _to_grayscale(img: torch.Tensor) -> torch.Tensor:
+        """Convert RGB image to grayscale using standard luminance formula."""
+        if img.shape[1] == 1:
+            return img  # Already grayscale
+        
+        coeffs = torch.tensor([0.299, 0.587, 0.114], device=img.device, dtype=img.dtype).view(1, 3, 1, 1)
+        gray = (img * coeffs).sum(dim=1, keepdim=True)
+        return gray
+
+    @staticmethod
+    def _resize_mask(
+        mask: torch.Tensor,
+        out_h: int,
+        out_w: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        """
+        Resize a validity / confidence mask to a pyramid level.
+
+        Accepts:
+            - None
+            - Tensor of shape [B, H, W]
+            - Tensor of shape [B, 1, H, W]
+            - Tensor of shape [B, C, H, W], which is averaged across channels to produce a single-channel mask.
+
+        Returns:
+            - None if input was None
+            - Tensor of shape [B, 1, out_h, out_w] in [0, 1] if input was a mask
+        """
+        if mask is None:
+            return None
+
+        if mask.ndim == 3:
+            mask = mask.unsqueeze(1)  # [B, 1, H, W]
+        elif mask.ndim != 4:
+            raise ValueError(f"mask must have shape [B, H, W] or [B, C, H, W], got {mask.shape}")
+
+        mask = mask.to(device=device, dtype=dtype)
+
+        if mask.ndim == 4 and mask.shape[1] > 1:
+            mask = mask.mean(dim=1, keepdim=True)  # Average across channels
+
+        # Handle uint8 masks with values in [0, 255].
+        if mask.max() > 2.0:
+            mask = mask / 255.0
+
+        mask = mask.clamp(0.0, 1.0)
+
+        mask = F.interpolate(
+            mask, 
+            size=(out_h, out_w), 
+            mode="bilinear", 
+            align_corners=True
+            )
+
+        return mask
+
+    def masked_warp_yx(
+            self,
+            x: torch.Tensor,
+            flow_yx: torch.Tensor,
+            target_valid: Optional[torch.Tensor] = None,
+            eps: float = 1e-6,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Validity aware backward warp.
+
+        For forward flow w_(1->2), this samples x2 at x + w(x).
+
+        If target_valid is provided, it must live in image-2 coordinates.
+        The function warps both:
+            target_valid
+            target_valid * x (to produce a masked feature map where invalid pixels are zeroed out)
+        
+        and returns an alpha-normalised warped image:
+
+            warp(target_valid*x) / (warp(target_valid) + eps)
+
+        This prevents masked target pixels from being blended into valid pixels by the warping operation.
+
+        Returns:
+            x_warp        : warped x with shape [B, C, H, W]
+            target_warp_valid : warped target_valid with shape [B, 1, H, W]
+            bounds_valid    : validity mask for warps that go out of bounds, shape [B, 1, H, W]
+        """
+        b, _, h, w = x.shape
+
+        bounds_valid = self._valid_warp_mask(flow_yx).to(device=x.device, dtype=x.dtype)
+
+        if target_valid is None:
+            x_warp = self._warp_yx(x, flow_yx)
+            return x_warp, bounds_valid, bounds_valid
+
+        target_valid = self._resize_mask(
+            target_valid,
+            out_h=h,
+            out_w=w,
+            device=x.device,
+            dtype=x.dtype,
+        )
+
+        target_warp_valid = self._warp_yx(target_valid, flow_yx)
+        target_warp_valid = (target_warp_valid * bounds_valid).clamp(0.0, 1.0)  # Ensure out-of-bounds warps are invalid.
+
+        numerator = self._warp_yx(x * target_valid, flow_yx)
+        denominator = target_warp_valid.clamp_min(eps)
+        x_warp = numerator / denominator
+        x_warp = torch.where(
+            target_warp_valid > eps,
+            x_warp,
+            torch.zeros_like(x_warp)
+        )
+
+        return x_warp, target_warp_valid, bounds_valid
+
+    @staticmethod
+    def build_target_valid_from_flow_yx(
+        flow_yx: torch.Tensor,
+        source_valid: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Build a target-frame coverage mask by forward splatting source validity through the forward flow.
+        
+        USE THIS WITH GROUND TRUTH FLOW during training / debugging.
+
+        flow_yx: [B, 2, H, W] forward flow from image 1 to image 2 in [dy, dx] order.
+        source_valid: [B, 1, H, W] or None. 1 means the frame-1 pixel is valid/matchable.
+
+        Returns:
+            target_valid: [B, 1, H, W], in image-2 coordinates. 1 means some valid source pixel maps to this target location.
+        """
+        if source_valid is None:
+            source_valid = torch.ones_like(flow_yx[:, :1])  # [B, 1, H, W]
+        elif source_valid.ndim == 3:
+            source_valid = source_valid.unsqueeze(1)  # [B, 1, H, W]
+
+        source_valid = source_valid.to(device=flow_yx.device, dtype=flow_yx.dtype).clamp(0.0, 1.0)
+
+        target_valid = HQSFlowModelTFPort.forward_splat(
+            src=source_valid,
+            flow_yx=flow_yx,
+            normalize=False,
+        )
+
+        return target_valid.clamp(0.0, 1.0)
+
     @staticmethod
     def forward_splat(
         src: torch.Tensor,
@@ -1081,8 +1268,55 @@ class HQSFlowModelTFPort(nn.Module):
         gy = 0.5 * (x[:, :, 2:, :] - x[:, :, :-2, :])
         return F.pad(gy, (0, 0, 1, 1), mode="replicate")
 
-    def compute_ofce_derivatives(self, i1: torch.Tensor, i2: torch.Tensor, flow_yx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        i2_warp = self._warp_yx(i2, flow_yx)
+    def compute_ofce_derivatives(
+            self,
+            i1: torch.Tensor,
+            i2: torch.Tensor,
+            flow_yx: torch.Tensor,
+            source_valid: Optional[torch.Tensor] = None,
+            target_valid: Optional[torch.Tensor] = None,
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        OFCE derivative computation with validity-aware warping.
+
+        For forward flow w_(1->2), we evaluate the OFCE residual at i2(x + w(x)) - i1(x).o
+
+        Returns: 
+            ix  : dI/dx at the evaluation point, shape [B, 1, H, W]
+            iy  : dI/dy at the evaluation point, shape [B, 1, H, W]
+            it  : dI/dt at the evaluation point, shape [B, 1, H, W]
+            i2_warp : the warped i2 at the evaluation point, shape [B, C, H, W]
+            data_valid : validity mask (in image 1 coords) for the OFCE data term at the evaluation point, shape [B, 1, H, W]
+
+        Important details:
+            - The OFCE residual is only valid at pixels where the warped i2 samples from valid target pixels. We compute a validity mask for the OFCE data term that identifies these pixels, which can be used to weight the data term in the HQS update to prevent corrupting the flow with target imaage occlusions, disocclusions and other invalid pixels.
+        """
+        b, _, h, w = i1.shape
+
+        if self.use_masked_ofce_warp:
+            i2_warp, target_warp_valid, bounds_valid = self.masked_warp_yx(
+                i2,
+                flow_yx,
+                target_valid=target_valid if self.use_self_occupancy_mask else None
+            )
+        else:
+            i2_warp = self._warp_yx(i2, flow_yx)
+            bounds_valid = self._valid_warp_mask(flow_yx).to(device=i1.device, dtype=i1.dtype)
+            target_warp_valid = bounds_valid  # If not using masked warp, we can only guarantee validity based on bounds.
+
+        source_valid = self._resize_mask(
+            source_valid,
+            out_h=h,
+            out_w=w,
+            device=i1.device,
+            dtype=i1.dtype,
+        )
+
+        if source_valid is None:
+            source_valid = torch.ones_like(bounds_valid)
+
+        data_valid = (bounds_valid * source_valid * target_warp_valid).clamp(0.0, 1.0)
+
         gx1 = self.central_grad_x(i1)
         gx2 = self.central_grad_x(i2_warp)
         gy1 = self.central_grad_y(i1)
@@ -1096,7 +1330,8 @@ class HQSFlowModelTFPort(nn.Module):
             ix = ix.mean(dim=1, keepdim=True)
             iy = iy.mean(dim=1, keepdim=True)
             it = it.mean(dim=1, keepdim=True)
-        return ix, iy, it, i2_warp
+
+        return ix, iy, it, i2_warp, data_valid
 
     @staticmethod
     def hqs_data_step(
@@ -1302,7 +1537,7 @@ class HQSFlowModelTFPort(nn.Module):
         scale = flow.new_tensor([sy, sx]).view(1, 2, 1, 1)
         return resized * scale
 
-    def photometric_confidence(self, it: torch.Tensor, tau: float = 0.05) -> torch.Tensor:
+    def photometric_confidence(self, it: torch.Tensor, tau: float = 0.25) -> torch.Tensor:
         """
         Soft mask confidence based from photometric residual, used to emulate occlusions.
         """
@@ -1314,6 +1549,8 @@ class HQSFlowModelTFPort(nn.Module):
         image2: torch.Tensor,
         iters: Optional[int] = None,
         flow_init: Optional[torch.Tensor] = None,
+        source_valid: Optional[torch.Tensor] = None,
+        target_valid: Optional[torch.Tensor] = None,
     ) -> Dict[str, List[torch.Tensor]]:
         iters = iters or self.num_hqs_iterations
         if iters > self.num_hqs_iterations:
@@ -1323,6 +1560,20 @@ class HQSFlowModelTFPort(nn.Module):
 
         i1 = self._normalise(image1)
         i2 = self._normalise(image2)
+
+        # Photometric tensors for OFCE/data term
+        # Remember these are deliberately NOT normalised according to ImageNet stats.
+        if self.use_photo_for_ofce:
+            i1_photo = self._photo_tensor(image1)
+            i2_photo = self._photo_tensor(image2)
+        else:
+            i1_photo = i1
+            i2_photo = i2
+
+        # If we are using the luminance model enabled in the config, then we need to convert to greyscale
+        if self.ofce_greyscale:
+            i1_photo = self._to_greyscale(i1_photo)
+            i2_photo = self._to_greyscale(i2_photo)
 
         feat1 = self.feature_encoder(i1)
         feat2 = self.feature_encoder(i2)
@@ -1334,8 +1585,26 @@ class HQSFlowModelTFPort(nn.Module):
         hidden_state = ctx["hidden_state"]
 
         b, _, h, w = f1.shape
-        i1_lvl = F.interpolate(i1, size=(h, w), mode="bilinear", align_corners=True)
-        i2_lvl = F.interpolate(i2, size=(h, w), mode="bilinear", align_corners=True)
+        # Update the OFCE tensors to the same resolution as the correlation features for the GRU updates.
+        i1_lvl = F.interpolate(i1_photo, size=(h, w), mode="bilinear", align_corners=True)
+        i2_lvl = F.interpolate(i2_photo, size=(h, w), mode="bilinear", align_corners=True)
+
+        source_valid_lvl = self._resize_mask(
+            source_valid,
+            out_h=h,
+            out_w=w,
+            device=i1.device,
+            dtype=i1.dtype,
+        ) if source_valid is not None else None
+
+        target_valid_lvl = self._resize_mask(
+            target_valid,
+            out_h=h,
+            out_w=w,
+            device=i1.device,
+            dtype=i1.dtype,
+        ) if target_valid is not None else None
+
         context_feat_lvl = F.interpolate(context_feat, size=(h, w), mode="bilinear", align_corners=False)
         hidden_lvl = F.interpolate(hidden_state, size=(h, w), mode="bilinear", align_corners=False)
 
@@ -1375,6 +1644,10 @@ class HQSFlowModelTFPort(nn.Module):
         delta_prior_lows: List[torch.Tensor] = []
         coupling_residual_lows: List[torch.Tensor] = []
         occupancy_masks: List[torch.Tensor] = []
+        data_valid_lows: List[torch.Tensor] = []
+        data_weight_lows: List[torch.Tensor] = []
+        data_reliability_lows: List[torch.Tensor] = []
+        matchability_lows: List[torch.Tensor] = []
 
         beta_schedule, lambda_schedule = self._hqs_penalties()
         correction_gates = self._correction_gates()
@@ -1395,73 +1668,180 @@ class HQSFlowModelTFPort(nn.Module):
             corr_feat_k = self.sample_all_pairs_corr_pyramid(corr_pyr, coords_query, radius=self.max_displacement)
             corr_feat_k_chw = corr_feat_k.permute(0, 3, 1, 2).contiguous()
 
+            ######### # HQS u-step: closed-form OFCE data minimisation.
+            ######### ix, iy, it, i2_warp = self.compute_ofce_derivatives(i1_lvl, i2_lvl, flow_yx)
+            ######### # Adjust our confidence based on the validity of the warp to prevent out-of-bounds pixels from destabilizing training.
+            ######### valid_k = self._valid_warp_mask(flow_yx)
 
-            # HQS u-step: closed-form OFCE data minimisation.
-            ix, iy, it, i2_warp = self.compute_ofce_derivatives(i1_lvl, i2_lvl, flow_yx)
-            # Adjust our confidence based on the validity of the warp to prevent out-of-bounds pixels from destabilizing training.
-            valid_k = self._valid_warp_mask(flow_yx)
+            ######### # Compute the per iteration forward splat to build occupancy masks.
+            ######### ones = torch.ones_like(flow_yx[:, :1, :, :])
+            ######### occupancy = self.forward_splat(ones, flow_yx, normalize=False)
+            ######### occupancy_mask = occupancy.clamp(0.0, 1.0)  # Optional: clamp to prevent extreme values from destabilizing training.
 
-            # Compute the per iteration forward splat to build occupancy masks.
-            ones = torch.ones_like(flow_yx[:, :1, :, :])
-            occupancy = self.forward_splat(ones, flow_yx, normalize=False)
-            occupancy_mask = occupancy.clamp(0.0, 1.0)  # Optional: clamp to prevent extreme values from destabilizing training.
+            ######### # Perform backwards warping of the occupancy mask to realign to image-1 coordinates.
+            ######### occupancy_mask_warped = self._warp_yx(occupancy_mask, flow_yx)
+            ######### occupancy_mask_warped = occupancy_mask_warped.clamp(0.0, 1.0)  # Optional: clamp to prevent extreme values from destabilizing training.
+            ######### occupancy_masks.append(occupancy_mask_warped.detach())
 
-            # Perform backwards warping of the occupancy mask to realign to image-1 coordinates.
-            occupancy_mask_warped = self._warp_yx(occupancy_mask, flow_yx)
-            occupancy_mask_warped = occupancy_mask_warped.clamp(0.0, 1.0)  # Optional: clamp to prevent extreme values from destabilizing training.
+            ######### # Per-iteration confidence from dedicated head (not the init decoder).
+            ######### conf_in = torch.cat([corr_feat_k_chw, flow_yx, ix, iy, it, valid_k], dim=1)
+
+            ######### confidence_k = self.iter_conf_head(conf_in)
+
+            ######### if self.use_photometric_confidence:
+                ######### photometric_conf_k = self.photometric_confidence(it, tau=self.photometric_confidence_tau)
+            ######### else:
+                ######### photometric_conf_k = torch.ones_like(it)
+
+            ######### confidence_k = confidence_k * valid_k * photometric_conf_k
+
+            ######### if self.use_data_reliability_mask:
+                ######### grad_mag = torch.sqrt(ix * ix + iy * iy + 1e-6)
+                ######### hqs_mag = torch.norm(flow_yx - aux_yx, dim=1, keepdim=True)
+                ######### flow_mag = torch.norm(flow_yx, dim=1, keepdim=True)
+
+                ######### rel_inputs = torch.cat(
+                    ######### [
+                        ######### it.abs(),
+                        ######### grad_mag,
+                        ######### valid_k,
+                        ######### confidence_k,
+                        ######### hqs_mag,
+                        ######### flow_mag,
+                    ######### ],
+                    ######### dim=1,
+                ######### )
+
+                ######### # Detach the inputs if you want the reliability head to learn
+                ######### # from these diagnostics without pushing gradients back through
+                ######### # the diagnostic construction itself.
+                ######### if self.detach_data_reliability_inputs:
+                    ######### rel_inputs = rel_inputs.detach()
+
+                ######### # IMPORTANT:
+                ######### # Do NOT detach data_reliability if you want the head to learn.
+                ######### data_reliability = self.data_reliability_head(rel_inputs)
+
+                ######### data_weight = valid_k * data_reliability
+            ######### else:
+                ######### data_reliability = valid_k
+                ######### data_weight = valid_k
+
+            ######### # Mask off the data_weight using the occupancy mask
+            ######### data_weight = occupancy_mask_warped * data_weight
+
+            ######### # Mask the OFCE coefficients before they enter the analytic data update.
+            ######### ix_data = ix 
+            ######### iy_data = iy 
+            ######### it_data = it
+
+            ######### confidence_k = confidence_k * data_weight.detach()
+
+            ######### flow_yx, _, _ = self.hqs_data_step(ix_data, iy_data, it_data, aux_yx, confidence_k, flow_yx, beta)
+
+            # ------------------------------------------------------------
+            # Leakage Safe OFCE Construction (Hopefully!)
+            # ------------------------------------------------------------
+
+            ix, iy, it, i2_warp, data_valid_k = self.compute_ofce_derivatives(
+                i1_lvl,
+                i2_lvl,
+                flow_yx,
+                source_valid=source_valid_lvl,
+                target_valid=target_valid_lvl,
+            )
+
+            # Optional (config-controlled - occupancy masks)
+            if self.use_self_occupancy_mask:
+                ones = torch.ones_like(flow_yx[:, :1])
+                occupancy = self.forward_splat(ones, flow_yx, normalize=False)
+                occupancy_mask = occupancy.clamp(0.0, 1.0)
+                occupancy_mask_warped = self._warp_yx(occupancy_mask, flow_yx).clamp(0.0, 1.0)
+            else:
+                occupancy_mask_warped = torch.ones_like(data_valid_k)
+
+            data_valid_k = (data_valid_k * occupancy_mask_warped).clamp(0.0, 1.0)
             occupancy_masks.append(occupancy_mask_warped.detach())
 
-            # Per-iteration confidence from dedicated head (not the init decoder).
-            conf_in = torch.cat([corr_feat_k_chw, flow_yx, ix, iy, it, valid_k], dim=1)
+            # Safe versions for learned branches
+            # Do NOT use these inside the weighted least squares data step unless you intentially want m^2/m^3 weighting.
+            # Use raw ix/iy/it + confidence for the analytic data step.
 
-            confidence_k = self.iter_conf_head(conf_in)
+            ix_safe = ix * data_valid_k
+            iy_safe = iy * data_valid_k
+            it_safe = it * data_valid_k
 
-            photometric_conf_k = self.photometric_confidence(it)
-            confidence_k = confidence_k * valid_k * photometric_conf_k
+            # --------------------------------------------------------------
+            # Matchability confidence
+            # --------------------------------------------------------------
+            conf_in = torch.cat([
+                corr_feat_k_chw,
+                flow_yx,
+                ix_safe,
+                iy_safe, 
+                it_safe,
+                data_valid_k,
+            ])
 
+            confidence_raw = self.iter_conf_head(conf_in)
+
+            if self.use_photometric_confidence:
+                photometric_conf_k = self.photometric_confidence(it_safe, tau=self.photometric_confidence_tau)
+                confidence_raw = confidence_raw * photometric_conf_k
+
+            matchability_lows.append(confidence_raw.detach())
+
+            confidence_masked = confidence_raw * data_valid_k
+
+            # ------------------------------------------------------------
+            # Data reliability weighting
+            # ------------------------------------------------------------
             if self.use_data_reliability_mask:
-                grad_mag = torch.sqrt(ix * ix + iy * iy + 1e-6)
+                grad_mag = torch.sqrt(ix_safe * ix_safe + iy_safe * iy_safe + 1e-6)
                 hqs_mag = torch.norm(flow_yx - aux_yx, dim=1, keepdim=True)
                 flow_mag = torch.norm(flow_yx, dim=1, keepdim=True)
 
                 rel_inputs = torch.cat(
                     [
-                        it.abs(),
+                        it_safe.abs(),
                         grad_mag,
-                        valid_k,
-                        confidence_k,
+                        data_valid_k,
+                        confidence_masked,
                         hqs_mag,
                         flow_mag,
                     ],
                     dim=1,
                 )
 
-                # Detach the inputs if you want the reliability head to learn
-                # from these diagnostics without pushing gradients back through
-                # the diagnostic construction itself.
                 if self.detach_data_reliability_inputs:
                     rel_inputs = rel_inputs.detach()
 
-                # IMPORTANT:
-                # Do NOT detach data_reliability if you want the head to learn.
                 data_reliability = self.data_reliability_head(rel_inputs)
+            else:                
+                data_reliability = torch.ones_like(data_valid_k)
 
-                data_weight = valid_k * data_reliability
-            else:
-                data_reliability = valid_k
-                data_weight = valid_k
+            data_weight = (data_valid_k * data_reliability).clamp(0.0, 1.0)
 
-            # Mask off the data_weight using the occupancy mask
-            data_weight = occupancy_mask_warped * data_weight
+            confidence_k = (confidence_raw * data_reliability).clamp(0.0, 1.0)
 
-            # Mask the OFCE coefficients before they enter the analytic data update.
-            ix_data = ix 
-            iy_data = iy 
-            it_data = it
+            data_valid_lows.append(data_valid_k.detach())
+            data_weight_lows.append(data_weight.detach())
+            data_reliability_lows.append(data_reliability.detach())
 
-            confidence_k = confidence_k * data_weight.detach()
+            # --------------------------------------------
+            # Analytic HQS data step
+            # --------------------------------------------
+            flow_yx, _, _ = self.hqs_data_step(
+                ix,
+                iy,
+                it,
+                aux_yx,
+                confidence_k,
+                flow_yx,
+                beta,
+            )
 
-            flow_yx, _, _ = self.hqs_data_step(ix_data, iy_data, it_data, aux_yx, confidence_k, flow_yx, beta)
+            # ------------------------------------------------------------
 
             if self.use_learned_prox_net:
                 # Use the learned prox network to predict the smoothed flow directly, rather than running the Jacobi iterations.
@@ -1471,21 +1851,6 @@ class HQSFlowModelTFPort(nn.Module):
                 aux_yx, _, _ = self.hqs_prox_step(
                     flow_yx, i1_lvl, beta, lam, validity_mask=data_weight, num_iter=self.prox_jacobi_iters
                 )
-
-            # Motion encoding: pack correlation, flow, and HQS coupling residual.
-            # Large residual (flow - aux) signals that data and prox disagree.
-            ################ OLD UPDATE
-            ################ hqs_resid = flow_yx - aux_yx
-            ################ motion_feat = self.motion_encoder(corr_feat_k_chw, flow_yx, hqs_resid, confidence_k)
-
-            ################ # ConvGRU update: stateful, so even/odd iterations are distinguishable.
-            ################ delta, mask_logits, net = self.update_unit(motion_feat, context_feat_lvl, net)
-
-            ################ # Apply learned correction, then re-establish the proximal coupling
-            ################ # variable by re-running prox on the corrected flow (Option B).
-            ################ # This ensures the next data-step anchors to prox(u_corrected)
-            ################ # rather than the drifted aux + delta.
-            ################ flow_yx = flow_yx + correction_gates[k] * delta
 
             hqs_resid = flow_yx - aux_yx
 
@@ -1516,8 +1881,8 @@ class HQSFlowModelTFPort(nn.Module):
                 # --------------------------------------------------------
 
                 prior_confidence_k = confidence_k
-                prior_it_k = it_data
-                prior_valid_k = valid_k
+                prior_it_k = it_safe
+                prior_valid_k = data_valid_k
 
                 if self.detach_reliability_inputs:
                     prior_confidence_k = prior_confidence_k.detach()
@@ -1541,8 +1906,8 @@ class HQSFlowModelTFPort(nn.Module):
                 gate_flow = flow_yx
                 gate_resid = hqs_resid
                 gate_conf = confidence_k
-                gate_it = it_data
-                gate_valid = valid_k
+                gate_it = it_safe
+                gate_valid = data_valid_k
 
                 if self.detach_reliability_inputs:
                     gate_flow = gate_flow.detach()
@@ -1617,8 +1982,25 @@ class HQSFlowModelTFPort(nn.Module):
             flow_l1 = self.convex_transition_upsample_yx(flow_yx, f1, f1_l1, f2_l1)
             aux_l1 = self.convex_transition_upsample_yx(aux_yx, f1, f1_l1, f2_l1)
 
-            i1_l1 = F.interpolate(i1, size=(h1, w1), mode="bilinear", align_corners=True)
-            i2_l1 = F.interpolate(i2, size=(h1, w1), mode="bilinear", align_corners=True)
+            i1_l1 = F.interpolate(i1_photo, size=(h1, w1), mode="bilinear", align_corners=True)
+            i2_l1 = F.interpolate(i2_photo, size=(h1, w1), mode="bilinear", align_corners=True)
+
+            source_valid_l1 = self._resize_mask(
+                source_valid,
+                out_h=h1,
+                out_w=w1,
+                device=i1_photo.device,
+                dtype=i1_photo.dtype,
+            ) if source_valid is not None else None
+
+            target_valid_l1 = self._resize_mask(
+                target_valid,
+                out_h=h1,
+                out_w=w1,
+                device=i1_photo.device,
+                dtype=i1_photo.dtype,
+            ) if target_valid is not None else None
+
             context_l1 = F.interpolate(context_feat, size=(h1, w1), mode="bilinear", align_corners=False)
             net_l1 = F.interpolate(net, size=(h1, w1), mode="bilinear", align_corners=False)
 
@@ -1650,70 +2032,161 @@ class HQSFlowModelTFPort(nn.Module):
                 )
                 corr_feat_l1_chw = corr_feat_l1.permute(0, 3, 1, 2).contiguous()
 
-                ix, iy, it, _ = self.compute_ofce_derivatives(i1_l1, i2_l1, flow_l1)
+                ######### ix, iy, it, _ = self.compute_ofce_derivatives(i1_l1, i2_l1, flow_l1)
                 
-                valid_l1 = self._valid_warp_mask(flow_l1)
+                ######### valid_l1 = self._valid_warp_mask(flow_l1)
 
-                # Compute the per iteration forward splat to build occupancy masks.
-                ones = torch.ones_like(flow_l1[:, :1, :, :])
-                occupancy = self.forward_splat(ones, flow_l1, normalize=False)
-                occupancy_mask = occupancy.clamp(0.0, 1.0)  # Optional: clamp to prevent extreme values from destabilizing training.
+                ######### # Compute the per iteration forward splat to build occupancy masks.
+                ######### ones = torch.ones_like(flow_l1[:, :1, :, :])
+                ######### occupancy = self.forward_splat(ones, flow_l1, normalize=False)
+                ######### occupancy_mask = occupancy.clamp(0.0, 1.0)  # Optional: clamp to prevent extreme values from destabilizing training.
 
-                # Perform backwards warping of the occupancy mask to realign to image-1 coordinates.
-                occupancy_mask_warped = self._warp_yx(occupancy_mask, flow_l1)
-                occupancy_mask_warped = occupancy_mask_warped.clamp(0.0, 1.0)  # Optional: clamp to prevent extreme values from destabilizing training.
+                ######### # Perform backwards warping of the occupancy mask to realign to image-1 coordinates.
+                ######### occupancy_mask_warped = self._warp_yx(occupancy_mask, flow_l1)
+                ######### occupancy_mask_warped = occupancy_mask_warped.clamp(0.0, 1.0)  # Optional: clamp to prevent extreme values from destabilizing training.
+                ######### occupancy_masks.append(occupancy_mask_warped.detach())
+
+                ######### if self.use_photometric_confidence:
+                    ######### photometric_conf_l1 = self.photometric_confidence(it, tau=self.photometric_confidence_tau)
+                ######### else:
+                    ######### photometric_conf_l1 = torch.ones_like(it)
+
+                ######### conf_in = torch.cat([corr_feat_l1_chw, flow_l1, ix, iy, it, valid_l1], dim=1)
+                ######### confidence_l1 = self.iter_conf_head(conf_in)
+                ######### confidence_l1 = confidence_l1 * valid_l1 * photometric_conf_l1
+
+                ######### if self.use_data_reliability_mask:
+                    ######### grad_mag = torch.sqrt(ix * ix + iy * iy + 1e-6)
+                    ######### hqs_mag = torch.norm(flow_l1 - aux_l1, dim=1, keepdim=True)
+                    ######### flow_mag = torch.norm(flow_l1, dim=1, keepdim=True)
+
+                    ######### rel_inputs = torch.cat(
+                        ######### [
+                            ######### it.abs(),
+                            ######### grad_mag,
+                            ######### valid_l1,
+                            ######### confidence_l1,
+                            ######### hqs_mag,
+                            ######### flow_mag,
+                        ######### ],
+                        ######### dim=1,
+                    ######### )
+
+                    ######### # Detach the inputs if you want the reliability head to learn
+                    ######### # from these diagnostics without pushing gradients back through
+                    ######### # the diagnostic construction itself.
+                    ######### if self.detach_data_reliability_inputs:
+                        ######### rel_inputs = rel_inputs.detach()
+
+                    ######### # IMPORTANT:
+                    ######### # Do NOT detach data_reliability if you want the head to learn.
+                    ######### data_reliability = self.data_reliability_head(rel_inputs)
+
+                    ######### data_weight = valid_l1 * data_reliability
+                ######### else:
+                    ######### data_reliability = valid_l1
+                    ######### data_weight = valid_l1
+
+                ######### # Mask off the data_weight using the occupancy mask
+                ######### data_weight = occupancy_mask_warped * data_weight
+
+                ######### # Mask the OFCE coefficients before they enter the analytic data update.
+                ######### ix_data = ix 
+                ######### iy_data = iy
+                ######### it_data = it
+
+                ######### confidence_l1 = confidence_l1 * data_weight.detach()
+
+                ######### flow_l1, _, _ = self.hqs_data_step(
+                    ######### ix_data, iy_data, it_data, aux_l1, confidence_l1, flow_l1, beta
+                ######### )
+
+                # ------------------------------------------------------------
+                # Leakage Safe OFCE Construction (Hopefully!) at level 1
+                # ------------------------------------------------------------
+                ix, iy, it, i2_warp, data_valid_l1 = self.compute_ofce_derivatives(
+                    i1_l1,
+                    i2_l1,
+                    flow_l1,
+                    source_valid=source_valid_l1,
+                    target_valid=target_valid_l1,
+                )
+
+                if self.use_self_occupancy_mask:
+                    ones = torch.ones_like(flow_l1[:, :1])
+                    occupancy = self.forward_splat(ones, flow_l1, normalize=False)
+                    occupancy_mask = occupancy.clamp(0.0, 1.0)
+                    occupancy_mask_warped = self._warp_yx(occupancy_mask, flow_l1).clamp(0.0, 1.0)
+                else:
+                    occupancy_mask_warped = torch.ones_like(data_valid_l1)
+
+                data_valid_l1 = (data_valid_l1 * occupancy_mask_warped).clamp(0.0, 1.0)
                 occupancy_masks.append(occupancy_mask_warped.detach())
 
-                photometric_conf_l1 = self.photometric_confidence(it)
-                conf_in = torch.cat([corr_feat_l1_chw, flow_l1, ix, iy, it, valid_l1], dim=1)
-                confidence_l1 = self.iter_conf_head(conf_in)
-                confidence_l1 = confidence_l1 * valid_l1 * photometric_conf_l1
+                ix_safe = ix * data_valid_l1
+                iy_safe = iy * data_valid_l1
+                it_safe = it * data_valid_l1
+
+                conf_in = torch.cat([
+                    corr_feat_l1_chw,
+                    flow_l1,
+                    ix_safe,
+                    iy_safe,
+                    it_safe,
+                    data_valid_l1,
+                ], dim=1)
+
+                confidence_raw_l1 = self.iter_conf_head(conf_in)
+
+                if self.use_photometric_confidence:
+                    photometric_conf_l1 = self.photometric_confidence(it_safe, tau=self.photometric_confidence_tau)
+                    confidence_raw_l1 = confidence_raw_l1 * photometric_conf_l1
+
+                matchability_lows.append(confidence_raw_l1.detach())
+                confidence_masked_l1 = confidence_raw_l1 * data_valid_l1
 
                 if self.use_data_reliability_mask:
-                    grad_mag = torch.sqrt(ix * ix + iy * iy + 1e-6)
+                    grad_mag = torch.sqrt(ix_safe * ix_safe + iy_safe * iy_safe + 1e-6)
                     hqs_mag = torch.norm(flow_l1 - aux_l1, dim=1, keepdim=True)
                     flow_mag = torch.norm(flow_l1, dim=1, keepdim=True)
 
                     rel_inputs = torch.cat(
                         [
-                            it.abs(),
+                            it_safe.abs(),
                             grad_mag,
-                            valid_l1,
-                            confidence_l1,
+                            data_valid_l1,
+                            confidence_masked_l1,
                             hqs_mag,
                             flow_mag,
                         ],
                         dim=1,
                     )
 
-                    # Detach the inputs if you want the reliability head to learn
-                    # from these diagnostics without pushing gradients back through
-                    # the diagnostic construction itself.
                     if self.detach_data_reliability_inputs:
                         rel_inputs = rel_inputs.detach()
 
-                    # IMPORTANT:
-                    # Do NOT detach data_reliability if you want the head to learn.
-                    data_reliability = self.data_reliability_head(rel_inputs)
-
-                    data_weight = valid_l1 * data_reliability
+                    data_reliability_l1 = self.data_reliability_head(rel_inputs)
                 else:
-                    data_reliability = valid_l1
-                    data_weight = valid_l1
+                    data_reliability_l1 = torch.ones_like(data_valid_l1)
 
-                # Mask off the data_weight using the occupancy mask
-                data_weight = occupancy_mask_warped * data_weight
+                data_weight = (data_valid_l1 * data_reliability_l1).clamp(0.0, 1.0)
+                confidence_l1 = (confidence_raw_l1 * data_reliability_l1).clamp(0.0, 1.0)
 
-                # Mask the OFCE coefficients before they enter the analytic data update.
-                ix_data = ix 
-                iy_data = iy
-                it_data = it
-
-                confidence_l1 = confidence_l1 * data_weight.detach()
+                data_valid_lows.append(data_valid_l1.detach())
+                data_weight_lows.append(data_weight.detach())
+                data_reliability_lows.append(data_reliability_l1.detach())
 
                 flow_l1, _, _ = self.hqs_data_step(
-                    ix_data, iy_data, it_data, aux_l1, confidence_l1, flow_l1, beta
+                    ix,
+                    iy,
+                    it,
+                    aux_l1,
+                    confidence_l1,
+                    flow_l1,
+                    beta,
                 )
+
+                # ------------------------------------------------------------
 
                 if self.use_learned_prox_net:
                     # Use the learned prox network to predict the smoothed flow directly, rather than running the Jacobi iterations.
@@ -1753,8 +2226,8 @@ class HQSFlowModelTFPort(nn.Module):
 
                 if self.use_split_delta_update:
                     prior_confidence_l1 = confidence_l1
-                    prior_it_l1 = it_data
-                    prior_valid_l1 = valid_l1
+                    prior_it_l1 = it_safe
+                    prior_valid_l1 = data_valid_l1
 
                     if self.detach_reliability_inputs:
                         prior_confidence_l1 = prior_confidence_l1.detach()
@@ -1778,8 +2251,8 @@ class HQSFlowModelTFPort(nn.Module):
                     gate_flow_l1 = flow_l1
                     gate_resid_l1 = hqs_resid_l1
                     gate_conf_l1 = confidence_l1
-                    gate_it_l1 = it_data
-                    gate_valid_l1 = valid_l1
+                    gate_it_l1 = it_safe
+                    gate_valid_l1 = data_valid_l1
 
                     if self.detach_reliability_inputs:
                         gate_flow_l1 = gate_flow_l1.detach()
@@ -1881,6 +2354,10 @@ class HQSFlowModelTFPort(nn.Module):
             "delta_prior_low": delta_prior_lows,
             "data_reliability_low": data_reliability.detach() if self.use_data_reliability_mask else None,
             "occupancy_masks": occupancy_masks,
+            "data_valid_lows": data_valid_lows,
+            "data_weight_lows": data_weight_lows,
+            "data_reliability_lows": data_reliability_lows,
+            "matchability_lows": matchability_lows,
         }
 
     def param_count(self) -> Dict[str, int]:

@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 from torch.utils.data import DataLoader
@@ -47,6 +48,7 @@ from models import build_model
 from losses import HQSFlowLoss
 from data import build_dataset, build_dataloader
 from utils import compute_metrics, aggregate_metrics, flow_to_color, InputPadder
+from hqs_pytorch.customML.customModels.HQSFlowModelTFPort import HQSFlowModelTFPort
 
 logger = logging.getLogger(__name__)
 
@@ -626,6 +628,68 @@ class Trainer:
                 import wandb
                 wandb.finish()
 
+    # ────────────────────────────────────────────────────────────────────── #
+    # Build Oracle masks for debugging target image leakage problem
+    # ────────────────────────────────────────────────────────────────────── #
+
+    def build_oracle_source_target_masks(
+            flow_gt_xy: torch.Tensor,
+            valid: Optional[torch.Tensor] = None,
+            occlusion: Optional[torch.Tensor] = None,
+            invalid: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Build source_valid and target_valid masks based on ground truth flow, for debugging leakage of target image information into the model.
+
+        flow_gt_xy: (B, 2, H, W) ground truth flow in pixel units with (x, y) order
+        valid: (B, H, W) or (B, 1, H, W) optional mask of valid flow pixels (1 for valid, 0 for invalid)
+        occlusion: (B, H, W) or (B, 1, H, W) optional mask of occluded pixels (1 for occluded/unmatachable from frame 1 to frame 2, 0 for non-occluded)
+        invalid: (B, H, W) or (B, 1, H, W) optional mask of invalid pixels (1 for invalid, 0 for valid)
+
+        Returns:
+            source_valid: (B, 1, H, W) boolean mask of pixels in source image that have valid, non-occluded correspondences in target image
+            target_valid: (B, 1, H, W) boolean mask of pixels in target image that are valid targets for the model to match to (i.e. not occluded and not invalid)
+        """
+        if flow_gt_xy.ndim != 4 or flow_gt_xy.shape[1] != 2:
+            raise ValueError(f"Expected flow_gt_xy shape (B, 2, H, W), got {flow_gt_xy.shape}")
+
+        device = flow_gt_xy.device
+        dtype = flow_gt_xy.dtype
+        b, _, h, w = flow_gt_xy.shape
+
+        def prep_mask(mask, default_value):
+            if mask is None:
+                return torch.full((b, 1, h, w), default_value, dtype=dtype, device=device)
+            if mask.ndim == 3:
+                mask = mask.unsqueeze(1)
+            mask = mask.to(dtype=dtype, device=device)
+            if mask.max() > 1.5:  # Assume binary mask is in {0, 255} format
+                mask = mask / 255.0
+            if mask.shape[-2:] != (h, w):
+                mask = F.interpolate(mask, size=(h, w), mode="nearest")
+            if mask.shape[1] != 1:
+                mask = mask.mean(dim=1, keepdim=True)
+            return mask.clamp(0.0, 1.0)
+
+        valid = prep_mask(valid, default_value=1.0)
+        occlusion = prep_mask(occlusion, default_value=0.0)
+        invalid = prep_mask(invalid, default_value=0.0)
+
+        # Convert [dx, dy] flow to our internal [dy, dx]
+        flow_gt_yx = torch.stack([flow_gt_xy[:, 1], flow_gt_xy[:, 0]], dim=1)
+
+        bounds = HQSFlowModelTFPort._valid_warp_mask(flow_gt_yx).to(device=device, dtype=dtype)
+
+        # Source-valid mask in frame-1 coordinates
+        source_valid = valid * (1.0 - occlusion) * (1.0 - invalid) * bounds
+        source_valid = source_valid.clamp(0.0, 1.0)
+
+        # Target-valid mask in frame-2 coordinates
+        # Pixels in image2 not reached by any valid source pixel are newly visible
+        target_valid = HQSFlowModelTFPort.forward_splat(source_valid, flow_gt_yx, normalized=False).clamp(0.0, 1.0)
+
+        return source_valid, target_valid
+
     # ─────────────────────────────────────────────────────────────────────── #
     # Single training step
     # ─────────────────────────────────────────────────────────────────────── #
@@ -640,8 +704,22 @@ class Trainer:
         occ_batch = batch.get("occlusion")
         inv_batch = batch.get("invalid")
 
+        # ---- Build oracle masks for debugging target image leakage ----
+        # DEBUGGING ORACLE MASKS!
+        # --------------------------------------------------
+
+        source_valid, target_valid = self.build_oracle_source_target_masks(
+            flow_gt_xy=flow,
+            valid=valid,
+            occlusion=occ_batch,
+            invalid=inv_batch,
+        )
+
+        # --------------------------------------------------
+
         with torch.autocast(device_type=self.device.type, enabled=self._use_amp):
-            out       = self.model(img1, img2)
+            # out       = self.model(img1, img2)
+            out       = self.model(img1, img2, source_valid=source_valid, target_valid=target_valid)
             loss_dict = self.criterion(
                 out["flow_preds"], flow, valid, img1, img2, model_outputs=out
             )
@@ -721,6 +799,15 @@ class Trainer:
                 occ_batch = batch.get("occlusion")  # (B, H, W) tensor or None
                 inv_batch = batch.get("invalid")
 
+                # Build oracle masks for debugging target image leakage, if occlusion/invalid masks are present
+                # DEBUGGING ORACLE MASKS!
+                source_valid, target_valid = self.build_oracle_source_target_masks(
+                    flow_gt_xy=flow,
+                    valid=valid,
+                    occlusion=occ_batch,
+                    invalid=inv_batch,
+                )
+
                 if occ_batch is None and not self._warned_missing_occ_masks:
                     logger.warning(
                         "Validation batches do not include occlusion masks; "
@@ -733,7 +820,7 @@ class Trainer:
                 img1, img2 = padder.pad(img1, img2)
 
                 with torch.autocast(device_type=self.device.type, enabled=self._use_amp):
-                    out  = self.model(img1, img2)
+                    out  = self.model(img1, img2, source_valid=source_valid, target_valid=target_valid)
                 pred = padder.unpad(out["flow_preds"][-1])
 
                 for b in range(img1.shape[0]):
