@@ -687,7 +687,7 @@ class Trainer:
 
         # Target-valid mask in frame-2 coordinates
         # Pixels in image2 not reached by any valid source pixel are newly visible
-        target_valid = HQSFlowModelTFPort.forward_splat(source_valid, flow_gt_yx, normalized=False).clamp(0.0, 1.0)
+        target_valid = HQSFlowModelTFPort.forward_splat(source_valid, flow_gt_yx, normalize=False).clamp(0.0, 1.0)
 
         return source_valid, target_valid
 
