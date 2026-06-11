@@ -633,6 +633,7 @@ class Trainer:
     # ────────────────────────────────────────────────────────────────────── #
 
     def build_oracle_source_target_masks(
+            self,
             flow_gt_xy: torch.Tensor,
             valid: Optional[torch.Tensor] = None,
             occlusion: Optional[torch.Tensor] = None,
