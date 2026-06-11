@@ -280,6 +280,31 @@ def _resize_flow_like(flow: torch.Tensor, out_h: int, out_w: int) -> torch.Tenso
     return out
 
 
+def _resize_stage_tensor(stage: torch.Tensor, out_h: int, out_w: int) -> torch.Tensor:
+    """Resize a CHW or HW diagnostic tensor to target spatial size."""
+    if stage.ndim == 2:
+        stage = stage.unsqueeze(0)
+    if stage.ndim != 3:
+        raise ValueError(f"Expected stage tensor with shape [H,W] or [C,H,W], got {list(stage.shape)}")
+    if stage.shape[-2:] == (out_h, out_w):
+        return stage
+    return F.interpolate(stage.unsqueeze(0), size=(out_h, out_w), mode="bilinear", align_corners=True).squeeze(0)
+
+
+def _stage_mean_value(stage_np: np.ndarray, out_h: int, out_w: int) -> float:
+    stage = _resize_stage_tensor(torch.from_numpy(stage_np), out_h, out_w)
+    return float(stage.mean().item())
+
+
+def _stage_mean_vector_norm(stage_np: np.ndarray, out_h: int, out_w: int) -> float:
+    stage = _resize_stage_tensor(torch.from_numpy(stage_np), out_h, out_w)
+    if stage.shape[0] >= 2:
+        norm = torch.sqrt((stage[:2] ** 2).sum(dim=0))
+    else:
+        norm = stage[0].abs()
+    return float(norm.mean().item())
+
+
 def _warp_xy(img: torch.Tensor, flow_xy: torch.Tensor) -> torch.Tensor:
     """Warp image with flow in [dx, dy] order."""
     b, _, h, w = img.shape
@@ -332,6 +357,14 @@ def _compute_iteration_metrics_np(
     aux_stages: Optional[List[np.ndarray]] = None,
     delta_stages: Optional[List[np.ndarray]] = None,
     coupling_stages: Optional[List[np.ndarray]] = None,
+    alpha_stages: Optional[List[np.ndarray]] = None,
+    delta_match_stages: Optional[List[np.ndarray]] = None,
+    delta_prior_stages: Optional[List[np.ndarray]] = None,
+    occupancy_stages: Optional[List[np.ndarray]] = None,
+    data_valid_stages: Optional[List[np.ndarray]] = None,
+    data_weight_stages: Optional[List[np.ndarray]] = None,
+    data_reliability_stages: Optional[List[np.ndarray]] = None,
+    matchability_stages: Optional[List[np.ndarray]] = None,
 ) -> Dict[str, List[float]]:
     flow_gt_t = torch.from_numpy(flow_gt)
     valid_t = torch.from_numpy(valid).bool()
@@ -343,6 +376,14 @@ def _compute_iteration_metrics_np(
     update_norm_list: List[float] = []
     w_minus_q_norm_list: List[float] = []
     delta_norm_list: List[float] = []
+    alpha_mean_list: List[float] = []
+    delta_match_norm_list: List[float] = []
+    delta_prior_norm_list: List[float] = []
+    occupancy_mean_list: List[float] = []
+    data_valid_mean_list: List[float] = []
+    data_weight_mean_list: List[float] = []
+    data_reliability_mean_list: List[float] = []
+    matchability_mean_list: List[float] = []
 
     prev_flow: Optional[torch.Tensor] = None
     for k, flow_k_np in enumerate(flow_stages):
@@ -384,6 +425,47 @@ def _compute_iteration_metrics_np(
         else:
             w_minus_q_norm_list.append(float("nan"))
 
+        out_h, out_w = flow_gt_t.shape[-2], flow_gt_t.shape[-1]
+        if alpha_stages is not None and k < len(alpha_stages):
+            alpha_mean_list.append(_stage_mean_value(alpha_stages[k], out_h, out_w))
+        else:
+            alpha_mean_list.append(float("nan"))
+
+        if delta_match_stages is not None and k < len(delta_match_stages):
+            delta_match_norm_list.append(_stage_mean_vector_norm(delta_match_stages[k], out_h, out_w))
+        else:
+            delta_match_norm_list.append(float("nan"))
+
+        if delta_prior_stages is not None and k < len(delta_prior_stages):
+            delta_prior_norm_list.append(_stage_mean_vector_norm(delta_prior_stages[k], out_h, out_w))
+        else:
+            delta_prior_norm_list.append(float("nan"))
+
+        if occupancy_stages is not None and k < len(occupancy_stages):
+            occupancy_mean_list.append(_stage_mean_value(occupancy_stages[k], out_h, out_w))
+        else:
+            occupancy_mean_list.append(float("nan"))
+
+        if data_valid_stages is not None and k < len(data_valid_stages):
+            data_valid_mean_list.append(_stage_mean_value(data_valid_stages[k], out_h, out_w))
+        else:
+            data_valid_mean_list.append(float("nan"))
+
+        if data_weight_stages is not None and k < len(data_weight_stages):
+            data_weight_mean_list.append(_stage_mean_value(data_weight_stages[k], out_h, out_w))
+        else:
+            data_weight_mean_list.append(float("nan"))
+
+        if data_reliability_stages is not None and k < len(data_reliability_stages):
+            data_reliability_mean_list.append(_stage_mean_value(data_reliability_stages[k], out_h, out_w))
+        else:
+            data_reliability_mean_list.append(float("nan"))
+
+        if matchability_stages is not None and k < len(matchability_stages):
+            matchability_mean_list.append(_stage_mean_value(matchability_stages[k], out_h, out_w))
+        else:
+            matchability_mean_list.append(float("nan"))
+
         prev_flow = flow_k
 
     return {
@@ -392,6 +474,14 @@ def _compute_iteration_metrics_np(
         "mean_update_norm": update_norm_list,
         "mean_w_minus_q_norm": w_minus_q_norm_list,
         "mean_delta_norm": delta_norm_list,
+        "mean_alpha": alpha_mean_list,
+        "mean_delta_match_norm": delta_match_norm_list,
+        "mean_delta_prior_norm": delta_prior_norm_list,
+        "mean_occupancy": occupancy_mean_list,
+        "mean_data_valid": data_valid_mean_list,
+        "mean_data_weight": data_weight_mean_list,
+        "mean_data_reliability": data_reliability_mean_list,
+        "mean_matchability": matchability_mean_list,
     }
 
 
@@ -470,6 +560,14 @@ def _save_qualitative_panels(
     flow_stages: List[np.ndarray],
     delta_stages: Optional[List[np.ndarray]],
     coupling_stages: Optional[List[np.ndarray]],
+    alpha_stages: Optional[List[np.ndarray]] = None,
+    delta_match_stages: Optional[List[np.ndarray]] = None,
+    delta_prior_stages: Optional[List[np.ndarray]] = None,
+    occupancy_stages: Optional[List[np.ndarray]] = None,
+    data_valid_stages: Optional[List[np.ndarray]] = None,
+    data_weight_stages: Optional[List[np.ndarray]] = None,
+    data_reliability_stages: Optional[List[np.ndarray]] = None,
+    matchability_stages: Optional[List[np.ndarray]] = None,
 ) -> Dict[str, str]:
     import cv2
     import matplotlib
@@ -540,6 +638,37 @@ def _save_qualitative_panels(
         plt.savefig(out_path, dpi=120, bbox_inches="tight")
         plt.close()
 
+    def _save_scalar_stage_grid(
+        scalar_list: List[np.ndarray],
+        out_path: Path,
+        title_prefix: str,
+        cmap: str = "viridis",
+        vmin: Optional[float] = None,
+        vmax: Optional[float] = None,
+    ) -> None:
+        K = len(scalar_list)
+        cols = min(4, K)
+        rows = int(math.ceil(K / cols))
+        fig, axes = plt.subplots(rows, cols, figsize=(4.2 * cols, 3.8 * rows))
+        axes_arr = np.array(axes).reshape(-1)
+
+        for i, arr in enumerate(scalar_list):
+            ax = axes_arr[i]
+            t = _resize_stage_tensor(torch.from_numpy(arr), flow_gt_t.shape[-2], flow_gt_t.shape[-1])
+            if t.shape[0] > 1:
+                t = t.mean(dim=0, keepdim=True)
+            im = ax.imshow(t[0].numpy(), cmap=cmap, vmin=vmin, vmax=vmax)
+            ax.set_title(f"{title_prefix} {i + 1}")
+            ax.axis("off")
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+        for j in range(K, len(axes_arr)):
+            axes_arr[j].axis("off")
+
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=120, bbox_inches="tight")
+        plt.close()
+
     flow_stage_path = out_dir / f"{sample_id}_flow_stages.png"
     _save_stage_grid(flow_stages, flow_stage_path, "w^k")
 
@@ -551,6 +680,38 @@ def _save_qualitative_panels(
     if coupling_stages is not None and len(coupling_stages) > 0:
         _save_stage_grid(coupling_stages, coupling_path, "w^k-q^k")
 
+    delta_match_path = out_dir / f"{sample_id}_delta_match_stages.png"
+    if delta_match_stages is not None and len(delta_match_stages) > 0:
+        _save_stage_grid(delta_match_stages, delta_match_path, "delta_match")
+
+    delta_prior_path = out_dir / f"{sample_id}_delta_prior_stages.png"
+    if delta_prior_stages is not None and len(delta_prior_stages) > 0:
+        _save_stage_grid(delta_prior_stages, delta_prior_path, "delta_prior")
+
+    alpha_path = out_dir / f"{sample_id}_alpha_stages.png"
+    if alpha_stages is not None and len(alpha_stages) > 0:
+        _save_scalar_stage_grid(alpha_stages, alpha_path, "alpha", cmap="magma", vmin=0.0, vmax=1.0)
+
+    occupancy_path = out_dir / f"{sample_id}_occupancy_stages.png"
+    if occupancy_stages is not None and len(occupancy_stages) > 0:
+        _save_scalar_stage_grid(occupancy_stages, occupancy_path, "occupancy", cmap="cividis", vmin=0.0, vmax=1.0)
+
+    data_valid_path = out_dir / f"{sample_id}_data_valid_stages.png"
+    if data_valid_stages is not None and len(data_valid_stages) > 0:
+        _save_scalar_stage_grid(data_valid_stages, data_valid_path, "data_valid", cmap="cividis", vmin=0.0, vmax=1.0)
+
+    data_weight_path = out_dir / f"{sample_id}_data_weight_stages.png"
+    if data_weight_stages is not None and len(data_weight_stages) > 0:
+        _save_scalar_stage_grid(data_weight_stages, data_weight_path, "data_weight", cmap="cividis", vmin=0.0, vmax=1.0)
+
+    data_reliability_path = out_dir / f"{sample_id}_data_reliability_stages.png"
+    if data_reliability_stages is not None and len(data_reliability_stages) > 0:
+        _save_scalar_stage_grid(data_reliability_stages, data_reliability_path, "data_reliability", cmap="magma", vmin=0.0, vmax=1.0)
+
+    matchability_path = out_dir / f"{sample_id}_matchability_stages.png"
+    if matchability_stages is not None and len(matchability_stages) > 0:
+        _save_scalar_stage_grid(matchability_stages, matchability_path, "matchability", cmap="magma", vmin=0.0, vmax=1.0)
+
     paths = {
         "overview": str(overview_path),
         "flow_stages": str(flow_stage_path),
@@ -559,6 +720,22 @@ def _save_qualitative_panels(
         paths["delta_stages"] = str(delta_path)
     if coupling_path.exists():
         paths["coupling_stages"] = str(coupling_path)
+    if delta_match_path.exists():
+        paths["delta_match_stages"] = str(delta_match_path)
+    if delta_prior_path.exists():
+        paths["delta_prior_stages"] = str(delta_prior_path)
+    if alpha_path.exists():
+        paths["alpha_stages"] = str(alpha_path)
+    if occupancy_path.exists():
+        paths["occupancy_stages"] = str(occupancy_path)
+    if data_valid_path.exists():
+        paths["data_valid_stages"] = str(data_valid_path)
+    if data_weight_path.exists():
+        paths["data_weight_stages"] = str(data_weight_path)
+    if data_reliability_path.exists():
+        paths["data_reliability_stages"] = str(data_reliability_path)
+    if matchability_path.exists():
+        paths["matchability_stages"] = str(matchability_path)
     return paths
 
 
@@ -582,6 +759,14 @@ def _process_sample_task(task: Dict[str, Any]) -> Dict[str, Any]:
     aux_stages_np: Optional[List[np.ndarray]] = task.get("aux_stages")
     delta_stages_np: Optional[List[np.ndarray]] = task.get("delta_stages")
     coupling_stages_np: Optional[List[np.ndarray]] = task.get("coupling_stages")
+    alpha_stages_np: Optional[List[np.ndarray]] = task.get("alpha_stages")
+    delta_match_stages_np: Optional[List[np.ndarray]] = task.get("delta_match_stages")
+    delta_prior_stages_np: Optional[List[np.ndarray]] = task.get("delta_prior_stages")
+    occupancy_stages_np: Optional[List[np.ndarray]] = task.get("occupancy_stages")
+    data_valid_stages_np: Optional[List[np.ndarray]] = task.get("data_valid_stages")
+    data_weight_stages_np: Optional[List[np.ndarray]] = task.get("data_weight_stages")
+    data_reliability_stages_np: Optional[List[np.ndarray]] = task.get("data_reliability_stages")
+    matchability_stages_np: Optional[List[np.ndarray]] = task.get("matchability_stages")
 
     occ_np = task.get("occlusion")
     inv_np = task.get("invalid")
@@ -699,6 +884,14 @@ def _process_sample_task(task: Dict[str, Any]) -> Dict[str, Any]:
         aux_stages=aux_stages_np,
         delta_stages=delta_stages_np,
         coupling_stages=coupling_stages_np,
+        alpha_stages=alpha_stages_np,
+        delta_match_stages=delta_match_stages_np,
+        delta_prior_stages=delta_prior_stages_np,
+        occupancy_stages=occupancy_stages_np,
+        data_valid_stages=data_valid_stages_np,
+        data_weight_stages=data_weight_stages_np,
+        data_reliability_stages=data_reliability_stages_np,
+        matchability_stages=matchability_stages_np,
     )
 
     qualitative_paths: Dict[str, str] = {}
@@ -714,6 +907,14 @@ def _process_sample_task(task: Dict[str, Any]) -> Dict[str, Any]:
             flow_stages_np,
             delta_stages_np,
             coupling_stages_np,
+            alpha_stages_np,
+            delta_match_stages_np,
+            delta_prior_stages_np,
+            occupancy_stages_np,
+            data_valid_stages_np,
+            data_weight_stages_np,
+            data_reliability_stages_np,
+            matchability_stages_np,
         )
 
     norm_profile = stage_epe / max(float(stage_epe[0]), 1e-6)
@@ -800,11 +1001,18 @@ def _git_metadata(repo_dir: str) -> Dict[str, str]:
 def _aggregate_iter_profiles(profiles: List[Dict[str, List[float]]]) -> Dict[str, List[float]]:
     if not profiles:
         return {}
-    max_k = max(len(p.get("epe", [])) for p in profiles)
-    keys = ["epe", "photometric_residual", "mean_update_norm", "mean_w_minus_q_norm", "mean_delta_norm"]
-    out: Dict[str, List[float]] = {k: [] for k in keys}
+    list_keys = sorted({k for p in profiles for k, v in p.items() if isinstance(v, list)})
+    if not list_keys:
+        return {}
 
-    for key in keys:
+    max_k = 0
+    for p in profiles:
+        for k in list_keys:
+            max_k = max(max_k, len(p.get(k, [])))
+
+    out: Dict[str, List[float]] = {k: [] for k in list_keys}
+
+    for key in list_keys:
         mat = np.full((len(profiles), max_k), np.nan, dtype=np.float32)
         for i, p in enumerate(profiles):
             vals = p.get(key, [])
@@ -824,19 +1032,33 @@ def _save_iteration_summary(output_dir: Path, agg_iter: Dict[str, List[float]]) 
         json.dump(agg_iter, f, indent=2)
 
     csv_path = output_dir / "per_iteration_summary.csv"
-    K = len(agg_iter.get("epe", []))
+    preferred = [
+        "epe",
+        "photometric_residual",
+        "mean_update_norm",
+        "mean_w_minus_q_norm",
+        "mean_delta_norm",
+        "mean_alpha",
+        "mean_delta_match_norm",
+        "mean_delta_prior_norm",
+        "mean_occupancy",
+        "mean_data_valid",
+        "mean_data_weight",
+        "mean_data_reliability",
+        "mean_matchability",
+    ]
+    columns = [k for k in preferred if k in agg_iter] + [k for k in sorted(agg_iter.keys()) if k not in preferred]
+    K = max((len(agg_iter.get(k, [])) for k in columns), default=0)
+
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["iteration", "epe", "photometric_residual", "mean_update_norm", "mean_w_minus_q_norm", "mean_delta_norm"])
+        w.writerow(["iteration", *columns])
         for i in range(K):
-            w.writerow([
-                i + 1,
-                _safe_float(agg_iter.get("epe", [float("nan")])[i]),
-                _safe_float(agg_iter.get("photometric_residual", [float("nan")])[i]),
-                _safe_float(agg_iter.get("mean_update_norm", [float("nan")])[i]),
-                _safe_float(agg_iter.get("mean_w_minus_q_norm", [float("nan")])[i]),
-                _safe_float(agg_iter.get("mean_delta_norm", [float("nan")])[i]),
-            ])
+            row: List[float] = [float(i + 1)]
+            for col in columns:
+                vals = agg_iter.get(col, [])
+                row.append(_safe_float(vals[i] if i < len(vals) else float("nan")))
+            w.writerow(row)
 
 
 def _render_markdown_report(
@@ -856,6 +1078,7 @@ def _render_markdown_report(
     ckpt = report_context.get("checkpoint", "")
     git = report_context.get("git", {})
     system = report_context.get("system", {})
+    model_summary = report_context.get("model_summary", {})
     qualitative_paths = report_context.get("qualitative_paths", [])
 
     lines: List[str] = []
@@ -880,6 +1103,12 @@ def _render_markdown_report(
         "- Hardware: "
         f"GPU={system.get('gpu')} | num_gpus={system.get('num_gpus')} | "
         f"VRAM_GB={system.get('vram_gb')} | CPU={system.get('cpu')} | RAM_GB={system.get('ram_gb')}"
+    )
+    lines.append(
+        "- Model params: "
+        f"total={model_summary.get('total_params', 'N/A')} | "
+        f"trainable={model_summary.get('trainable_params', 'N/A')} | "
+        f"non_trainable={model_summary.get('non_trainable_params', 'N/A')}"
     )
     lines.append(f"- Runtime: evaluation_seconds={report_context.get('runtime_sec', float('nan')):.2f}")
     lines.append("- Random seeds: N/A (evaluation-only script)")
@@ -918,16 +1147,40 @@ def _render_markdown_report(
     if iters:
         lines.append("## Per-iteration Results")
         lines.append("")
-        lines.append("| Iteration k | EPE | Photometric residual | Mean update norm | Mean ||w^k-q^k|| | Mean ||delta w^k|| |")
-        lines.append("|---:|---:|---:|---:|---:|---:|")
-        K = len(iters.get("epe", []))
+        core_cols = [
+            "epe",
+            "photometric_residual",
+            "mean_update_norm",
+            "mean_w_minus_q_norm",
+            "mean_delta_norm",
+        ]
+        present_core = [c for c in core_cols if c in iters]
+        headers = ["Iteration k"] + present_core
+        lines.append("| " + " | ".join(headers) + " |")
+        lines.append("|" + "|".join(["---:"] * len(headers)) + "|")
+        K = max((len(iters.get(c, [])) for c in present_core), default=0)
         for i in range(K):
-            epe = _safe_float(iters.get("epe", [float("nan")])[i])
-            pr = _safe_float(iters.get("photometric_residual", [float("nan")])[i])
-            up = _safe_float(iters.get("mean_update_norm", [float("nan")])[i])
-            wq = _safe_float(iters.get("mean_w_minus_q_norm", [float("nan")])[i])
-            dn = _safe_float(iters.get("mean_delta_norm", [float("nan")])[i])
-            lines.append(f"| {i + 1} | {epe:.6f} | {pr:.6f} | {up:.6f} | {wq:.6f} | {dn:.6f} |")
+            row = [str(i + 1)]
+            for c in present_core:
+                vals = iters.get(c, [])
+                row.append(f"{_safe_float(vals[i] if i < len(vals) else float('nan')):.6f}")
+            lines.append("| " + " | ".join(row) + " |")
+        lines.append("")
+
+        extra_cols = [c for c in sorted(iters.keys()) if c not in present_core]
+        if extra_cols:
+            lines.append("### Extended Diagnostics")
+            lines.append("")
+            ext_headers = ["Iteration k"] + extra_cols
+            lines.append("| " + " | ".join(ext_headers) + " |")
+            lines.append("|" + "|".join(["---:"] * len(ext_headers)) + "|")
+            K_ext = max((len(iters.get(c, [])) for c in extra_cols), default=0)
+            for i in range(K_ext):
+                row = [str(i + 1)]
+                for c in extra_cols:
+                    vals = iters.get(c, [])
+                    row.append(f"{_safe_float(vals[i] if i < len(vals) else float('nan')):.6f}")
+                lines.append("| " + " | ".join(row) + " |")
         lines.append("")
 
     lines.append("## Qualitative Results")
@@ -1129,11 +1382,25 @@ def save_model_summary(
     total_params = int(sum(p.numel() for p in model.parameters()))
     total_trainable = int(sum(p.numel() for p in model.parameters() if p.requires_grad))
 
+    components: List[Dict[str, Any]] = []
+    for comp_name, comp_mod in model.named_children():
+        comp_total = int(sum(p.numel() for p in comp_mod.parameters()))
+        comp_trainable = int(sum(p.numel() for p in comp_mod.parameters() if p.requires_grad))
+        components.append(
+            {
+                "name": comp_name,
+                "params": comp_total,
+                "trainable_params": comp_trainable,
+                "non_trainable_params": comp_total - comp_trainable,
+            }
+        )
+
     summary = {
         "input_shape": list(input_shape),
         "total_params": total_params,
         "trainable_params": total_trainable,
         "non_trainable_params": total_params - total_trainable,
+        "components": components,
         "layers": rows,
         "forward_error": error,
     }
@@ -1151,6 +1418,16 @@ def save_model_summary(
         f.write(f"- Non-trainable params: {total_params - total_trainable:,}\n")
         if error:
             f.write(f"- Forward-pass capture warning: {error}\n")
+
+        if components:
+            f.write("\n## Component Parameter Breakdown\n\n")
+            f.write("| Component | Params | Trainable | Non-trainable |\n")
+            f.write("|---|---:|---:|---:|\n")
+            for c in components:
+                f.write(
+                    f"| {c['name']} | {c['params']:,} | {c['trainable_params']:,} | {c['non_trainable_params']:,} |\n"
+                )
+
         f.write("\n| Layer | Type | Output shape | Params | Trainable |\n")
         f.write("|---|---|---|---:|---:|\n")
         for r in rows:
@@ -1332,6 +1609,14 @@ class FlowEvaluator:
                     aux_low = out.get("aux_low")
                     delta_low = out.get("delta_low")
                     coupling_low = out.get("coupling_residual_low")
+                    alpha_low = out.get("alpha_low")
+                    delta_match_low = out.get("delta_match_low")
+                    delta_prior_low = out.get("delta_prior_low")
+                    occupancy_masks = out.get("occupancy_masks")
+                    data_valid_lows = out.get("data_valid_lows")
+                    data_weight_lows = out.get("data_weight_lows")
+                    data_reliability_lows = out.get("data_reliability_lows")
+                    matchability_lows = out.get("matchability_lows")
 
                     img1_cpu = img1.detach().cpu()
                     img2_cpu = img2.detach().cpu()
@@ -1343,6 +1628,14 @@ class FlowEvaluator:
                     aux_low_cpu = [a.detach().cpu() for a in aux_low] if aux_low is not None else None
                     delta_low_cpu = [d.detach().cpu() for d in delta_low] if delta_low is not None else None
                     coupling_low_cpu = [c.detach().cpu() for c in coupling_low] if coupling_low is not None else None
+                    alpha_low_cpu = [a.detach().cpu() for a in alpha_low] if alpha_low is not None else None
+                    delta_match_low_cpu = [d.detach().cpu() for d in delta_match_low] if delta_match_low is not None else None
+                    delta_prior_low_cpu = [d.detach().cpu() for d in delta_prior_low] if delta_prior_low is not None else None
+                    occupancy_masks_cpu = [m.detach().cpu() for m in occupancy_masks] if occupancy_masks is not None else None
+                    data_valid_lows_cpu = [m.detach().cpu() for m in data_valid_lows] if data_valid_lows is not None else None
+                    data_weight_lows_cpu = [m.detach().cpu() for m in data_weight_lows] if data_weight_lows is not None else None
+                    data_reliability_lows_cpu = [m.detach().cpu() for m in data_reliability_lows] if data_reliability_lows is not None else None
+                    matchability_lows_cpu = [m.detach().cpu() for m in matchability_lows] if matchability_lows is not None else None
 
                     B = img1.shape[0]
                     tasks: List[Dict[str, Any]] = []
@@ -1372,6 +1665,14 @@ class FlowEvaluator:
                                 "aux_stages": [a[b].numpy() for a in aux_low_cpu] if aux_low_cpu is not None else None,
                                 "delta_stages": [d[b].numpy() for d in delta_low_cpu] if delta_low_cpu is not None else None,
                                 "coupling_stages": [c[b].numpy() for c in coupling_low_cpu] if coupling_low_cpu is not None else None,
+                                "alpha_stages": [a[b].numpy() for a in alpha_low_cpu] if alpha_low_cpu is not None else None,
+                                "delta_match_stages": [d[b].numpy() for d in delta_match_low_cpu] if delta_match_low_cpu is not None else None,
+                                "delta_prior_stages": [d[b].numpy() for d in delta_prior_low_cpu] if delta_prior_low_cpu is not None else None,
+                                "occupancy_stages": [m[b].numpy() for m in occupancy_masks_cpu] if occupancy_masks_cpu is not None else None,
+                                "data_valid_stages": [m[b].numpy() for m in data_valid_lows_cpu] if data_valid_lows_cpu is not None else None,
+                                "data_weight_stages": [m[b].numpy() for m in data_weight_lows_cpu] if data_weight_lows_cpu is not None else None,
+                                "data_reliability_stages": [m[b].numpy() for m in data_reliability_lows_cpu] if data_reliability_lows_cpu is not None else None,
+                                "matchability_stages": [m[b].numpy() for m in matchability_lows_cpu] if matchability_lows_cpu is not None else None,
                                 "flow_gt": flow_gt_cpu[b].numpy(),
                                 "valid": valid_cpu[b].numpy(),
                                 "occlusion": occ_cpu[b].numpy() if occ_cpu is not None else None,
@@ -1561,7 +1862,14 @@ def main() -> None:
     data_cfg = OmegaConf.load(args.data_config)
 
     model = build_model(model_cfg).to(device)
-    logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    model_total_params = int(sum(p.numel() for p in model.parameters()))
+    model_trainable_params = int(sum(p.numel() for p in model.parameters() if p.requires_grad))
+    logger.info(
+        "Model parameters: total=%s trainable=%s non_trainable=%s",
+        f"{model_total_params:,}",
+        f"{model_trainable_params:,}",
+        f"{model_total_params - model_trainable_params:,}",
+    )
 
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(ckpt.get("model", ckpt), strict=False)
@@ -1598,9 +1906,12 @@ def main() -> None:
         "git": git_meta,
         "dataset_size": len(eval_data),
         "model_summary": {
-            "total_params": model_summary_info.get("total_params", int(sum(p.numel() for p in model.parameters()))),
+            "total_params": model_summary_info.get("total_params", model_total_params),
             "trainable_params": model_summary_info.get(
-                "trainable_params", int(sum(p.numel() for p in model.parameters() if p.requires_grad))
+                "trainable_params", model_trainable_params
+            ),
+            "non_trainable_params": model_summary_info.get(
+                "non_trainable_params", model_total_params - model_trainable_params
             ),
             "summary_markdown": model_summary_info.get("markdown", ""),
             "summary_json": model_summary_info.get("json", ""),

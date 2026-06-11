@@ -2366,7 +2366,10 @@ class HQSFlowModelTFPort(nn.Module):
         def count(module: nn.Module) -> int:
             return sum(p.numel() for p in module.parameters())
 
-        return {
+        def count_trainable(module: nn.Module) -> int:
+            return sum(p.numel() for p in module.parameters() if p.requires_grad)
+
+        base = {
             "feature_encoder": count(self.feature_encoder),
             "context_encoder": count(self.context_encoder),
             "motion_encoder": count(self.motion_encoder),
@@ -2380,6 +2383,34 @@ class HQSFlowModelTFPort(nn.Module):
             "final_refinement": (
                 count(self.final_refinement_network) + count(self.final_mask_logits)
             ),
+            "data_reliability_head": count(self.data_reliability_head),
+            "hidden_proj": count(self.hidden_proj),
+            "level1_transition_mask": count(self.level1_transition_mask),
             "stages": count(self.update_unit),  # alias kept for trainer logging compat
             "total": count(self),
+            "total_trainable": count_trainable(self),
         }
+
+        # Optional modules added by feature flags.
+        base["prior_motion_encoder"] = count(self.prior_motion_encoder) if hasattr(self, "prior_motion_encoder") else 0
+        base["prior_update_unit"] = count(self.prior_update_unit) if hasattr(self, "prior_update_unit") else 0
+        base["reliability_gate"] = count(self.reliability_gate) if hasattr(self, "reliability_gate") else 0
+        base["learned_prox"] = count(self.learned_prox) if self.learned_prox is not None else 0
+
+        # Per-component trainable counts for logging parity.
+        base["feature_encoder_trainable"] = count_trainable(self.feature_encoder)
+        base["context_encoder_trainable"] = count_trainable(self.context_encoder)
+        base["motion_encoder_trainable"] = count_trainable(self.motion_encoder)
+        base["update_unit_trainable"] = count_trainable(self.update_unit)
+        base["iter_conf_head_trainable"] = count_trainable(self.iter_conf_head)
+        base["final_refinement_trainable"] = count_trainable(self.final_refinement_network) + count_trainable(self.final_mask_logits)
+        base["prior_motion_encoder_trainable"] = count_trainable(self.prior_motion_encoder) if hasattr(self, "prior_motion_encoder") else 0
+        base["prior_update_unit_trainable"] = count_trainable(self.prior_update_unit) if hasattr(self, "prior_update_unit") else 0
+        base["reliability_gate_trainable"] = count_trainable(self.reliability_gate) if hasattr(self, "reliability_gate") else 0
+        base["data_reliability_head_trainable"] = count_trainable(self.data_reliability_head)
+        base["hidden_proj_trainable"] = count_trainable(self.hidden_proj)
+        base["level1_transition_mask_trainable"] = count_trainable(self.level1_transition_mask)
+        base["learned_prox_trainable"] = count_trainable(self.learned_prox) if self.learned_prox is not None else 0
+        base["total_non_trainable"] = base["total"] - base["total_trainable"]
+
+        return base
