@@ -1437,8 +1437,8 @@ class HQSFlowModelTFPort(nn.Module):
         p = flow_yx[:, 1:2].clone()
         wx, wy = self.edge_weights(image)
         for _ in range(num_iter):
-            q = self.jacobi_prox_step(p, flow_yx[:, 0:1], beta, lam, wx, wy, validity_mask=validity_mask)
-            p = self.jacobi_prox_step(q, flow_yx[:, 1:2], beta, lam, wx, wy, validity_mask=validity_mask)
+            q = self.jacobi_prox_step(q, flow_yx[:, 0:1], beta, lam, wx, wy, validity_mask=validity_mask)
+            p = self.jacobi_prox_step(p, flow_yx[:, 1:2], beta, lam, wx, wy, validity_mask=validity_mask)
         return torch.cat([q, p], dim=1), wx, wy
 
     @staticmethod
@@ -1789,6 +1789,7 @@ class HQSFlowModelTFPort(nn.Module):
 
             if self.use_photometric_confidence:
                 photometric_conf_k = self.photometric_confidence(it_safe, tau=self.photometric_confidence_tau)
+                photometric_conf_k = photometric_conf_k * data_valid_k  # Mask photometric confidence by data validity to prevent high confidence at invalid pixels.
                 confidence_raw = confidence_raw * photometric_conf_k
 
             matchability_lows.append(confidence_raw.detach())
@@ -1824,7 +1825,7 @@ class HQSFlowModelTFPort(nn.Module):
 
             data_weight = (data_valid_k * data_reliability).clamp(0.0, 1.0)
 
-            confidence_k = (confidence_raw * data_reliability).clamp(0.0, 1.0)
+            confidence_k = (confidence_raw * data_weight).clamp(0.0, 1.0)
 
             data_valid_lows.append(data_valid_k.detach())
             data_weight_lows.append(data_weight.detach())
@@ -1926,6 +1927,7 @@ class HQSFlowModelTFPort(nn.Module):
                     gate_valid,
                 )
 
+                alpha = data_valid_k.detach()
                 delta = alpha * delta_match + (1.0 - alpha) * delta_prior
             else:
                 alpha = torch.ones_like(confidence_k)
@@ -2142,6 +2144,7 @@ class HQSFlowModelTFPort(nn.Module):
 
                 if self.use_photometric_confidence:
                     photometric_conf_l1 = self.photometric_confidence(it_safe, tau=self.photometric_confidence_tau)
+                    photometric_conf_l1 = photometric_conf_l1 * data_valid_l1  # Mask photometric confidence by data validity to prevent high confidence at invalid pixels.
                     confidence_raw_l1 = confidence_raw_l1 * photometric_conf_l1
 
                 matchability_lows.append(confidence_raw_l1.detach())
@@ -2172,7 +2175,7 @@ class HQSFlowModelTFPort(nn.Module):
                     data_reliability_l1 = torch.ones_like(data_valid_l1)
 
                 data_weight = (data_valid_l1 * data_reliability_l1).clamp(0.0, 1.0)
-                confidence_l1 = (confidence_raw_l1 * data_reliability_l1).clamp(0.0, 1.0)
+                confidence_l1 = (confidence_raw_l1 * data_weight).clamp(0.0, 1.0)
 
                 data_valid_lows.append(data_valid_l1.detach())
                 data_weight_lows.append(data_weight.detach())
@@ -2271,6 +2274,7 @@ class HQSFlowModelTFPort(nn.Module):
                         gate_valid_l1,
                     )
 
+                    alpha_l1 = data_valid_l1.detach()
                     delta_l1 = alpha_l1 * delta_l1_match + (1.0 - alpha_l1) * delta_l1_prior
                 else:
                     alpha_l1 = torch.ones_like(confidence_l1)
