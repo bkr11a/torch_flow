@@ -1293,14 +1293,32 @@ class HQSFlowModelTFPort(nn.Module):
         """
         b, _, h, w = i1.shape
 
+        gx1 = self.central_grad_x(i1)
+        gy1 = self.central_grad_y(i1)
+
+        gx2_native = self.central_grad_x(i2)
+        gy2_native = self.central_grad_y(i2)
+
         if self.use_masked_ofce_warp:
             i2_warp, target_warp_valid, bounds_valid = self.masked_warp_yx(
                 i2,
                 flow_yx,
                 target_valid=target_valid if self.use_self_occupancy_mask else None
             )
+            gx2_warp, gx2_valid, _ = self.masked_warp_yx(
+                gx2_native,
+                flow_yx,
+                target_valid=target_valid if self.use_self_occupancy_mask else None
+            )
+            gy2_warp, gy2_valid, _ = self.masked_warp_yx(
+                gy2_native,
+                flow_yx,
+                target_valid=target_valid if self.use_self_occupancy_mask else None
+            )
         else:
             i2_warp = self._warp_yx(i2, flow_yx)
+            gx2_warp = self._warp_yx(gx2_native, flow_yx)
+            gy2_warp = self._warp_yx(gy2_native, flow_yx)
             bounds_valid = self._valid_warp_mask(flow_yx).to(device=i1.device, dtype=i1.dtype)
             target_warp_valid = bounds_valid  # If not using masked warp, we can only guarantee validity based on bounds.
 
@@ -1315,15 +1333,10 @@ class HQSFlowModelTFPort(nn.Module):
         if source_valid is None:
             source_valid = torch.ones_like(bounds_valid)
 
-        data_valid = (bounds_valid * source_valid * target_warp_valid).clamp(0.0, 1.0)
+        data_valid = (bounds_valid * source_valid * target_warp_valid * gx2_valid * gy2_valid).clamp(0.0, 1.0)
 
-        gx1 = self.central_grad_x(i1)
-        gx2 = self.central_grad_x(i2_warp)
-        gy1 = self.central_grad_y(i1)
-        gy2 = self.central_grad_y(i2_warp)
-
-        ix = 0.5 * (gx1 + gx2)
-        iy = 0.5 * (gy1 + gy2)
+        ix = 0.5 * (gx1 + gx2_warp)
+        iy = 0.5 * (gy1 + gy2_warp)
         it = i2_warp - i1
 
         if ix.shape[1] > 1:
