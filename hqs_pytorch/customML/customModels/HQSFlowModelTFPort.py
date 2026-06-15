@@ -784,7 +784,7 @@ class HQSFlowModelTFPort(nn.Module):
         )
 
         self.use_learned_prox_net = bool(
-            _cfg_get(mb, "use_learned_proximal", False)
+            _cfg_get(mb, "use_learned_prox", False)
         )
 
         if self.use_learned_prox_net:
