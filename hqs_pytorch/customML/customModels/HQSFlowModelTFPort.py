@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from hqs_pytorch.customML.customModels.pgma import PhysicsGatedMatchingAttention
 
 class GroupNorm2D(nn.Module):
     def __init__(self, channels: int, groups: int = 8, eps: float = 1e-5) -> None:
@@ -823,6 +824,22 @@ class HQSFlowModelTFPort(nn.Module):
         self.ofce_greyscale = bool(
             _cfg_get(mb, "ofce_greyscale", True)
         )
+
+        # Setting for the Physics-Gated Global Matching Attention (PGMA) module.
+        self.use_pgma = bool(
+            _cfg_get(mb, "use_pgma", True)
+        )
+
+        if self.use_pgma:
+            self.pgma = PhysicsGatedMatchingAttention(
+                feature_dim=feature_dim,
+                gate_hidden=int(_cfg_get(mb, "pgma_hidden_dim", 64)),
+                temperature=float(_cfg_get(mb, "pgma_temperature", 0.07)),
+                topk=int(_cfg_get(mb, "pgma_topk", 64)),
+                use_topk=bool(_cfg_get(mb, "pgma_use_topk", True)),
+            )
+        else:
+            self.pgma = None
 
     @staticmethod
     def _normalise(img: torch.Tensor) -> torch.Tensor:
@@ -1661,6 +1678,9 @@ class HQSFlowModelTFPort(nn.Module):
         data_weight_lows: List[torch.Tensor] = []
         data_reliability_lows: List[torch.Tensor] = []
         matchability_lows: List[torch.Tensor] = []
+        pgma_global_conf_lows: List[torch.Tensor] = []
+        pgma_gate_lows: List[torch.Tensor] = []
+        pgma_delta_global_lows: List[torch.Tensor] = []
 
         beta_schedule, lambda_schedule = self._hqs_penalties()
         correction_gates = self._correction_gates()
@@ -1940,12 +1960,12 @@ class HQSFlowModelTFPort(nn.Module):
                     gate_valid,
                 )
 
-                alpha = data_valid_k.detach()
-                delta = alpha * delta_match + (1.0 - alpha) * delta_prior
+                alpha = alpha * data_valid_k.detach()
+                delta_hqs = alpha * delta_match + (1.0 - alpha) * delta_prior
             else:
                 alpha = torch.ones_like(confidence_k)
                 delta_prior = torch.zeros_like(delta_match)
-                delta = delta_match
+                delta_hqs = delta_match
 
             alpha_lows.append(alpha.detach())
             delta_match_lows.append(torch.stack([delta_match[:, 1], delta_match[:, 0]], dim=1).detach())
@@ -1954,6 +1974,40 @@ class HQSFlowModelTFPort(nn.Module):
                 delta_prior_lows.append(torch.stack([delta_prior[:, 1], delta_prior[:, 0]], dim=1).detach())
             else:
                 delta_prior_lows.append(torch.zeros_like(delta_match_lows[-1]))
+
+            # Switch for PGMA.
+            if self.use_pgma:
+                # f1, f2 are full feature tensors; use the same level as flow_yx.
+                # If f1/f2 are at a different level, replace with feat1["level2"], etc.
+                pgma_out = self.pgma(
+                    f1=f1,
+                    f2=f2,
+                    flow_yx=flow_yx,
+                    delta_hqs=delta_hqs,
+                    aux_yx=aux_yx,
+                    hqs_resid=hqs_resid,
+                    local_conf=confidence_k,
+                    validity=data_valid_k.detach(),
+                    iter_frac=it_safe.abs(),
+                )
+
+                delta = pgma_out["delta"]
+
+                if "pgma_global_conf_lows" not in locals():
+                    pgma_global_conf_lows = []
+                    pgma_gate_lows = []
+                    pgma_delta_global_lows = []
+
+                pgma_global_conf_lows.append(pgma_out["global_conf"].detach())
+                pgma_gate_lows.append(pgma_out["gates"].detach())
+                pgma_delta_global_lows.append(
+                    torch.stack(
+                        [pgma_out["delta_global"][:, 1], pgma_out["delta_global"][:, 0]],
+                        dim=1,
+                    ).detach()
+                )
+            else:
+                delta = delta_hqs
 
             flow_yx = flow_yx + correction_gates[k] * delta
 
@@ -2287,12 +2341,41 @@ class HQSFlowModelTFPort(nn.Module):
                         gate_valid_l1,
                     )
 
-                    alpha_l1 = data_valid_l1.detach()
+                    alpha_l1 = alpha_l1 * data_valid_l1.detach()
                     delta_l1 = alpha_l1 * delta_l1_match + (1.0 - alpha_l1) * delta_l1_prior
                 else:
                     alpha_l1 = torch.ones_like(confidence_l1)
                     delta_l1_prior = torch.zeros_like(delta_l1_match)
                     delta_l1 = delta_l1_match
+
+                if self.use_pgma:
+                    pgma_out_l1 = self.pgma(
+                        f1=f1_l1,
+                        f2=f2_l1,
+                        flow_yx=flow_l1,
+                        delta_hqs=delta_l1,
+                        aux_yx=aux_l1,
+                        hqs_resid=hqs_resid_l1,
+                        local_conf=confidence_l1,
+                        validity=data_valid_l1.detach(),
+                        iter_frac=it_safe.abs(),
+                    )
+
+                    delta_l1 = pgma_out_l1["delta"]
+
+                    if "pgma_global_conf_lows" not in locals():
+                        pgma_global_conf_lows = []
+                        pgma_gate_lows = []
+                        pgma_delta_global_lows = []
+
+                    pgma_global_conf_lows.append(pgma_out_l1["global_conf"].detach())
+                    pgma_gate_lows.append(pgma_out_l1["gates"].detach())
+                    pgma_delta_global_lows.append(
+                        torch.stack(
+                            [pgma_out_l1["delta_global"][:, 1], pgma_out_l1["delta_global"][:, 0]],
+                            dim=1,
+                        ).detach()
+                    )
 
                 flow_l1 = flow_l1 + gates_l1[k_l1] * delta_l1
 
@@ -2377,6 +2460,9 @@ class HQSFlowModelTFPort(nn.Module):
             "data_weight_lows": data_weight_lows,
             "data_reliability_lows": data_reliability_lows,
             "matchability_lows": matchability_lows,
+            "pgma_global_conf_lows": pgma_global_conf_lows if self.use_pgma else [],
+            "pgma_gate_lows": pgma_gate_lows if self.use_pgma else [],
+            "pgma_delta_global_lows": pgma_delta_global_lows if self.use_pgma else [],
         }
 
     def param_count(self) -> Dict[str, int]:
@@ -2429,5 +2515,9 @@ class HQSFlowModelTFPort(nn.Module):
         base["level1_transition_mask_trainable"] = count_trainable(self.level1_transition_mask)
         base["learned_prox_trainable"] = count_trainable(self.learned_prox) if self.learned_prox is not None else 0
         base["total_non_trainable"] = base["total"] - base["total_trainable"]
+
+        # PGMA module counts if present
+        base["pgma"] = count(self.pgma) if self.pgma is not None else 0
+        base["pgma_trainable"] = count_trainable(self.pgma) if self.pgma is not None else 0
 
         return base

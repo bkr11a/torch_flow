@@ -104,6 +104,12 @@ model:
     # OFCE input settings
     use_photo_for_ofce: true       # Whether to use [0, 1] scaling for the photo inputs into the OFCE or ImageNETs normalization. true is [0, 1], false is ImageNETs normalization.
     ofce_greyscale: true           # Whether to use greyscale inputs for the OFCE. This is useful for illumination modeling.
+    # -- Physics-Gated Global Matching Attention (PGMA) settings --
+    use_pgma: true
+    pgma_hidden_dim: 64
+    pgma_temperature: 0.07
+    pgma_topk: 64
+    pgma_use_topk: true
 
 # ── Loss ──────────────────────────────────────────────────────────────────
 loss:
