@@ -106,10 +106,20 @@ model:
     ofce_greyscale: true           # Whether to use greyscale inputs for the OFCE. This is useful for illumination modeling.
     # -- Physics-Gated Global Matching Attention (PGMA) settings --
     use_pgma: true
+    use_gmflow_init: true
+    use_pgma_iter: true
+    pgma_max_delta_step: 0.0
+    gmflow_init_scale: 1.0
+
     pgma_hidden_dim: 64
     pgma_temperature: 0.07
     pgma_topk: 64
     pgma_use_topk: true
+    pgma_match_mode: soft
+    pgma_use_feature_enhancer: true
+    pgma_gate_init_hqs: 1.0
+    pgma_gate_init_global: 1.0
+    pgma_gate_init_prox: 1.0
 
 # ── Loss ──────────────────────────────────────────────────────────────────
 loss:

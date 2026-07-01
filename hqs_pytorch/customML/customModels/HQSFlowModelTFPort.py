@@ -830,13 +830,37 @@ class HQSFlowModelTFPort(nn.Module):
             _cfg_get(mb, "use_pgma", True)
         )
 
-        if self.use_pgma:
+        # Setting for using gmflow initialisation before the HQS iterations. This is a strong prior for the initial flow estimate.
+        self.use_gmflow_init = bool(
+            _cfg_get(mb, "use_gmflow_init", True)
+        )
+
+        # Setting for using PGMA inside the HQS iterations.
+        # Compute global proposal and gate it against HQS/proximal update.
+        self.use_pgma_iter = bool(
+            _cfg_get(mb, "use_pgma_iter", self.use_pgma)
+        )
+
+        self.pgma_max_delta_step = float(
+            _cfg_get(mb, "pgma_max_delta_step", 0.0)
+        )
+
+        self.gmflow_init_scale = float(
+            _cfg_get(mb, "gmflow_init_scale", 1.0)
+        )
+
+        if self.use_pgma or self.use_gmflow_init or self.use_pgma_iter:
             self.pgma = PhysicsGatedMatchingAttention(
                 feature_dim=feature_dim,
                 gate_hidden=int(_cfg_get(mb, "pgma_hidden_dim", 64)),
                 temperature=float(_cfg_get(mb, "pgma_temperature", 0.07)),
                 topk=int(_cfg_get(mb, "pgma_topk", 64)),
                 use_topk=bool(_cfg_get(mb, "pgma_use_topk", True)),
+                match_mode=str(_cfg_get(mb, "pgma_match_mode", "soft")),
+                use_feature_enhancer=bool(_cfg_get(mb, "pgma_use_feature_enhancer", True)),
+                gate_init_hqs=float(_cfg_get(mb, "pgma_gate_init_hqs", 1.0)),
+                gate_init_global=float(_cfg_get(mb, "pgma_gate_init_global", 1.0)),
+                gate_init_prox=float(_cfg_get(mb, "pgma_gate_init_prox", 1.0))
             )
         else:
             self.pgma = None
@@ -1664,6 +1688,41 @@ class HQSFlowModelTFPort(nn.Module):
         flow_yx = flow_yx
         aux_yx = flow_yx.clone()
 
+        # -------------------------------------------------------------------------
+        # GMFlow-style global initialisation
+        # -------------------------------------------------------------------------
+        # This differs from the existing RAFT-like zero-flow correlation initialiser.
+        # It directly estimates a global correspondence:
+        #     w0(x) = E_y[y - x | x]
+        # from all-pairs feature attention.
+        # -------------------------------------------------------------------------
+        pgma_init_out = None
+
+        if self.use_gmflow_init:
+            gm_init = self.pgma.global_match(
+                f1,
+                f2,
+                target_valid=target_valid_lvl if "target_valid_lvl" in locals() else None,
+            )
+
+            # This is a full global proposal, not a local residual lookup.
+            gm_flow_yx = gm_init["flow_yx"]
+
+            # Optional scaling allows conservative warm start.
+            flow_yx = (1.0 - self.gmflow_init_scale) * flow_yx + self.gmflow_init_scale * gm_flow_yx
+
+            # Keep auxiliary variable aligned with the initialised flow.
+            # This prevents the first HQS residual w - q from becoming artificially huge.
+            aux_yx = flow_yx.clone()
+
+            pgma_init_out = {
+                "gmflow_init_flow_yx": gm_flow_yx.detach(),
+                "gmflow_init_hard_flow_yx": gm_init["hard_flow_yx"].detach(),
+                "gmflow_init_conf": gm_init["conf"].detach(),
+                "gmflow_init_entropy": gm_init["entropy"].detach(),
+                "gmflow_init_margin": gm_init["margin"].detach(),
+            }
+
         flow_preds: List[torch.Tensor] = []
         flow_lows: List[torch.Tensor] = []
         hidden_states: List[torch.Tensor] = []
@@ -1700,77 +1759,6 @@ class HQSFlowModelTFPort(nn.Module):
             coords_query = coords1 + flow_yx.permute(0, 2, 3, 1)
             corr_feat_k = self.sample_all_pairs_corr_pyramid(corr_pyr, coords_query, radius=self.max_displacement)
             corr_feat_k_chw = corr_feat_k.permute(0, 3, 1, 2).contiguous()
-
-            ######### # HQS u-step: closed-form OFCE data minimisation.
-            ######### ix, iy, it, i2_warp = self.compute_ofce_derivatives(i1_lvl, i2_lvl, flow_yx)
-            ######### # Adjust our confidence based on the validity of the warp to prevent out-of-bounds pixels from destabilizing training.
-            ######### valid_k = self._valid_warp_mask(flow_yx)
-
-            ######### # Compute the per iteration forward splat to build occupancy masks.
-            ######### ones = torch.ones_like(flow_yx[:, :1, :, :])
-            ######### occupancy = self.forward_splat(ones, flow_yx, normalize=False)
-            ######### occupancy_mask = occupancy.clamp(0.0, 1.0)  # Optional: clamp to prevent extreme values from destabilizing training.
-
-            ######### # Perform backwards warping of the occupancy mask to realign to image-1 coordinates.
-            ######### occupancy_mask_warped = self._warp_yx(occupancy_mask, flow_yx)
-            ######### occupancy_mask_warped = occupancy_mask_warped.clamp(0.0, 1.0)  # Optional: clamp to prevent extreme values from destabilizing training.
-            ######### occupancy_masks.append(occupancy_mask_warped.detach())
-
-            ######### # Per-iteration confidence from dedicated head (not the init decoder).
-            ######### conf_in = torch.cat([corr_feat_k_chw, flow_yx, ix, iy, it, valid_k], dim=1)
-
-            ######### confidence_k = self.iter_conf_head(conf_in)
-
-            ######### if self.use_photometric_confidence:
-                ######### photometric_conf_k = self.photometric_confidence(it, tau=self.photometric_confidence_tau)
-            ######### else:
-                ######### photometric_conf_k = torch.ones_like(it)
-
-            ######### confidence_k = confidence_k * valid_k * photometric_conf_k
-
-            ######### if self.use_data_reliability_mask:
-                ######### grad_mag = torch.sqrt(ix * ix + iy * iy + 1e-6)
-                ######### hqs_mag = torch.norm(flow_yx - aux_yx, dim=1, keepdim=True)
-                ######### flow_mag = torch.norm(flow_yx, dim=1, keepdim=True)
-
-                ######### rel_inputs = torch.cat(
-                    ######### [
-                        ######### it.abs(),
-                        ######### grad_mag,
-                        ######### valid_k,
-                        ######### confidence_k,
-                        ######### hqs_mag,
-                        ######### flow_mag,
-                    ######### ],
-                    ######### dim=1,
-                ######### )
-
-                ######### # Detach the inputs if you want the reliability head to learn
-                ######### # from these diagnostics without pushing gradients back through
-                ######### # the diagnostic construction itself.
-                ######### if self.detach_data_reliability_inputs:
-                    ######### rel_inputs = rel_inputs.detach()
-
-                ######### # IMPORTANT:
-                ######### # Do NOT detach data_reliability if you want the head to learn.
-                ######### data_reliability = self.data_reliability_head(rel_inputs)
-
-                ######### data_weight = valid_k * data_reliability
-            ######### else:
-                ######### data_reliability = valid_k
-                ######### data_weight = valid_k
-
-            ######### # Mask off the data_weight using the occupancy mask
-            ######### data_weight = occupancy_mask_warped * data_weight
-
-            ######### # Mask the OFCE coefficients before they enter the analytic data update.
-            ######### ix_data = ix 
-            ######### iy_data = iy 
-            ######### it_data = it
-
-            ######### confidence_k = confidence_k * data_weight.detach()
-
-            ######### flow_yx, _, _ = self.hqs_data_step(ix_data, iy_data, it_data, aux_yx, confidence_k, flow_yx, beta)
 
             # ------------------------------------------------------------
             # Leakage Safe OFCE Construction (Hopefully!)
@@ -1975,10 +1963,10 @@ class HQSFlowModelTFPort(nn.Module):
             else:
                 delta_prior_lows.append(torch.zeros_like(delta_match_lows[-1]))
 
-            # Switch for PGMA.
-            if self.use_pgma:
-                # f1, f2 are full feature tensors; use the same level as flow_yx.
-                # If f1/f2 are at a different level, replace with feat1["level2"], etc.
+            # -------------------------------------------------------------------------
+            # PGMA per-iteration global proposal and physics-gated update
+            # -------------------------------------------------------------------------
+            if self.use_pgma_iter:
                 pgma_out = self.pgma(
                     f1=f1,
                     f2=f2,
@@ -1989,26 +1977,63 @@ class HQSFlowModelTFPort(nn.Module):
                     local_conf=confidence_k,
                     validity=data_valid_k.detach(),
                     iter_frac=it_safe.abs(),
+                    target_valid=target_valid_lvl if "target_valid_lvl" in locals() else None,
                 )
 
                 delta = pgma_out["delta"]
 
-                if "pgma_global_conf_lows" not in locals():
-                    pgma_global_conf_lows = []
-                    pgma_gate_lows = []
-                    pgma_delta_global_lows = []
+                # Optional clamp for early stability.
+                # At 1/8 resolution, a clamp of 8 corresponds to 64 full-res pixels.
+                if self.pgma_max_delta_step > 0.0:
+                    delta = delta.clamp(
+                        min=-self.pgma_max_delta_step,
+                        max=self.pgma_max_delta_step,
+                    )
 
-                pgma_global_conf_lows.append(pgma_out["global_conf"].detach())
-                pgma_gate_lows.append(pgma_out["gates"].detach())
+                # Logging containers.
+                if "pgma_global_flow_lows" not in locals():
+                    pgma_global_flow_lows = []
+                    pgma_hard_global_flow_lows = []
+                    pgma_delta_global_lows = []
+                    pgma_global_conf_lows = []
+                    pgma_global_entropy_lows = []
+                    pgma_global_margin_lows = []
+                    pgma_gate_lows = []
+
+                # Convert [dy, dx] internal convention to [dx, dy] for visualisation/loss,
+                # if the rest of your repository expects optical flow as [u, v].
+                pgma_global_flow_lows.append(
+                    torch.stack(
+                        [pgma_out["global_flow_yx"][:, 1], pgma_out["global_flow_yx"][:, 0]],
+                        dim=1,
+                    ).detach()
+                )
+
+                pgma_hard_global_flow_lows.append(
+                    torch.stack(
+                        [pgma_out["hard_global_flow_yx"][:, 1], pgma_out["hard_global_flow_yx"][:, 0]],
+                        dim=1,
+                    ).detach()
+                )
+
                 pgma_delta_global_lows.append(
                     torch.stack(
                         [pgma_out["delta_global"][:, 1], pgma_out["delta_global"][:, 0]],
                         dim=1,
                     ).detach()
                 )
+
+                pgma_global_conf_lows.append(pgma_out["global_conf"].detach())
+                pgma_global_entropy_lows.append(pgma_out["global_entropy"].detach())
+                pgma_global_margin_lows.append(pgma_out["global_margin"].detach())
+                pgma_gate_lows.append(pgma_out["gates"].detach())
+
             else:
                 delta = delta_hqs
 
+            # -------------------------------------------------------------------------
+
+            # Existing residual update.
             flow_yx = flow_yx + correction_gates[k] * delta
 
             if self.use_learned_prox_net:
@@ -2102,75 +2127,6 @@ class HQSFlowModelTFPort(nn.Module):
                     corr_pyr_l1, coords_query_l1, radius=self.max_displacement
                 )
                 corr_feat_l1_chw = corr_feat_l1.permute(0, 3, 1, 2).contiguous()
-
-                ######### ix, iy, it, _ = self.compute_ofce_derivatives(i1_l1, i2_l1, flow_l1)
-                
-                ######### valid_l1 = self._valid_warp_mask(flow_l1)
-
-                ######### # Compute the per iteration forward splat to build occupancy masks.
-                ######### ones = torch.ones_like(flow_l1[:, :1, :, :])
-                ######### occupancy = self.forward_splat(ones, flow_l1, normalize=False)
-                ######### occupancy_mask = occupancy.clamp(0.0, 1.0)  # Optional: clamp to prevent extreme values from destabilizing training.
-
-                ######### # Perform backwards warping of the occupancy mask to realign to image-1 coordinates.
-                ######### occupancy_mask_warped = self._warp_yx(occupancy_mask, flow_l1)
-                ######### occupancy_mask_warped = occupancy_mask_warped.clamp(0.0, 1.0)  # Optional: clamp to prevent extreme values from destabilizing training.
-                ######### occupancy_masks.append(occupancy_mask_warped.detach())
-
-                ######### if self.use_photometric_confidence:
-                    ######### photometric_conf_l1 = self.photometric_confidence(it, tau=self.photometric_confidence_tau)
-                ######### else:
-                    ######### photometric_conf_l1 = torch.ones_like(it)
-
-                ######### conf_in = torch.cat([corr_feat_l1_chw, flow_l1, ix, iy, it, valid_l1], dim=1)
-                ######### confidence_l1 = self.iter_conf_head(conf_in)
-                ######### confidence_l1 = confidence_l1 * valid_l1 * photometric_conf_l1
-
-                ######### if self.use_data_reliability_mask:
-                    ######### grad_mag = torch.sqrt(ix * ix + iy * iy + 1e-6)
-                    ######### hqs_mag = torch.norm(flow_l1 - aux_l1, dim=1, keepdim=True)
-                    ######### flow_mag = torch.norm(flow_l1, dim=1, keepdim=True)
-
-                    ######### rel_inputs = torch.cat(
-                        ######### [
-                            ######### it.abs(),
-                            ######### grad_mag,
-                            ######### valid_l1,
-                            ######### confidence_l1,
-                            ######### hqs_mag,
-                            ######### flow_mag,
-                        ######### ],
-                        ######### dim=1,
-                    ######### )
-
-                    ######### # Detach the inputs if you want the reliability head to learn
-                    ######### # from these diagnostics without pushing gradients back through
-                    ######### # the diagnostic construction itself.
-                    ######### if self.detach_data_reliability_inputs:
-                        ######### rel_inputs = rel_inputs.detach()
-
-                    ######### # IMPORTANT:
-                    ######### # Do NOT detach data_reliability if you want the head to learn.
-                    ######### data_reliability = self.data_reliability_head(rel_inputs)
-
-                    ######### data_weight = valid_l1 * data_reliability
-                ######### else:
-                    ######### data_reliability = valid_l1
-                    ######### data_weight = valid_l1
-
-                ######### # Mask off the data_weight using the occupancy mask
-                ######### data_weight = occupancy_mask_warped * data_weight
-
-                ######### # Mask the OFCE coefficients before they enter the analytic data update.
-                ######### ix_data = ix 
-                ######### iy_data = iy
-                ######### it_data = it
-
-                ######### confidence_l1 = confidence_l1 * data_weight.detach()
-
-                ######### flow_l1, _, _ = self.hqs_data_step(
-                    ######### ix_data, iy_data, it_data, aux_l1, confidence_l1, flow_l1, beta
-                ######### )
 
                 # ------------------------------------------------------------
                 # Leakage Safe OFCE Construction (Hopefully!) at level 1
@@ -2348,7 +2304,10 @@ class HQSFlowModelTFPort(nn.Module):
                     delta_l1_prior = torch.zeros_like(delta_l1_match)
                     delta_l1 = delta_l1_match
 
-                if self.use_pgma:
+                # -------------------------------------------------------------------------
+                # PGMA per-iteration global proposal and physics-gated update
+                # -------------------------------------------------------------------------
+                if self.use_pgma_iter:
                     pgma_out_l1 = self.pgma(
                         f1=f1_l1,
                         f2=f2_l1,
@@ -2359,23 +2318,61 @@ class HQSFlowModelTFPort(nn.Module):
                         local_conf=confidence_l1,
                         validity=data_valid_l1.detach(),
                         iter_frac=it_safe.abs(),
+                        target_valid=target_valid_lvl if "target_valid_lvl" in locals() else None,
                     )
 
                     delta_l1 = pgma_out_l1["delta"]
 
-                    if "pgma_global_conf_lows" not in locals():
-                        pgma_global_conf_lows = []
-                        pgma_gate_lows = []
-                        pgma_delta_global_lows = []
+                    # Optional clamp for early stability.
+                    # At 1/8 resolution, a clamp of 8 corresponds to 64 full-res pixels.
+                    if self.pgma_max_delta_step > 0.0:
+                        delta_l1 = delta_l1.clamp(
+                            min=-self.pgma_max_delta_step,
+                            max=self.pgma_max_delta_step,
+                        )
 
-                    pgma_global_conf_lows.append(pgma_out_l1["global_conf"].detach())
-                    pgma_gate_lows.append(pgma_out_l1["gates"].detach())
-                    pgma_delta_global_lows.append(
+                    # Logging containers.
+                    if "pgma_global_flow_lows_l1" not in locals():
+                        pgma_global_flow_lows_l1 = []
+                        pgma_hard_global_flow_lows_l1 = []
+                        pgma_delta_global_lows_l1 = []
+                        pgma_global_conf_lows_l1 = []
+                        pgma_global_entropy_lows_l1 = []
+                        pgma_global_margin_lows_l1 = []
+                        pgma_gate_lows_l1 = []
+
+                    # Convert [dy, dx] internal convention to [dx, dy] for visualisation/loss,
+                    # if the rest of your repository expects optical flow as [u, v].
+                    pgma_global_flow_lows_l1.append(
+                        torch.stack(
+                            [pgma_out_l1["global_flow_yx"][:, 1], pgma_out_l1["global_flow_yx"][:, 0]],
+                            dim=1,
+                        ).detach()
+                    )
+
+                    pgma_hard_global_flow_lows_l1.append(
+                        torch.stack(
+                            [pgma_out_l1["hard_global_flow_yx"][:, 1], pgma_out_l1["hard_global_flow_yx"][:, 0]],
+                            dim=1,
+                        ).detach()
+                    )
+
+                    pgma_delta_global_lows_l1.append(
                         torch.stack(
                             [pgma_out_l1["delta_global"][:, 1], pgma_out_l1["delta_global"][:, 0]],
                             dim=1,
                         ).detach()
                     )
+
+                    pgma_global_conf_lows_l1.append(pgma_out_l1["global_conf"].detach())
+                    pgma_global_entropy_lows_l1.append(pgma_out_l1["global_entropy"].detach())
+                    pgma_global_margin_lows_l1.append(pgma_out_l1["global_margin"].detach())
+                    pgma_gate_lows_l1.append(pgma_out_l1["gates"].detach())
+
+                else:
+                    delta_l1 = delta_hqs
+
+                # -------------------------------------------------------------------------
 
                 flow_l1 = flow_l1 + gates_l1[k_l1] * delta_l1
 
@@ -2440,7 +2437,7 @@ class HQSFlowModelTFPort(nn.Module):
                 torch.stack([(flow_yx - aux_yx)[:, 1], (flow_yx - aux_yx)[:, 0]], dim=1)
             ]
 
-        return {
+        out = dict({
             "flow_preds": flow_preds,
             "flow_preds_raw": raw_flow_preds,
             "flow_low": flow_lows,
@@ -2460,10 +2457,34 @@ class HQSFlowModelTFPort(nn.Module):
             "data_weight_lows": data_weight_lows,
             "data_reliability_lows": data_reliability_lows,
             "matchability_lows": matchability_lows,
-            "pgma_global_conf_lows": pgma_global_conf_lows if self.use_pgma else [],
-            "pgma_gate_lows": pgma_gate_lows if self.use_pgma else [],
-            "pgma_delta_global_lows": pgma_delta_global_lows if self.use_pgma else [],
-        }
+        })
+
+        # Update the output dictionary with PGMA outputs if applicable.
+        if self.use_gmflow_init and pgma_init_out is not None:
+            out["gmflow_init_flow_yx"] = pgma_init_out["gmflow_init_flow_yx"]
+            out["gmflow_init_hard_flow_yx"] = pgma_init_out["gmflow_init_hard_flow_yx"]
+            out["gmflow_init_conf"] = pgma_init_out["gmflow_init_conf"]
+            out["gmflow_init_entropy"] = pgma_init_out["gmflow_init_entropy"]
+            out["gmflow_init_margin"] = pgma_init_out["gmflow_init_margin"]
+
+        if self.use_pgma_iter:
+            out["pgma_global_flow_lows"] = pgma_global_flow_lows
+            out["pgma_hard_global_flow_lows"] = pgma_hard_global_flow_lows
+            out["pgma_delta_global_lows"] = pgma_delta_global_lows
+            out["pgma_global_conf_lows"] = pgma_global_conf_lows
+            out["pgma_global_entropy_lows"] = pgma_global_entropy_lows
+            out["pgma_global_margin_lows"] = pgma_global_margin_lows
+            out["pgma_gate_lows"] = pgma_gate_lows
+        else:
+            out["pgma_global_flow_lows"] = []
+            out["pgma_hard_global_flow_lows"] = []
+            out["pgma_delta_global_lows"] = []
+            out["pgma_global_conf_lows"] = []
+            out["pgma_global_entropy_lows"] = []
+            out["pgma_global_margin_lows"] = []
+            out["pgma_gate_lows"] = []
+
+        return out
 
     def param_count(self) -> Dict[str, int]:
         def count(module: nn.Module) -> int:
