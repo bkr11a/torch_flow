@@ -127,6 +127,14 @@ model:
     direct_init_use_global_stats: true
     direct_init_max_flow: 16.0
 
+    # -- Transformer-based feature enhancer settings --
+    use_transformer_feature_enhancer: true
+    transformer_heads: 4
+    transformer_depth: 1
+    transformer_mlp_ratio: 2.0
+    transformer_dropout: 0.0
+    transformer_max_tokens: 4096
+
 # ── Loss ──────────────────────────────────────────────────────────────────
 loss:
   gamma: 0.85                     # geometric decay over stages (used when stage_weight_mode: geometric)

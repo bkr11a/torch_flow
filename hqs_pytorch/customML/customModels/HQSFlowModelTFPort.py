@@ -887,6 +887,25 @@ class HQSFlowModelTFPort(nn.Module):
         else:
             self.direct_init_head = None
 
+        # -------------------------------------------------------------------------
+        # Transformer-enhanced matching features
+        # -------------------------------------------------------------------------
+        self.use_transformer_feature_enhancer = bool(
+            _cfg_get(mb, "use_transformer_feature_enhancer", False)
+        )
+
+        if self.use_transformer_feature_enhancer:
+            self.match_feature_enhancer = TransformerFeatureEnhancer(
+                feature_dim=feature_dim,
+                num_heads=int(_cfg_get(mb, "transformer_heads", 4)),
+                depth=int(_cfg_get(mb, "transformer_depth", 1)),
+                mlp_ratio=float(_cfg_get(mb, "transformer_mlp_ratio", 2.0)),
+                dropout=float(_cfg_get(mb, "transformer_dropout", 0.0)),
+                max_tokens=int(_cfg_get(mb, "transformer_max_tokens", 4096)),
+            )
+        else:
+            self.match_feature_enhancer = None
+
     @staticmethod
     def _normalise(img: torch.Tensor) -> torch.Tensor:
         if img.max() > 2.0:
@@ -1653,8 +1672,15 @@ class HQSFlowModelTFPort(nn.Module):
 
         feat1 = self.feature_encoder(i1)
         feat2 = self.feature_encoder(i2)
+
+        f1_l1 = feat1["level1"]
+        f2_l1 = feat2["level1"]
         f1 = feat1["level2"]
         f2 = feat2["level2"]
+
+        if self.use_transformer_feature_enhancer:
+            f1_l1, f2_l1 = self.match_feature_enhancer(f1_l1, f2_l1)
+            f1, f2 = self.match_feature_enhancer(f1, f2)
 
         ctx = self.context_encoder(i1)
         context_feat = ctx["context_feat"]
@@ -2109,8 +2135,6 @@ class HQSFlowModelTFPort(nn.Module):
             # loss supervises convergence at this finer scale.  The refined flow
             # is transferred back to level2 so the post-loop network starts from
             # the best available state.
-            f1_l1 = feat1["level1"]
-            f2_l1 = feat2["level1"]
             _, _, h1, w1 = f1_l1.shape
 
             # ------ OLD Bilinear resize-based transfer (Option A) ------
