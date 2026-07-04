@@ -28,6 +28,7 @@ from hqs_pytorch.customML.customModels.sota_addons import (DirectInitialFlowHead
     BoundaryConfidenceProximal,
     FlowUncertaintyHead,
     image_edge_magnitude,
+    resize_flow_yx,
 )
 
 class GroupNorm2D(nn.Module):
@@ -906,6 +907,27 @@ class HQSFlowModelTFPort(nn.Module):
         else:
             self.match_feature_enhancer = None
 
+        # -------------------------------------------------------------------------
+        # Multi-scale global-to-local initialisation
+        # -------------------------------------------------------------------------
+        self.use_multiscale_global_init = bool(
+            _cfg_get(mb, "use_multiscale_global_init", False)
+        )
+
+        if self.use_multiscale_global_init:
+            if self.pgma is None:
+                raise ValueError("use_multiscale_global_init=True requires PGMA to be enabled.")
+
+            self.multiscale_initializer = MultiScaleGlobalLocalInitializer(
+                pgma_module=self.pgma,
+                feature_dim=feature_dim,
+                local_radius=int(_cfg_get(mb, "ms_local_radius", 4)),
+                local_temperature=float(_cfg_get(mb, "ms_local_temperature", 0.05)),
+                use_level1=bool(_cfg_get(mb, "ms_use_level1", True)),
+            )
+        else:
+            self.multiscale_initializer = None
+
     @staticmethod
     def _normalise(img: torch.Tensor) -> torch.Tensor:
         if img.max() > 2.0:
@@ -1734,7 +1756,7 @@ class HQSFlowModelTFPort(nn.Module):
         delta_init = self.allpairs_init_head(torch.cat([flow_yx, x0], dim=1))
         flow_yx = flow_yx + delta_init
         flow_yx = flow_yx
-        aux_yx = flow_yx.clone()
+
 
         # -------------------------------------------------------------------------
         # GMFlow-style global initialisation
@@ -1818,6 +1840,24 @@ class HQSFlowModelTFPort(nn.Module):
 
         # Initialise prior hidden state from the same source-context seed.
         net_prior = net.detach().clone() if self.detach_reliability_inputs else net.clone()
+        
+        # -------------------------------------------------------------------------
+        # Multi-scale global-to-local initialisation
+        # -------------------------------------------------------------------------
+        ms_init_out = None
+
+        if self.use_multiscale_global_init:
+            ms_init_out = self.multiscale_initializer(
+                feats1=feat1,
+                feats2=feat2,
+                target_valid=target_valid_lvl if "target_valid_lvl" in locals() else None,
+            )
+
+            if "flow_l1_yx" in ms_init_out:
+                # If HQS loop operates at level2, downsample back to level2.
+                flow_yx = resize_flow_yx(ms_init_out["flow_l1_yx"], f1.shape[-2:])
+            else:
+                flow_yx = ms_init_out["flow_l2_yx"]
 
         for k in range(iters):
             beta = beta_schedule[k]
@@ -2549,6 +2589,13 @@ class HQSFlowModelTFPort(nn.Module):
             out["pgma_global_entropy_lows"] = []
             out["pgma_global_margin_lows"] = []
             out["pgma_gate_lows"] = []
+
+        if ms_init_out is not None:
+            out["ms_init_flow_l2_yx"] = ms_init_out["flow_l2_yx"].detach()
+            out["ms_init_conf_l2"] = ms_init_out["conf_l2"].detach()
+            if "flow_l1_yx" in ms_init_out:
+                out["ms_init_flow_l1_yx"] = ms_init_out["flow_l1_yx"].detach()
+                out["ms_init_conf_l1"] = ms_init_out["conf_l1"].detach()
 
         return out
 

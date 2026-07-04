@@ -135,6 +135,12 @@ model:
     transformer_dropout: 0.0
     transformer_max_tokens: 4096
 
+    # -- Multi-scale global-to-local initialization --
+    use_multiscale_global_init: true
+    ms_local_radius: 4
+    ms_local_temperature: 0.05
+    use_level1: true
+
 # ── Loss ──────────────────────────────────────────────────────────────────
 loss:
   gamma: 0.85                     # geometric decay over stages (used when stage_weight_mode: geometric)
