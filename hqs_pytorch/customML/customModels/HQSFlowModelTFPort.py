@@ -22,6 +22,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from hqs_pytorch.customML.customModels.pgma import PhysicsGatedMatchingAttention
+from hqs_pytorch.customML.customModels.sota_addons import (DirectInitialFlowHead,
+    TransformerFeatureEnhancer,
+    MultiScaleGlobalLocalInitializer,
+    BoundaryConfidenceProximal,
+    FlowUncertaintyHead,
+    image_edge_magnitude,
+)
 
 class GroupNorm2D(nn.Module):
     def __init__(self, channels: int, groups: int = 8, eps: float = 1e-5) -> None:
@@ -864,6 +871,21 @@ class HQSFlowModelTFPort(nn.Module):
             )
         else:
             self.pgma = None
+
+        # -------------------------------------------------------------------------
+        # Direct initial flow regression
+        # -------------------------------------------------------------------------
+        self.use_direct_init_head = bool(_cfg_get(mb, "use_direct_init_head", False))
+
+        if self.use_direct_init_head:
+            self.direct_init_head = DirectInitialFlowHead(
+                feature_dim=feature_dim,
+                hidden_dim=int(_cfg_get(mb, "direct_init_hidden_dim", 128)),
+                use_global_stats=bool(_cfg_get(mb, "direct_init_use_global_stats", True)),
+                max_init_flow=float(_cfg_get(mb, "direct_init_max_flow", 32.0)),
+            )
+        else:
+            self.direct_init_head = None
 
     @staticmethod
     def _normalise(img: torch.Tensor) -> torch.Tensor:
@@ -1713,7 +1735,6 @@ class HQSFlowModelTFPort(nn.Module):
 
             # Keep auxiliary variable aligned with the initialised flow.
             # This prevents the first HQS residual w - q from becoming artificially huge.
-            aux_yx = flow_yx.clone()
 
             pgma_init_out = {
                 "gmflow_init_flow_yx": gm_flow_yx.detach(),
@@ -1722,6 +1743,27 @@ class HQSFlowModelTFPort(nn.Module):
                 "gmflow_init_entropy": gm_init["entropy"].detach(),
                 "gmflow_init_margin": gm_init["margin"].detach(),
             }
+
+        # -------------------------------------------------------------------------
+        # Direct initial flow regression head
+        # -------------------------------------------------------------------------
+        if self.use_direct_init_head:
+            if self.use_gmflow_init and pgma_init_out is not None:
+                gm_flow_yx = pgma_init_out["gmflow_init_flow_yx"]
+                gm_conf = pgma_init_out["gmflow_init_conf"]
+            else:
+                gm_flow_yx = flow_yx
+                gm_conf = torch.ones(flow_yx.shape[0], 1, flow_yx.shape[-2], flow_yx.shape[-1],
+                                    device=flow_yx.device, dtype=flow_yx.dtype)
+
+            flow_yx = self.direct_init_head(
+                f1=f1,
+                f2=f2,
+                gm_flow_yx=gm_flow_yx,
+                gm_conf=gm_conf,
+            )
+
+        aux_yx = flow_yx.clone()
 
         flow_preds: List[torch.Tensor] = []
         flow_lows: List[torch.Tensor] = []
