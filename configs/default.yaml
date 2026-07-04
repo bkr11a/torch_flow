@@ -117,9 +117,15 @@ model:
     pgma_use_topk: true
     pgma_match_mode: soft
     pgma_use_feature_enhancer: true
-    pgma_gate_init_hqs: 1.0
-    pgma_gate_init_global: 1.0
-    pgma_gate_init_prox: 1.0
+    pgma_gate_init_hqs: 1.5
+    pgma_gate_init_global: -1.0
+    pgma_gate_init_prox: -1.0
+
+    # -- Direct initial flow regression head settings --
+    use_direct_init_head: true
+    direct_init_hidden_dim: 128
+    direct_init_use_global_stats: true
+    direct_init_max_flow: 16.0
 
 # ── Loss ──────────────────────────────────────────────────────────────────
 loss:

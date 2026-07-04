@@ -865,9 +865,9 @@ class HQSFlowModelTFPort(nn.Module):
                 use_topk=bool(_cfg_get(mb, "pgma_use_topk", True)),
                 match_mode=str(_cfg_get(mb, "pgma_match_mode", "soft")),
                 use_feature_enhancer=bool(_cfg_get(mb, "pgma_use_feature_enhancer", True)),
-                gate_init_hqs=float(_cfg_get(mb, "pgma_gate_init_hqs", 1.0)),
-                gate_init_global=float(_cfg_get(mb, "pgma_gate_init_global", 1.0)),
-                gate_init_prox=float(_cfg_get(mb, "pgma_gate_init_prox", 1.0))
+                gate_init_hqs=float(_cfg_get(mb, "pgma_gate_init_hqs", 1.5)),
+                gate_init_global=float(_cfg_get(mb, "pgma_gate_init_global", -1.0)),
+                gate_init_prox=float(_cfg_get(mb, "pgma_gate_init_prox", -1.0))
             )
         else:
             self.pgma = None
