@@ -1859,6 +1859,8 @@ class HQSFlowModelTFPort(nn.Module):
             else:
                 flow_yx = ms_init_out["flow_l2_yx"]
 
+            aux_yx = flow_yx.clone()
+
         for k in range(iters):
             beta = beta_schedule[k]
             lam = lambda_schedule[k]
