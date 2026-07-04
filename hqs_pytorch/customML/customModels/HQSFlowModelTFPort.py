@@ -2426,7 +2426,7 @@ class HQSFlowModelTFPort(nn.Module):
                         local_conf=confidence_l1,
                         validity=data_valid_l1.detach(),
                         iter_frac=it_safe.abs(),
-                        target_valid=target_valid_lvl if "target_valid_lvl" in locals() else None,
+                        target_valid=target_valid_l1 if "target_valid_l1" in locals() else None,
                     )
 
                     delta_l1 = pgma_out_l1["delta"]
