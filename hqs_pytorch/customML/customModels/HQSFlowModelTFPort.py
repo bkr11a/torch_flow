@@ -2477,9 +2477,6 @@ class HQSFlowModelTFPort(nn.Module):
                     pgma_global_margin_lows_l1.append(pgma_out_l1["global_margin"].detach())
                     pgma_gate_lows_l1.append(pgma_out_l1["gates"].detach())
 
-                else:
-                    delta_l1 = delta_hqs
-
                 # -------------------------------------------------------------------------
 
                 flow_l1 = flow_l1 + gates_l1[k_l1] * delta_l1
