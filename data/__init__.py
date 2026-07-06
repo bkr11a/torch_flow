@@ -70,10 +70,17 @@ def _build_single(name: str, root: str, split: str, cfg, augmentor):
             direction=cfg.get("direction", "forward"),
             augmentor=augmentor,
         )
-    if name in ("kitti", "kitti15"):
+    if name in ("kitti", "kitti12", "kitti2012", "kitti15", "kitti2015"):
         sparse_aug = SparseFlowAugmentor(crop_size=tuple(cfg.crop_size)) \
-                     if split == "train" and hasattr(cfg, "crop_size") else None
-        return KITTIDataset(root=root, split=split, augmentor=sparse_aug)
+                    if split == "train" and hasattr(cfg, "crop_size") else None
+        return KITTIDataset(
+            root=root,
+            split=split,
+            augmentor=sparse_aug,
+            val_size=cfg.get("val_size", 40),
+            camera=cfg.get("camera", None),
+            flow_type=cfg.get("flow_type", "occ"),
+        )
     if name == "chairs":
         return FlyingChairsDataset(root=root, split=split, augmentor=augmentor)
     if name == "things":
