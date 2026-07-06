@@ -69,6 +69,8 @@ data:
   max_scale: 0.8
   detail_crop_prob: 0.10
   dstype: clean
+  side: both
+  direction: forward
 
 val_data:
   name: things
@@ -77,3 +79,5 @@ val_data:
   num_workers: 2
   crop_size: [400, 720]
   dstype: clean
+  side: both
+  direction: forward

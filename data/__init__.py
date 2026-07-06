@@ -77,8 +77,11 @@ def _build_single(name: str, root: str, split: str, cfg, augmentor):
         return FlyingChairsDataset(root=root, split=split, augmentor=augmentor)
     if name == "things":
         return FlyingThingsDataset(
-            root=root, split=split,
+            root=root,
+            split=split,
             dstype=cfg.get("dstype", "clean"),
+            side=cfg.get("side", "left"),              # "left" | "right" | "both"
+            direction=cfg.get("direction", "forward"), # "forward" | "backward" | "both"
             augmentor=augmentor,
         )
     raise ValueError(f"Unknown dataset: {name!r}")
