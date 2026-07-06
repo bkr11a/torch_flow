@@ -19,6 +19,30 @@ DATASETS = {
         "dstype": "clean",
     },
 
+    "things_subset_forward_both": {
+        "name": "things",
+        "root": f"{ROOT}/FlyingThings3D/FlyingThings3D_subset",
+        "dstype": "clean",
+        "side": "both",
+        "direction": "forward",
+        "crop_size": [400, 720],
+        "min_scale": -0.2,
+        "max_scale": 0.8,
+        "detail_crop_prob": 0.0,
+    },
+
+    "things_subset_forward_left": {
+        "name": "things",
+        "root": f"{ROOT}/FlyingThings3D/FlyingThings3D_subset",
+        "dstype": "clean",
+        "side": "left",
+        "direction": "forward",
+        "crop_size": [400, 720],
+        "min_scale": -0.2,
+        "max_scale": 0.8,
+        "detail_crop_prob": 0.0,
+    },
+
     "sintel_clean": {
         "name": "sintel",
         "root": f"{ROOT}/MPI-Sintel/MPI-Sintel-complete",
