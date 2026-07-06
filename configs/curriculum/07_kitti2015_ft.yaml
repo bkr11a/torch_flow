@@ -63,7 +63,7 @@ loss:
 
 data:
   name: kitti
-  root: "/mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2015"
+  root: "/mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2015/data_scene_flow"
   batch_size: 4
   num_workers: 4
   crop_size: [320, 960]
@@ -73,7 +73,7 @@ data:
 
 val_data:
   name: kitti
-  root: "/mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2015"
+  root: "/mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2015/data_scene_flow"
   batch_size: 1
   num_workers: 2
   crop_size: [320, 960]
