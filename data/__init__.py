@@ -8,12 +8,13 @@ from .base_dataset import FlowDataset
 from .sintel import SintelDataset
 from .spring import SpringDataset
 from .kitti import KITTIDataset
+from .hd1k import HD1KDataset
 from .flyingthings import FlyingChairsDataset, FlyingThingsDataset
 from .augmentation import FlowAugmentor, SparseFlowAugmentor
 
 __all__ = [
     "FlowDataset",
-    "SintelDataset", "SpringDataset", "KITTIDataset",
+    "SintelDataset", "SpringDataset", "KITTIDataset", "HD1KDataset",
     "FlyingChairsDataset", "FlyingThingsDataset",
     "FlowAugmentor", "SparseFlowAugmentor",
     "build_dataset", "build_dataloader",
@@ -83,6 +84,17 @@ def _build_single(name: str, root: str, split: str, cfg, augmentor):
             side=cfg.get("side", "left"),              # "left" | "right" | "both"
             direction=cfg.get("direction", "forward"), # "forward" | "backward" | "both"
             augmentor=augmentor,
+        )
+    if name in ("hd1k", "h1dk"):
+        sparse_aug = SparseFlowAugmentor(crop_size=tuple(cfg.crop_size)) \
+                    if split == "train" and hasattr(cfg, "crop_size") else None
+        return HD1KDataset(
+            root=root,
+            split=split,
+            camera=cfg.get("camera", "image_2"),
+            val_fraction=cfg.get("val_fraction", 0.10),
+            val_num_sequences=cfg.get("val_num_sequences", None),
+            augmentor=sparse_aug,
         )
     raise ValueError(f"Unknown dataset: {name!r}")
 

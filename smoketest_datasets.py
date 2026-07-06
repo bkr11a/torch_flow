@@ -112,6 +112,17 @@ DATASETS = {
         "max_scale": 0.4,
         "detail_crop_prob": 0.0,
     },
+
+    "hd1k": {
+        "name": "hd1k",
+        "root": f"{ROOT}/HD1K/hd1k_full_package",
+        "camera": "image_2",
+        "crop_size": [320, 960],
+        "min_scale": -0.2,
+        "max_scale": 0.4,
+        "detail_crop_prob": 0.0,
+        "val_fraction": 0.10,
+    },
 }
 
 
