@@ -97,7 +97,7 @@ DATASETS = {
 
     "kitti_2012": {
         "name": "kitti",
-        "root": f"{ROOT}/KITTI/KITTI 2012",
+        "root": f"{ROOT}/KITTI/KITTI 2012/data_stereo_flow",
         "crop_size": [320, 960],
         "min_scale": -0.2,
         "max_scale": 0.4,
@@ -106,7 +106,7 @@ DATASETS = {
 
     "kitti_2015": {
         "name": "kitti",
-        "root": f"{ROOT}/KITTI/KITTI 2015",
+        "root": f"{ROOT}/KITTI/KITTI 2015/data_scene_flow",
         "crop_size": [320, 960],
         "min_scale": -0.2,
         "max_scale": 0.4,
