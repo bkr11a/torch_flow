@@ -39,4 +39,7 @@ CKPT_04="checkpoints/curr_04_sintel_final_refine/best.pth"
 run_stage "05_spring_detail_refine.yaml" "$CKPT_04"
 CKPT_05="checkpoints/curr_05_spring_detail_refine/best.pth"
 
-run_stage "06_kitti2015_ft.yaml" "$CKPT_05"
+run_stage "06_hd1k_road_refine.yaml" "$CKPT_05"
+CKPT_06="checkpoints/curr_06_hd1k_road_refine/best.pth"
+
+run_stage "07_kitti2015_ft.yaml" "$CKPT_06"

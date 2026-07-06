@@ -1,14 +1,16 @@
-run_name: curr_06_kitti2015_ft
+run_name: curr_06_hd1k_road_refine
 
 mlflow:
   experiment_name: "HQSFlow_Curriculum"
   tags:
     project: "torch_flow"
     framework: "pytorch"
-    curriculum_stage: "06_kitti2015_ft"
+    curriculum_stage: "06_hd1k_road_refine"
+    dataset: "hd1k"
+    domain: "driving"
 
 training:
-  num_steps: 40000
+  num_steps: 50000
   lr: 5.0e-5
   weight_decay: 1.0e-4
   warmup_pct: 0.05
@@ -51,6 +53,7 @@ loss:
   gamma: 0.85
   max_flow: 400.0
   loss_fn: charbonnier
+
   smooth_weight: 0.0
   inter_smooth_weight: 0.005
   boundary_weight: 0.02
@@ -62,18 +65,22 @@ loss:
   ofce_weight: 0.0
 
 data:
-  name: kitti
-  root: "/mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2015"
+  name: hd1k
+  root: "/mnt/a/benchmark_data/optical_flow/HD1K/hd1k_full_package"
+  camera: image_2
   batch_size: 4
   num_workers: 4
   crop_size: [320, 960]
   min_scale: -0.2
   max_scale: 0.4
-  detail_crop_prob: 0.25
+  detail_crop_prob: 0.10
+  val_fraction: 0.10
 
 val_data:
-  name: kitti
-  root: "/mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2015"
+  name: hd1k
+  root: "/mnt/a/benchmark_data/optical_flow/HD1K/hd1k_full_package"
+  camera: image_2
   batch_size: 1
   num_workers: 2
   crop_size: [320, 960]
+  val_fraction: 0.10
