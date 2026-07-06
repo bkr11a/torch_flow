@@ -1,0 +1,73 @@
+run_name: curr_01_chairs_baseline
+
+mlflow:
+  experiment_name: "HQSFlow_Curriculum"
+  tags:
+    project: "torch_flow"
+    framework: "pytorch"
+    curriculum_stage: "01_chairs_baseline"
+
+training:
+  num_steps: 100000
+  lr: 4.0e-4
+  weight_decay: 1.0e-4
+  warmup_pct: 0.05
+  grad_clip: 1.0
+  log_every: 100
+  val_every: 10000
+  save_every: 20000
+  checkpoint: null
+  resume_mode: weights_only
+
+model:
+  model_backbone:
+    use_pgma: false
+    use_gmflow_init: false
+    use_pgma_iter: false
+    pgma_max_delta_step: 0.0
+    gmflow_init_scale: 0.0
+
+    use_direct_init_head: false
+    use_transformer_feature_enhancer: false
+    use_multiscale_global_init: false
+    use_learned_prox: false
+
+    use_data_reliability_mask: false
+    use_self_occupancy_mask: false
+    use_photometric_confidence: false
+
+    num_hqs_iterations: 12
+    pyramid_l1_iters: 0
+
+loss:
+  stage_weight_mode: geometric
+  num_stages: 12
+  gamma: 0.85
+  max_flow: 400.0
+  loss_fn: charbonnier
+  smooth_weight: 0.0
+  inter_smooth_weight: 0.0
+  boundary_weight: 0.0
+  raw_final_weight: 0.0
+  iter_damp_weight: 0.0
+  photo_weight: 0.0
+  ofce_weight: 0.0
+
+data:
+  name: chairs
+  root: "/mnt/a/benchmark_data/optical_flow/FlyingChairs_release"
+  batch_size: 6
+  num_workers: 4
+  crop_size: [368, 496]
+  min_scale: -0.1
+  max_scale: 1.0
+  detail_crop_prob: 0.0
+  dstype: clean
+
+val_data:
+  name: chairs
+  root: "/mnt/a/benchmark_data/optical_flow/FlyingChairs_release"
+  batch_size: 4
+  num_workers: 2
+  crop_size: [368, 496]
+  dstype: clean

@@ -1,0 +1,81 @@
+run_name: curr_03_sintel_clean_refine
+
+mlflow:
+  experiment_name: "HQSFlow_Curriculum"
+  tags:
+    project: "torch_flow"
+    framework: "pytorch"
+    curriculum_stage: "03_sintel_clean_refine"
+
+training:
+  num_steps: 50000
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  warmup_pct: 0.05
+  grad_clip: 1.0
+  log_every: 100
+  val_every: 5000
+  save_every: 10000
+  checkpoint: null
+  resume_mode: weights_only
+
+model:
+  model_backbone:
+    use_pgma: true
+    use_gmflow_init: true
+    use_pgma_iter: false
+    gmflow_init_scale: 0.25
+    pgma_max_delta_step: 4.0
+    pgma_match_mode: straight_through
+    pgma_gate_init_hqs: 1.5
+    pgma_gate_init_global: -3.0
+    pgma_gate_init_prox: -3.0
+
+    use_direct_init_head: false
+    use_transformer_feature_enhancer: false
+    use_multiscale_global_init: false
+    use_learned_prox: false
+
+    use_data_reliability_mask: true
+    detach_data_reliability_inputs: true
+    data_reliability_m_min: 0.02
+    use_self_occupancy_mask: false
+    use_photometric_confidence: false
+
+    num_hqs_iterations: 12
+    pyramid_l1_iters: 4
+
+loss:
+  stage_weight_mode: geometric
+  num_stages: 16
+  gamma: 0.85
+  max_flow: 400.0
+  loss_fn: charbonnier
+  smooth_weight: 0.0
+  inter_smooth_weight: 0.005
+  boundary_weight: 0.02
+  boundary_thresh: 0.03
+  raw_final_weight: 0.0
+  iter_damp_weight: 0.002
+  iter_damp_start_frac: 0.5
+  photo_weight: 0.0
+  ofce_weight: 0.0
+
+data:
+  name: sintel
+  root: "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete"
+  batch_size: 4
+  num_workers: 4
+  crop_size: [368, 768]
+  min_scale: -0.2
+  max_scale: 0.6
+  detail_crop_prob: 0.20
+  dstype: clean
+
+val_data:
+  name: sintel
+  root: "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete"
+  batch_size: 1
+  num_workers: 2
+  crop_size: [368, 768]
+  dstype: clean
