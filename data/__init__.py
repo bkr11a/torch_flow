@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from torch.utils.data import ConcatDataset, DataLoader
 from typing import Optional
+from omegaconf import OmegaConf
 
+from .mixed_dataset import WeightedMixedFlowDataset
 from .base_dataset import FlowDataset
 from .sintel import SintelDataset
 from .spring import SpringDataset
@@ -17,7 +19,7 @@ __all__ = [
     "SintelDataset", "SpringDataset", "KITTIDataset", "HD1KDataset",
     "FlyingChairsDataset", "FlyingThingsDataset",
     "FlowAugmentor", "SparseFlowAugmentor",
-    "build_dataset", "build_dataloader",
+    "build_dataset", "build_dataloader", "WeightedMixedFlowDataset",
 ]
 
 
@@ -34,6 +36,18 @@ def build_dataset(cfg, split: str = "train"):
 
     When *name* is a list, datasets are concatenated with equal weighting.
     """
+
+    mode = cfg.get("mode", None)
+    name_field = cfg.get("name", None)
+
+    if mode is not None and str(mode).lower() in ("weighted_mixed", "mixed_weighted", "universal_mixed"):
+        return _build_weighted_mixed_dataset(cfg, split=split)
+
+    if isinstance(name_field, str) and name_field.lower() in (
+        "weighted_mixed", "mixed_weighted", "universal_mixed"
+    ):
+        return _build_weighted_mixed_dataset(cfg, split=split)
+
     augmentor = None
     if split == "train" and hasattr(cfg, "crop_size"):
         crop = tuple(cfg.crop_size)  # (H, W)
@@ -55,6 +69,59 @@ def build_dataset(cfg, split: str = "train"):
         return datasets[0]
     return ConcatDataset(datasets)
 
+def _build_weighted_mixed_dataset(cfg, split: str = "train"):
+    if not hasattr(cfg, "datasets"):
+        raise ValueError("weighted_mixed data config requires a `datasets` list")
+
+    base_dict = OmegaConf.to_container(cfg, resolve=True)
+    assert isinstance(base_dict, dict)
+
+    for k in (
+        "mode", "name", "datasets", "weights", "epoch_size", "deterministic",
+        "seed", "include_dataset_id", "batch_size", "num_workers",
+    ):
+        base_dict.pop(k, None)
+
+    datasets = []
+    weights = []
+    labels = []
+
+    for item in cfg.datasets:
+        item_dict = OmegaConf.to_container(item, resolve=True)
+        assert isinstance(item_dict, dict)
+
+        weight = float(item_dict.pop("weight", 1.0))
+        label = item_dict.pop("label", None)
+        name = item_dict.get("name", None)
+        root = item_dict.get("root", None)
+
+        if name is None or root is None:
+            raise ValueError(f"Each weighted_mixed child requires name and root: {item_dict}")
+
+        child_cfg = OmegaConf.create({**base_dict, **item_dict})
+
+        augmentor = None
+        if split == "train" and hasattr(child_cfg, "crop_size"):
+            augmentor = FlowAugmentor(
+                crop_size=tuple(child_cfg.crop_size),
+                min_scale=child_cfg.get("min_scale", -0.2),
+                max_scale=child_cfg.get("max_scale", 0.5),
+                detail_crop_prob=child_cfg.get("detail_crop_prob", 0.0),
+            )
+
+        datasets.append(_build_single(name, root, split, child_cfg, augmentor))
+        weights.append(weight)
+        labels.append(str(label if label is not None else name))
+
+    return WeightedMixedFlowDataset(
+        datasets=datasets,
+        weights=weights,
+        names=labels,
+        epoch_size=cfg.get("epoch_size", 50000),
+        deterministic=cfg.get("deterministic", split != "train"),
+        seed=cfg.get("seed", 12345),
+        include_dataset_id=cfg.get("include_dataset_id", True),
+    )
 
 def _build_single(name: str, root: str, split: str, cfg, augmentor):
     name = name.lower()
