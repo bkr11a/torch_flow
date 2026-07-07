@@ -1,0 +1,295 @@
+curriculum:
+  enabled: true
+  description: >
+    Universal anti-forgetting curriculum with weighted replay mixing.
+
+  stages:
+    - id: u01_chairs_baseline
+      enabled: true
+      checkpoint_from_previous: false
+      checkpoint_tag: best
+      run_name: curr_u01_chairs_baseline
+      mlflow:
+        experiment_name: "HQSFlow_Universal_Curriculum"
+        tags:
+          curriculum_stage: "u01_chairs_baseline"
+          dataset_mode: "single"
+      training:
+        num_steps: 100000
+        lr: 4.0e-4
+        val_every: 10000
+        save_every: 20000
+        checkpoint: null
+        resume_mode: weights_only
+      model:
+        model_backbone:
+          use_pgma: false
+          use_gmflow_init: false
+          use_pgma_iter: false
+          use_direct_init_head: false
+          use_transformer_feature_enhancer: false
+          use_multiscale_global_init: false
+          use_learned_prox: false
+          use_data_reliability_mask: false
+          use_self_occupancy_mask: false
+          num_hqs_iterations: 12
+          pyramid_l1_iters: 0
+      loss:
+        stage_weight_mode: geometric
+        num_stages: 12
+        smooth_weight: 0.0
+        inter_smooth_weight: 0.0
+        boundary_weight: 0.0
+        raw_final_weight: 0.0
+        iter_damp_weight: 0.0
+        photo_weight: 0.0
+        ofce_weight: 0.0
+      data:
+        mode: single
+        name: chairs
+        root: "/mnt/a/benchmark_data/optical_flow/FlyingChairs_release"
+        batch_size: 6
+        num_workers: 4
+        crop_size: [368, 496]
+        min_scale: -0.1
+        max_scale: 1.0
+        detail_crop_prob: 0.0
+        dstype: clean
+      val_data:
+        mode: single
+        name: chairs
+        root: "/mnt/a/benchmark_data/optical_flow/FlyingChairs_release"
+        batch_size: 4
+        num_workers: 2
+        crop_size: [368, 496]
+        dstype: clean
+
+    - id: u02_things_pgma_init
+      enabled: true
+      checkpoint_from_previous: true
+      checkpoint_tag: best
+      run_name: curr_u02_things_pgma_init
+      mlflow:
+        experiment_name: "HQSFlow_Universal_Curriculum"
+        tags:
+          curriculum_stage: "u02_things_pgma_init"
+          dataset_mode: "single"
+      training:
+        num_steps: 150000
+        lr: 1.25e-4
+        val_every: 10000
+        save_every: 25000
+        checkpoint: null
+        resume_mode: weights_only
+      model:
+        model_backbone:
+          use_pgma: true
+          use_gmflow_init: true
+          use_pgma_iter: false
+          gmflow_init_scale: 0.25
+          pgma_max_delta_step: 4.0
+          pgma_match_mode: straight_through
+          pgma_gate_init_hqs: 1.5
+          pgma_gate_init_global: -3.0
+          pgma_gate_init_prox: -3.0
+          use_direct_init_head: false
+          use_transformer_feature_enhancer: false
+          use_multiscale_global_init: false
+          use_learned_prox: false
+          use_data_reliability_mask: false
+          use_self_occupancy_mask: false
+          num_hqs_iterations: 12
+          pyramid_l1_iters: 0
+      loss:
+        stage_weight_mode: geometric
+        num_stages: 12
+        smooth_weight: 0.0
+        inter_smooth_weight: 0.0
+        boundary_weight: 0.0
+        raw_final_weight: 0.0
+        iter_damp_weight: 0.0
+        photo_weight: 0.0
+        ofce_weight: 0.0
+      data:
+        mode: single
+        name: things
+        root: "/mnt/a/benchmark_data/optical_flow/FlyingThings3D/FlyingThings3D_subset"
+        dstype: clean
+        side: both
+        direction: forward
+        batch_size: 4
+        num_workers: 4
+        crop_size: [400, 720]
+        min_scale: -0.2
+        max_scale: 0.8
+        detail_crop_prob: 0.10
+      val_data:
+        mode: single
+        name: things
+        root: "/mnt/a/benchmark_data/optical_flow/FlyingThings3D/FlyingThings3D_subset"
+        dstype: clean
+        side: both
+        direction: forward
+        batch_size: 1
+        num_workers: 2
+        crop_size: [400, 720]
+
+    - id: u03_general_replay_mixed
+      enabled: true
+      checkpoint_from_previous: true
+      checkpoint_tag: best
+      run_name: curr_u03_general_replay_mixed
+      mlflow:
+        experiment_name: "HQSFlow_Universal_Curriculum"
+        tags:
+          curriculum_stage: "u03_general_replay_mixed"
+          dataset_mode: "weighted_mixed"
+      training:
+        num_steps: 100000
+        lr: 1.0e-4
+        val_every: 5000
+        save_every: 20000
+        checkpoint: null
+        resume_mode: weights_only
+      model:
+        model_backbone:
+          use_pgma: true
+          use_gmflow_init: true
+          use_pgma_iter: false
+          gmflow_init_scale: 0.25
+          pgma_max_delta_step: 4.0
+          pgma_match_mode: straight_through
+          pgma_gate_init_hqs: 1.5
+          pgma_gate_init_global: -3.0
+          pgma_gate_init_prox: -3.0
+          use_direct_init_head: false
+          use_transformer_feature_enhancer: false
+          use_multiscale_global_init: false
+          use_learned_prox: false
+          use_data_reliability_mask: true
+          data_reliability_m_min: 0.02
+          use_self_occupancy_mask: false
+          num_hqs_iterations: 12
+          pyramid_l1_iters: 4
+      loss:
+        stage_weight_mode: geometric
+        num_stages: 16
+        inter_smooth_weight: 0.005
+        boundary_weight: 0.02
+        iter_damp_weight: 0.002
+        photo_weight: 0.0
+        ofce_weight: 0.0
+      data:
+        mode: weighted_mixed
+        epoch_size: 50000
+        deterministic: false
+        seed: 31003
+        include_dataset_id: true
+        batch_size: 4
+        num_workers: 4
+        crop_size: [400, 720]
+        min_scale: -0.2
+        max_scale: 0.6
+        detail_crop_prob: 0.20
+        datasets:
+          - {label: things_subset, name: things, root: "/mnt/a/benchmark_data/optical_flow/FlyingThings3D/FlyingThings3D_subset", dstype: clean, side: both, direction: forward, weight: 0.40}
+          - {label: sintel_clean, name: sintel, root: "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete", dstype: clean, weight: 0.10}
+          - {label: sintel_final, name: sintel, root: "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete", dstype: final, weight: 0.20}
+          - {label: spring_left, name: spring, root: "/mnt/a/benchmark_data/optical_flow/Spring/spring", direction: forward, side: left, val_fraction: 0.10, weight: 0.30}
+      val_data:
+        mode: weighted_mixed
+        epoch_size: 512
+        deterministic: true
+        seed: 931003
+        include_dataset_id: true
+        batch_size: 1
+        num_workers: 2
+        crop_size: [400, 720]
+        datasets:
+          - {label: things_subset, name: things, root: "/mnt/a/benchmark_data/optical_flow/FlyingThings3D/FlyingThings3D_subset", dstype: clean, side: both, direction: forward, weight: 0.30}
+          - {label: sintel_clean, name: sintel, root: "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete", dstype: clean, weight: 0.15}
+          - {label: sintel_final, name: sintel, root: "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete", dstype: final, weight: 0.25}
+          - {label: spring_left, name: spring, root: "/mnt/a/benchmark_data/optical_flow/Spring/spring", direction: forward, side: left, val_fraction: 0.10, weight: 0.30}
+
+    - id: u04_universal_balanced_final
+      enabled: true
+      checkpoint_from_previous: true
+      checkpoint_tag: best
+      run_name: curr_u04_universal_balanced_final
+      mlflow:
+        experiment_name: "HQSFlow_Universal_Curriculum"
+        tags:
+          curriculum_stage: "u04_universal_balanced_final"
+          dataset_mode: "weighted_mixed"
+      training:
+        num_steps: 75000
+        lr: 5.0e-5
+        val_every: 5000
+        save_every: 15000
+        checkpoint: null
+        resume_mode: weights_only
+      model:
+        model_backbone:
+          use_pgma: true
+          use_gmflow_init: true
+          use_pgma_iter: false
+          gmflow_init_scale: 0.25
+          pgma_max_delta_step: 4.0
+          pgma_match_mode: straight_through
+          pgma_gate_init_hqs: 1.5
+          pgma_gate_init_global: -3.0
+          pgma_gate_init_prox: -3.0
+          use_direct_init_head: false
+          use_transformer_feature_enhancer: false
+          use_multiscale_global_init: false
+          use_learned_prox: false
+          use_data_reliability_mask: true
+          data_reliability_m_min: 0.02
+          use_self_occupancy_mask: false
+          num_hqs_iterations: 12
+          pyramid_l1_iters: 4
+      loss:
+        stage_weight_mode: geometric
+        num_stages: 16
+        inter_smooth_weight: 0.005
+        boundary_weight: 0.02
+        iter_damp_weight: 0.002
+        photo_weight: 0.0
+        ofce_weight: 0.0
+      data:
+        mode: weighted_mixed
+        epoch_size: 30000
+        deterministic: false
+        seed: 41004
+        include_dataset_id: true
+        batch_size: 4
+        num_workers: 4
+        crop_size: [320, 768]
+        min_scale: -0.2
+        max_scale: 0.4
+        detail_crop_prob: 0.25
+        datasets:
+          - {label: things_subset, name: things, root: "/mnt/a/benchmark_data/optical_flow/FlyingThings3D/FlyingThings3D_subset", dstype: clean, side: both, direction: forward, weight: 0.25}
+          - {label: spring_left, name: spring, root: "/mnt/a/benchmark_data/optical_flow/Spring/spring", direction: forward, side: left, val_fraction: 0.10, weight: 0.25}
+          - {label: sintel_final, name: sintel, root: "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete", dstype: final, weight: 0.20}
+          - {label: sintel_clean, name: sintel, root: "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete", dstype: clean, weight: 0.10}
+          - {label: hd1k, name: hd1k, root: "/mnt/a/benchmark_data/optical_flow/HD1K/hd1k_full_package", camera: image_2, val_fraction: 0.10, weight: 0.10}
+          - {label: kitti2015, name: kitti, root: "/mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2015/data_scene_flow", camera: image_2, flow_type: occ, weight: 0.07}
+          - {label: kitti2012, name: kitti, root: "/mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2012/data_stereo_flow", camera: image_0, flow_type: occ, weight: 0.03}
+      val_data:
+        mode: weighted_mixed
+        epoch_size: 768
+        deterministic: true
+        seed: 941004
+        include_dataset_id: true
+        batch_size: 1
+        num_workers: 2
+        crop_size: [320, 768]
+        datasets:
+          - {label: things_subset, name: things, root: "/mnt/a/benchmark_data/optical_flow/FlyingThings3D/FlyingThings3D_subset", dstype: clean, side: both, direction: forward, weight: 0.20}
+          - {label: spring_left, name: spring, root: "/mnt/a/benchmark_data/optical_flow/Spring/spring", direction: forward, side: left, val_fraction: 0.10, weight: 0.20}
+          - {label: sintel_final, name: sintel, root: "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete", dstype: final, weight: 0.20}
+          - {label: sintel_clean, name: sintel, root: "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete", dstype: clean, weight: 0.10}
+          - {label: hd1k, name: hd1k, root: "/mnt/a/benchmark_data/optical_flow/HD1K/hd1k_full_package", camera: image_2, val_fraction: 0.10, weight: 0.15}
+          - {label: kitti2015, name: kitti, root: "/mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2015/data_scene_flow", camera: image_2, flow_type: occ, weight: 0.10}
+          - {label: kitti2012, name: kitti, root: "/mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2012/data_stereo_flow", camera: image_0, flow_type: occ, weight: 0.05}
