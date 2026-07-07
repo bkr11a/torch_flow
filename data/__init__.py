@@ -66,8 +66,12 @@ def _build_single(name: str, root: str, split: str, cfg, augmentor):
         )
     if name == "spring":
         return SpringDataset(
-            root=root, split=split,
+            root=root,
+            split=split,
             direction=cfg.get("direction", "forward"),
+            side=cfg.get("side", "left"),
+            val_scenes=cfg.get("val_scenes", None),
+            val_fraction=cfg.get("val_fraction", 0.10),
             augmentor=augmentor,
         )
     if name in ("kitti", "kitti12", "kitti2012", "kitti15", "kitti2015"):
