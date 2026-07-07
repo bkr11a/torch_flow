@@ -33,6 +33,7 @@ import re
 from pathlib import Path
 from typing import Callable, List, Optional
 
+import torch
 import numpy as np
 
 from .base_dataset import FlowDataset
@@ -269,6 +270,93 @@ class SpringDataset(FlowDataset):
             return self._load_flow_flo5(path)
 
         return super()._load_flow(path)
+
+    @staticmethod
+    def _subsample_spring_flow_to_image_grid(
+        flow: np.ndarray,
+        image_shape,
+        flow_path: str,
+    ) -> np.ndarray:
+        """
+        Spring stores HD images but UHD ground-truth flow.
+
+        Typical Spring optical-flow training layout:
+            image: 1080 x 1920
+            flow:  2160 x 3840
+
+        SOTA-style training, e.g. SEA-RAFT-style Spring loading, subsamples the
+        UHD flow to the image grid using every second GT value:
+
+            flow = flow[::2, ::2]
+
+        We do NOT scale u/v here.
+        """
+        img_h, img_w = image_shape[:2]
+        flow_h, flow_w = flow.shape[:2]
+
+        if (flow_h, flow_w) == (img_h, img_w):
+            return np.ascontiguousarray(flow.astype(np.float32))
+
+        if flow_h == 2 * img_h and flow_w == 2 * img_w:
+            return np.ascontiguousarray(flow[::2, ::2].astype(np.float32))
+
+        raise RuntimeError(
+            "Spring flow/image resolution mismatch.\n"
+            f"  image_shape: {(img_h, img_w)}\n"
+            f"  flow_shape:  {(flow_h, flow_w)}\n"
+            f"  flow_path:   {flow_path}\n\n"
+            "Expected either same resolution or Spring's standard 2x UHD flow."
+        )
+
+    def __getitem__(self, idx: int):
+        s = self._samples[idx]
+
+        img1 = self._load_image(s["image1"])
+        img2 = self._load_image(s["image2"])
+
+        if s.get("flow") is not None:
+            flow = self._load_flow(s["flow"])
+
+            # Critical Spring-specific step:
+            # .flo5 GT is UHD, images are HD. Bring GT onto image grid.
+            flow = self._subsample_spring_flow_to_image_grid(
+                flow=flow,
+                image_shape=img1.shape,
+                flow_path=s["flow"],
+            )
+
+            valid = np.ones((flow.shape[0], flow.shape[1]), dtype=bool)
+            valid &= np.isfinite(flow[:, :, 0]) & np.isfinite(flow[:, :, 1])
+            flow[~valid] = 0.0
+        else:
+            h, w = img1.shape[:2]
+            flow = np.zeros((h, w, 2), dtype=np.float32)
+            valid = np.zeros((h, w), dtype=bool)
+
+        sample = {
+            "image1": img1,
+            "image2": img2,
+            "flow": flow,
+            "valid": valid,
+            "occlusion": None,
+            "invalid": None,
+        }
+
+        if self.augmentor is not None and self.split == "train":
+            sample = self.augmentor(sample)
+
+        return {
+            "image1": self._to_tensor(sample["image1"]),
+            "image2": self._to_tensor(sample["image2"]),
+            "flow": torch.from_numpy(
+                sample["flow"].transpose(2, 0, 1).copy()
+            ).float(),
+            "valid": torch.from_numpy(
+                sample["valid"].astype(np.float32)
+            ),
+            "occlusion": None,
+            "invalid": None,
+        }
 
     @staticmethod
     def _load_flow_flo5(path: str) -> np.ndarray:
