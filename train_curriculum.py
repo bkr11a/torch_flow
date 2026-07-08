@@ -17,16 +17,56 @@ def parse_args():
     p.add_argument("--start-stage", default=None)
     p.add_argument("--stop-after-stage", default=None)
     p.add_argument("--run-optional", action="store_true")
+    p.add_argument(
+        "--base-run-name",
+        default=None,
+        help=(
+            "Optional grouping name for all curriculum stages. "
+            "Example: --base-run-name hqs_flow_curriculum_test"
+        ),
+    )
     p.add_argument("overrides", nargs="*")
     return p.parse_args()
 
+def pop_global_run_name(cli_cfg: Optional[DictConfig]) -> Optional[str]:
+    """
+    Treat a CLI override like:
+
+        run_name=hqs_flow_curriculum_test
+
+    as a curriculum base/group name, not as a replacement for every stage
+    run_name.
+
+    Without this, all stages write into the same TensorBoard/checkpoint path.
+    """
+    if cli_cfg is None:
+        return None
+
+    if "run_name" not in cli_cfg:
+        return None
+
+    run_name = str(cli_cfg.run_name)
+
+    with open_dict(cli_cfg):
+        del cli_cfg["run_name"]
+
+    return run_name
+
 def setup_logging(log_dir: str, run_name: str) -> None:
     os.makedirs(log_dir, exist_ok=True)
+
+    # run_name may now be nested, e.g.
+    #   hqs_flow_curriculum_test/curr_u01_chairs_baseline
     log_file = os.path.join(log_dir, f"{run_name}.log")
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler(log_file)],
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(log_file),
+        ],
         force=True,
     )
 
@@ -60,6 +100,12 @@ def main():
         raise RuntimeError("Curriculum YAML has no stages")
 
     global_cli_cfg = OmegaConf.from_dotlist(args.overrides) if args.overrides else None
+    
+    # Backward-compatible convenience:
+    # If the user passes run_name=foo on the CLI, treat it as a curriculum
+    # grouping name, not as a stage run_name override.
+    cli_base_run_name = pop_global_run_name(global_cli_cfg)
+    
     from engine import Trainer
 
     previous_checkpoint = None
@@ -79,9 +125,39 @@ def main():
             print(f"Skipping optional stage: {stage_id}")
             continue
 
+        stage_run_name = str(stage.get("run_name", stage_id))
+
         cfg = OmegaConf.merge(base_cfg, stage_to_override(stage))
         if global_cli_cfg is not None:
             cfg = OmegaConf.merge(cfg, global_cli_cfg)
+
+        base_run_name = (
+            args.base_run_name
+            or cli_base_run_name
+            or curr.get("base_run_name", None)
+        )
+
+        if base_run_name:
+            with open_dict(cfg):
+                # This gives nested TensorBoard/checkpoint dirs:
+                #
+                #   logs/<base_run_name>/<stage_run_name>
+                #   checkpoints/<base_run_name>/<stage_run_name>
+                #
+                # because Trainer writes to:
+                #
+                #   os.path.join(log_dir, run_name)
+                #   os.path.join(checkpoint_dir, run_name)
+                cfg.run_name = f"{base_run_name}/{stage_run_name}"
+
+                if not hasattr(cfg, "mlflow") or cfg.mlflow is None:
+                    cfg.mlflow = {}
+
+                if not hasattr(cfg.mlflow, "tags") or cfg.mlflow.tags is None:
+                    cfg.mlflow.tags = {}
+
+                cfg.mlflow.tags["curriculum_base_run_name"] = str(base_run_name)
+                cfg.mlflow.tags["curriculum_stage_run_name"] = str(stage_run_name)
 
         if bool(stage.get("checkpoint_from_previous", idx > 0)) and previous_checkpoint:
             with open_dict(cfg):
