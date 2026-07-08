@@ -48,7 +48,7 @@ curriculum:
         mode: single
         name: chairs
         root: "/mnt/a/benchmark_data/optical_flow/FlyingChairs_release"
-        batch_size: 8
+        batch_size: 6
         num_workers: 4
         crop_size: [368, 496]
         min_scale: -0.1
