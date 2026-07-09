@@ -776,6 +776,95 @@ class Trainer:
     # Validation
     # ─────────────────────────────────────────────────────────────────────── #
 
+    def _get_validation_crop_size(self):
+        """
+        Return deterministic validation crop size.
+
+        For training-time checkpoint selection, we do not want to run RAFT-style
+        all-pairs correlation on native 1080p/2K validation frames. This crop is
+        for validation during training only, not for final benchmark reporting.
+
+        Uses:
+            val_data.eval_crop_size if present
+            else val_data.crop_size if present
+
+        Disable with:
+            val_data.eval_center_crop: false
+        """
+        if not hasattr(self.cfg, "val_data") or self.cfg.val_data is None:
+            return None
+
+        if self.cfg.val_data.get("eval_center_crop", True) is False:
+            return None
+
+        crop_size = self.cfg.val_data.get(
+            "eval_crop_size",
+            self.cfg.val_data.get("crop_size", None),
+        )
+
+        if crop_size is None:
+            return None
+
+        if len(crop_size) != 2:
+            raise ValueError(f"Expected validation crop_size [H, W], got {crop_size}")
+
+        return int(crop_size[0]), int(crop_size[1])
+
+    @staticmethod
+    def _crop_mask_like(mask, y0: int, x0: int, crop_h: int, crop_w: int):
+        if mask is None:
+            return None
+
+        if mask.ndim == 3:
+            return mask[:, y0:y0 + crop_h, x0:x0 + crop_w]
+
+        if mask.ndim == 4:
+            return mask[:, :, y0:y0 + crop_h, x0:x0 + crop_w]
+
+        raise ValueError(f"Expected mask shape [B,H,W] or [B,1,H,W], got {mask.shape}")
+
+    def _maybe_center_crop_validation_batch(
+        self,
+        img1,
+        img2,
+        flow,
+        valid,
+        occ_batch,
+        inv_batch,
+    ):
+        crop_size = self._get_validation_crop_size()
+
+        if crop_size is None:
+            return img1, img2, flow, valid, occ_batch, inv_batch
+
+        crop_h, crop_w = crop_size
+        _, _, h, w = img1.shape
+
+        crop_h = min(crop_h, h)
+        crop_w = min(crop_w, w)
+
+        if crop_h == h and crop_w == w:
+            return img1, img2, flow, valid, occ_batch, inv_batch
+
+        y0 = (h - crop_h) // 2
+        x0 = (w - crop_w) // 2
+
+        img1 = img1[:, :, y0:y0 + crop_h, x0:x0 + crop_w]
+        img2 = img2[:, :, y0:y0 + crop_h, x0:x0 + crop_w]
+        flow = flow[:, :, y0:y0 + crop_h, x0:x0 + crop_w]
+
+        if valid.ndim == 3:
+            valid = valid[:, y0:y0 + crop_h, x0:x0 + crop_w]
+        elif valid.ndim == 4:
+            valid = valid[:, :, y0:y0 + crop_h, x0:x0 + crop_w]
+        else:
+            raise ValueError(f"Expected valid shape [B,H,W] or [B,1,H,W], got {valid.shape}")
+
+        occ_batch = self._crop_mask_like(occ_batch, y0, x0, crop_h, crop_w)
+        inv_batch = self._crop_mask_like(inv_batch, y0, x0, crop_h, crop_w)
+
+        return img1, img2, flow, valid, occ_batch, inv_batch
+
     def _validate(self) -> Optional[Dict[str, float]]:
         if not self._has_val:
             return None
@@ -800,6 +889,24 @@ class Trainer:
                 occ_batch = batch.get("occlusion")  # (B, H, W) tensor or None
                 inv_batch = batch.get("invalid")
 
+                if occ_batch is not None:
+                    occ_batch = occ_batch.to(self.device, non_blocking=True)
+
+                if inv_batch is not None:
+                    inv_batch = inv_batch.to(self.device, non_blocking=True)
+
+                # Training-time validation crop.
+                # This prevents all-pairs correlation from exploding on native Spring/HD1K/KITTI
+                # validation frames.
+                img1, img2, flow, valid, occ_batch, inv_batch = self._maybe_center_crop_validation_batch(
+                    img1=img1,
+                    img2=img2,
+                    flow=flow,
+                    valid=valid,
+                    occ_batch=occ_batch,
+                    inv_batch=inv_batch,
+                )
+
                 # Build oracle masks for debugging target image leakage, if occlusion/invalid masks are present
                 # DEBUGGING ORACLE MASKS!
                 source_valid, target_valid = self.build_oracle_source_target_masks(
@@ -819,6 +926,18 @@ class Trainer:
 
                 padder = InputPadder(img1.shape, divisor=8)
                 img1, img2 = padder.pad(img1, img2)
+
+                # Pad masks too. Images use replicate padding, but masks should mark padded
+                # regions as invalid.
+                pad_tuple = (
+                    padder._left,
+                    padder._right,
+                    padder._top,
+                    padder._bottom,
+                )
+
+                source_valid = F.pad(source_valid, pad_tuple, mode="constant", value=0.0)
+                target_valid = F.pad(target_valid, pad_tuple, mode="constant", value=0.0)
 
                 with torch.autocast(device_type=self.device.type, enabled=self._use_amp):
                     out  = self.model(img1, img2, source_valid=source_valid, target_valid=target_valid)
