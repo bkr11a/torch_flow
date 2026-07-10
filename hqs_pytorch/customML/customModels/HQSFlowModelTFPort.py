@@ -927,6 +927,43 @@ class HQSFlowModelTFPort(nn.Module):
             )
         else:
             self.multiscale_initializer = None
+        
+        # ---------------------------------------------------------------------
+        # Direct level1 (1/4-resolution) -> full-resolution convex upsampler
+        # ---------------------------------------------------------------------
+
+        # level2 operates at 1/8 and uses rate=8.
+        # level1 operates at 1/4 and therefore requires rate=4.
+        self.level1_upsample_scale = self.upsample_scale // 2
+
+        if self.level1_upsample_scale != 4:
+            raise ValueError(
+                "The current encoder defines level1 at 1/4 resolution, so "
+                f"level1_upsample_scale must be 4, got "
+                f"{self.level1_upsample_scale}."
+            )
+
+        # Mirror the image-guided mask construction used by HQSUpdateUnit:
+        # current 1/4 GRU state + 1/4 context -> convex mask logits.
+        self.level1_upsample_mask_head = nn.Sequential(
+            nn.Conv2d(
+                gru_hidden_dim + context_dim,
+                gru_hidden_dim,
+                kernel_size=3,
+                padding=1,
+            ),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                gru_hidden_dim,
+                9 * self.level1_upsample_scale ** 2,
+                kernel_size=3,
+                padding=1,
+            ),
+        )
+
+        # Stable initialisation: initially produces uniform 3x3 convex weights.
+        nn.init.zeros_(self.level1_upsample_mask_head[-1].weight)
+        nn.init.zeros_(self.level1_upsample_mask_head[-1].bias)
 
     @staticmethod
     def _normalise(img: torch.Tensor) -> torch.Tensor:
@@ -2168,7 +2205,7 @@ class HQSFlowModelTFPort(nn.Module):
             coupling_residual_lows.append(
                 torch.stack([(flow_yx - aux_yx)[:, 1], (flow_yx - aux_yx)[:, 0]], dim=1)
             )
-
+        ran_level1 = False
         if self.pyramid_l1_iters > 0 and "level1" in feat1 and "level1" in feat2:
             # ── Feature-pyramid multi-scale refinement (1.2 + 2.1) ──────────
             # Runs a dedicated HQS loop at level1 (1/4-scale) features using
@@ -2177,6 +2214,7 @@ class HQSFlowModelTFPort(nn.Module):
             # loss supervises convergence at this finer scale.  The refined flow
             # is transferred back to level2 so the post-loop network starts from
             # the best available state.
+            ran_level1 = True
             _, _, h1, w1 = f1_l1.shape
 
             # ------ OLD Bilinear resize-based transfer (Option A) ------
@@ -2494,53 +2532,217 @@ class HQSFlowModelTFPort(nn.Module):
                 # Full-res prediction from 1/4-scale flow via bilinear upsampling.
                 # Higher quality than main-loop predictions (finer features),
                 # and supervised by the sequence loss at each step.
-                flow_up_l1 = self._resize_flow_yx(flow_l1, image1.shape[-2], image1.shape[-1])
-                flow_up_l1_xy = torch.stack([flow_up_l1[:, 1], flow_up_l1[:, 0]], dim=1)
-                flow_preds.append(flow_up_l1_xy)
-                flow_lows.append(torch.stack([flow_l1[:, 1], flow_l1[:, 0]], dim=1))
-                hidden_states.append(net_l1)
-                aux_lows.append(torch.stack([aux_l1[:, 1], aux_l1[:, 0]], dim=1))
-                delta_lows.append(torch.stack([delta_l1[:, 1], delta_l1[:, 0]], dim=1))
-                coupling_residual_lows.append(
-                    torch.stack([(flow_l1 - aux_l1)[:, 1], (flow_l1 - aux_l1)[:, 0]], dim=1)
+                # -------------------------------------------------------------
+                # True 1/4 -> full-resolution convex upsampling
+                # -------------------------------------------------------------
+
+                # Both tensors are genuinely at level1 / 1/4 resolution:
+                #   net_l1     : [B, gru_hidden_dim, H/4, W/4]
+                #   context_l1 : [B, context_dim,    H/4, W/4]
+                level1_mask_input = torch.cat(
+                    [net_l1, context_l1],
+                    dim=1,
                 )
 
-            # Transfer refined flow back to level2 for post-loop refinement.
-            flow_yx = self._resize_flow_yx(flow_l1, h, w)
-            aux_yx = self._resize_flow_yx(aux_l1, h, w)
-            net = F.interpolate(net_l1, size=(h, w), mode="bilinear", align_corners=False)
+                level1_mask_logits = self.level1_upsample_mask_head(
+                    level1_mask_input
+                )
+
+                expected_mask_channels = (
+                    9 * self.level1_upsample_scale ** 2
+                )
+
+                if level1_mask_logits.shape[1] != expected_mask_channels:
+                    raise RuntimeError(
+                        "Invalid level1 convex mask channel count: "
+                        f"expected {expected_mask_channels}, "
+                        f"got {level1_mask_logits.shape[1]}."
+                    )
+
+                if level1_mask_logits.shape[-2:] != flow_l1.shape[-2:]:
+                    raise RuntimeError(
+                        "Level1 mask and flow must have identical spatial sizes: "
+                        f"mask={level1_mask_logits.shape[-2:]}, "
+                        f"flow={flow_l1.shape[-2:]}."
+                    )
+
+                # flow_l1 is expressed in 1/4-resolution pixel units.
+                # convex_upsample multiplies it by rate=4 internally, converting
+                # the displacement into full-resolution pixel units.
+                flow_up_l1_yx = self.convex_upsample(
+                    flow_lr=flow_l1,
+                    mask_logits=level1_mask_logits,
+                    rate=self.level1_upsample_scale,
+                )
+
+                # Normally this should already exactly match the padded image resolution.
+                # Retain this only as protection against unusual odd input dimensions.
+                if flow_up_l1_yx.shape[-2:] != image1.shape[-2:]:
+                    flow_up_l1_yx = self._resize_flow_yx(
+                        flow_up_l1_yx,
+                        image1.shape[-2],
+                        image1.shape[-1],
+                    )
+
+                # Internal convention [dy, dx] -> repository/output convention [dx, dy].
+                flow_up_l1_xy = torch.stack(
+                    [
+                        flow_up_l1_yx[:, 1],
+                        flow_up_l1_yx[:, 0],
+                    ],
+                    dim=1,
+                )
+
+                flow_preds.append(flow_up_l1_xy)
+                flow_lows.append(
+                    torch.stack(
+                        [flow_l1[:, 1], flow_l1[:, 0]],
+                        dim=1,
+                    )
+                )
+                hidden_states.append(net_l1)
+                aux_lows.append(
+                    torch.stack(
+                        [aux_l1[:, 1], aux_l1[:, 0]],
+                        dim=1,
+                    )
+                )
+                delta_lows.append(
+                    torch.stack(
+                        [delta_l1[:, 1], delta_l1[:, 0]],
+                        dim=1,
+                    )
+                )
+                coupling_residual_lows.append(
+                    torch.stack(
+                        [
+                            (flow_l1 - aux_l1)[:, 1],
+                            (flow_l1 - aux_l1)[:, 0],
+                        ],
+                        dim=1,
+                    )
+                )
 
         raw_flow_preds = list(flow_preds)
         raw_flow_lows = list(flow_lows)
 
-        # Post-loop refinement using the fixed context-encoder hidden output
-        # (stable reference independent of GRU trajectory).
-        final_in = torch.cat([flow_yx, context_feat_lvl, hidden_lvl], dim=1)
-        flow_yx = flow_yx + 0.1 * self.final_refinement_network(final_in)
-        final_mask = self.final_mask_logits(final_in)
-        flow_up_final_yx = self.convex_upsample(flow_yx, final_mask, rate=self.upsample_scale)
-        if flow_up_final_yx.shape[-2:] != image1.shape[-2:]:
-            flow_up_final_yx = self._resize_flow_yx(flow_up_final_yx, image1.shape[-2], image1.shape[-1])
-        flow_up_xy = torch.stack([flow_up_final_yx[:, 1], flow_up_final_yx[:, 0]], dim=1)
+        if ran_level1:
+            # -------------------------------------------------------------
+            # Final state remains at true 1/4 resolution.
+            # -------------------------------------------------------------
+            flow_yx = flow_l1
+            aux_yx = aux_l1
+            net = net_l1
 
-        if flow_preds:
-            flow_preds[-1] = flow_up_xy
-            flow_lows[-1] = torch.stack([flow_yx[:, 1], flow_yx[:, 0]], dim=1)
-            if aux_lows:
-                aux_lows[-1] = torch.stack([aux_yx[:, 1], aux_yx[:, 0]], dim=1)
-            if coupling_residual_lows:
-                coupling_residual_lows[-1] = torch.stack(
-                    [(flow_yx - aux_yx)[:, 1], (flow_yx - aux_yx)[:, 0]], dim=1
-                )
+            # The last flow prediction was already produced directly from
+            # flow_l1 using the correctly shaped ×4 convex mask.
+            flow_up_xy = flow_preds[-1]
+
+            # Do not replace flow_preds[-1].
+            # Do not replace flow_lows[-1].
+            # Do not downsample flow_l1.
+            #
+            # This preserves consistent semantics:
+            #   flow_preds[-1]  = full-res prediction from 1/4
+            #   flow_lows[-1]   = native 1/4 flow
+            #   aux_lows[-1]    = native 1/4 auxiliary flow
+            #   hidden_states[-1] = native 1/4 hidden state
+
         else:
-            flow_preds = [flow_up_xy]
-            flow_lows = [torch.stack([flow_yx[:, 1], flow_yx[:, 0]], dim=1)]
-            hidden_states = [net]
-            aux_lows = [torch.stack([aux_yx[:, 1], aux_yx[:, 0]], dim=1)]
-            delta_lows = [torch.zeros_like(flow_lows[0])]
-            coupling_residual_lows = [
-                torch.stack([(flow_yx - aux_yx)[:, 1], (flow_yx - aux_yx)[:, 0]], dim=1)
-            ]
+            # -------------------------------------------------------------
+            # Existing 1/8 -> full path, used only when level1 is disabled.
+            # -------------------------------------------------------------
+            final_in = torch.cat(
+                [
+                    flow_yx,
+                    context_feat_lvl,
+                    hidden_lvl,
+                ],
+                dim=1,
+            )
+
+            flow_yx = (
+                flow_yx
+                + 0.1 * self.final_refinement_network(final_in)
+            )
+
+            final_mask = self.final_mask_logits(final_in)
+
+            flow_up_final_yx = self.convex_upsample(
+                flow_lr=flow_yx,
+                mask_logits=final_mask,
+                rate=self.upsample_scale,
+            )
+
+            if flow_up_final_yx.shape[-2:] != image1.shape[-2:]:
+                flow_up_final_yx = self._resize_flow_yx(
+                    flow_up_final_yx,
+                    image1.shape[-2],
+                    image1.shape[-1],
+                )
+
+            flow_up_xy = torch.stack(
+                [
+                    flow_up_final_yx[:, 1],
+                    flow_up_final_yx[:, 0],
+                ],
+                dim=1,
+            )
+
+            if flow_preds:
+                flow_preds[-1] = flow_up_xy
+                flow_lows[-1] = torch.stack(
+                    [
+                        flow_yx[:, 1],
+                        flow_yx[:, 0],
+                    ],
+                    dim=1,
+                )
+
+                if aux_lows:
+                    aux_lows[-1] = torch.stack(
+                        [
+                            aux_yx[:, 1],
+                            aux_yx[:, 0],
+                        ],
+                        dim=1,
+                    )
+
+                if coupling_residual_lows:
+                    coupling_residual_lows[-1] = torch.stack(
+                        [
+                            (flow_yx - aux_yx)[:, 1],
+                            (flow_yx - aux_yx)[:, 0],
+                        ],
+                        dim=1,
+                    )
+            else:
+                flow_preds = [flow_up_xy]
+                flow_lows = [
+                    torch.stack(
+                        [flow_yx[:, 1], flow_yx[:, 0]],
+                        dim=1,
+                    )
+                ]
+                hidden_states = [net]
+                aux_lows = [
+                    torch.stack(
+                        [aux_yx[:, 1], aux_yx[:, 0]],
+                        dim=1,
+                    )
+                ]
+                delta_lows = [
+                    torch.zeros_like(flow_lows[0])
+                ]
+                coupling_residual_lows = [
+                    torch.stack(
+                        [
+                            (flow_yx - aux_yx)[:, 1],
+                            (flow_yx - aux_yx)[:, 0],
+                        ],
+                        dim=1,
+                    )
+                ]
 
         out = dict({
             "flow_preds": flow_preds,
