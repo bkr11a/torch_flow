@@ -1,0 +1,135 @@
+datasets:
+  - id: chairs
+    enabled: true
+    supports_scenes: false
+    batch_size: 1
+    qualitative_samples: 64
+    max_samples: null
+    data:
+      mode: single
+      name: chairs
+      root: "/mnt/a/benchmark_data/optical_flow/FlyingChairs_release"
+      dstype: clean
+      batch_size: 1
+      num_workers: 2
+      eval_center_crop: true
+      eval_crop_size: [368, 496]
+
+  - id: things_subset_clean
+    enabled: true
+    supports_scenes: false
+    batch_size: 1
+    qualitative_samples: 64
+    max_samples: null
+    data:
+      mode: single
+      name: things
+      root: "/mnt/a/benchmark_data/optical_flow/FlyingThings3D/FlyingThings3D_subset"
+      dstype: clean
+      side: both
+      direction: forward
+      batch_size: 1
+      num_workers: 2
+      eval_center_crop: true
+      eval_crop_size: [400, 720]
+
+  - id: sintel_clean
+    enabled: true
+    supports_scenes: true
+    batch_size: 1
+    qualitative_samples: all
+    max_samples: null
+    data:
+      mode: single
+      name: sintel
+      root: "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete"
+      dstype: clean
+      batch_size: 1
+      num_workers: 2
+      eval_center_crop: true
+      eval_crop_size: [320, 768]
+
+  - id: sintel_final
+    enabled: true
+    supports_scenes: true
+    batch_size: 1
+    qualitative_samples: all
+    max_samples: null
+    data:
+      mode: single
+      name: sintel
+      root: "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete"
+      dstype: final
+      batch_size: 1
+      num_workers: 2
+      eval_center_crop: true
+      eval_crop_size: [320, 768]
+
+  - id: spring_left
+    enabled: true
+    supports_scenes: true
+    batch_size: 1
+    qualitative_samples: all
+    max_samples: null
+    data:
+      mode: single
+      name: spring
+      root: "/mnt/a/benchmark_data/optical_flow/Spring/spring"
+      direction: forward
+      side: left
+      val_fraction: 0.10
+      batch_size: 1
+      num_workers: 2
+      eval_center_crop: true
+      eval_crop_size: [320, 768]
+
+  - id: hd1k
+    enabled: true
+    supports_scenes: true
+    batch_size: 1
+    qualitative_samples: all
+    max_samples: null
+    data:
+      mode: single
+      name: hd1k
+      root: "/mnt/a/benchmark_data/optical_flow/HD1K/hd1k_full_package"
+      camera: image_2
+      val_fraction: 0.10
+      batch_size: 1
+      num_workers: 2
+      eval_center_crop: true
+      eval_crop_size: [320, 768]
+
+  - id: kitti2015
+    enabled: true
+    supports_scenes: false
+    batch_size: 1
+    qualitative_samples: all
+    max_samples: null
+    data:
+      mode: single
+      name: kitti
+      root: "/mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2015/data_scene_flow"
+      camera: image_2
+      flow_type: occ
+      batch_size: 1
+      num_workers: 2
+      eval_center_crop: true
+      eval_crop_size: [320, 960]
+
+  - id: kitti2012
+    enabled: true
+    supports_scenes: false
+    batch_size: 1
+    qualitative_samples: all
+    max_samples: null
+    data:
+      mode: single
+      name: kitti
+      root: "/mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2012/data_stereo_flow"
+      camera: image_0
+      flow_type: occ
+      batch_size: 1
+      num_workers: 2
+      eval_center_crop: true
+      eval_crop_size: [320, 960]
