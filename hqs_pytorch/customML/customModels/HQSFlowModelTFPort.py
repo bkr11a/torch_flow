@@ -1715,6 +1715,12 @@ class HQSFlowModelTFPort(nn.Module):
         i1 = self._normalise(image1)
         i2 = self._normalise(image2)
 
+        # Force source_valid and target_valid to be None.
+        # This is a temporary measure to ensure that the model does not use the external masks in order to establise a baseline.
+        # Still TODO: remove the source_valid and target_valid arguments from the forward() signature, and remove the corresponding code in the training loop.
+        source_valid = None
+        target_valid = None
+
         # Photometric tensors for OFCE/data term
         # Remember these are deliberately NOT normalised according to ImageNet stats.
         if self.use_photo_for_ofce:
