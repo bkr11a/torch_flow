@@ -4,7 +4,7 @@ model:
   model_backbone:
     # Phase switches
     use_bidirectional_training: true
-    detach_reverse_for_geometry: false
+    detach_reverse_for_geometry: true
     use_factorised_reliability: true
     use_fb_geometry: true
     use_forward_occupancy: true
@@ -15,7 +15,7 @@ model:
     fb_alpha: 0.01
     fb_beta: 0.5
     occupancy_hole_threshold: 0.25
-    occupancy_collision_threshold: 1.0
+    occupancy_collision_threshold: 1.25
     occupancy_temperature: 0.10
 
     # Reliability
@@ -40,6 +40,6 @@ loss:
     temporal_weight: 0.001
     visibility_prior_weight: 0.001
     outlier_scale: 20.0
-    detach_reverse_for_cycle: false
+    detach_reverse_for_cycle: true
     expected_visible_fraction: 0.85
     visibility_prior_tolerance: 0.10

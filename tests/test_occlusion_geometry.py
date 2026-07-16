@@ -42,3 +42,23 @@ def test_backward_warp_yx_channel_order():
     flow[:, 1] = 1.0  # sample one pixel right
     warped = backward_warp_yx(image, flow)
     assert torch.allclose(warped[0, 0, :, :-1], image[0, 0, :, 1:])
+
+
+def test_geometry_products_share_source_coordinates():
+    flow_ab = torch.zeros(1, 2, 6, 8)
+    flow_ba = torch.zeros_like(flow_ab)
+    flow_ab[:, 1] = 1.0
+    flow_ba[:, 1] = -1.0
+    geometry = compute_flow_geometry_yx(
+        flow_ab,
+        flow_ba,
+        collision_threshold=1.25,
+        occupancy_temperature=0.1,
+    )
+    # A->B leaves a target-frame hole on the left.
+    assert geometry.target_hole_score[:, :, :, 0].mean() > 0.9
+    # B->A leaves an A-coordinate hole on the right; this is the tensor fed to
+    # an A-coordinate reliability head.
+    assert geometry.hole_score[:, :, :, -1].mean() > 0.9
+    # Unit occupancy should not be labelled as a 0.5-probability collision.
+    assert geometry.target_collision_score[:, :, :, 1:-1].mean() < 0.1

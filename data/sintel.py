@@ -19,8 +19,9 @@ Occlusion and invalid masks
   invalid/     – pixels where the GT flow is unreliable for any reason
                  (motion blur, reflections, etc.). 255 = invalid.
 
-Both masks are used to restrict the valid mask returned in each sample,
-so that these pixels are excluded from training loss and evaluation metrics.
+Only ``invalid`` restricts GT-flow supervision.  ``occlusions`` remains a
+separate visibility label: Sintel still provides a valid flow vector there,
+which is required to train and evaluate the source-conditioned prior.
 
 Reference: Butler et al., "A naturalistic open source movie for optical flow
            evaluation", ECCV 2012.

@@ -21,7 +21,14 @@ from torch import Tensor
 
 @dataclass
 class FlowGeometry:
-    """Predicted geometric evidence at one resolution."""
+    """Predicted geometric evidence aligned to the *source* frame.
+
+    ``in_bounds``, the forward/backward quantities, ``occupancy``,
+    ``hole_score`` and ``collision_score`` all live in the coordinates of the
+    source of ``flow_ab``.  Target-frame splat products are exposed separately
+    for diagnostics.  Keeping this invariant prevents accidentally
+    concatenating A-coordinate and B-coordinate tensors in a reliability head.
+    """
 
     in_bounds: Tensor
     fb_error: Tensor
@@ -30,8 +37,11 @@ class FlowGeometry:
     occupancy: Tensor
     hole_score: Tensor
     collision_score: Tensor
+    target_occupancy: Optional[Tensor] = None
+    target_hole_score: Optional[Tensor] = None
+    target_collision_score: Optional[Tensor] = None
 
-    def detached_dict(self) -> dict[str, Tensor]:
+    def detached_dict(self) -> dict[str, Optional[Tensor]]:
         return {
             "in_bounds": self.in_bounds.detach(),
             "fb_error": self.fb_error.detach(),
@@ -40,6 +50,21 @@ class FlowGeometry:
             "occupancy": self.occupancy.detach(),
             "hole_score": self.hole_score.detach(),
             "collision_score": self.collision_score.detach(),
+            "target_occupancy": (
+                self.target_occupancy.detach()
+                if self.target_occupancy is not None
+                else None
+            ),
+            "target_hole_score": (
+                self.target_hole_score.detach()
+                if self.target_hole_score is not None
+                else None
+            ),
+            "target_collision_score": (
+                self.target_collision_score.detach()
+                if self.target_collision_score is not None
+                else None
+            ),
         }
 
 
@@ -216,7 +241,7 @@ def occupancy_scores(
     occupancy: Tensor,
     *,
     hole_threshold: float = 0.25,
-    collision_threshold: float = 1.0,
+    collision_threshold: float = 1.25,
     temperature: float = 0.1,
 ) -> tuple[Tensor, Tensor]:
     """Return smooth hole and collision scores in [0,1]."""
@@ -236,28 +261,49 @@ def compute_flow_geometry_yx(
     fb_alpha: float = 0.01,
     fb_beta: float = 0.5,
     hole_threshold: float = 0.25,
-    collision_threshold: float = 1.0,
+    collision_threshold: float = 1.25,
     occupancy_temperature: float = 0.1,
     detach_reverse_for_geometry: bool = False,
 ) -> FlowGeometry:
-    """Compute all inference-time geometric evidence for direction a -> b."""
+    """Compute inference-time evidence for ``A -> B`` in A coordinates.
+
+    A forward splat of ``flow_ab`` produces occupancy in B, whereas the
+    forward/backward residual and in-bounds mask are in A.  For an A-aligned
+    reliability state we therefore:
+
+    * use the reverse-flow splat to obtain occupancy/hole evidence in A; and
+    * warp the B-coordinate collision score back to A with ``flow_ab``.
+
+    No ground-truth quantity is accepted by this function.
+    """
     reverse = flow_ba.detach() if detach_reverse_for_geometry else flow_ba
     fb_error, fb_normalised, fb_conf = forward_backward_error_yx(
         flow_ab, reverse, alpha=fb_alpha, beta=fb_beta
     )
-    occupancy = forward_splat_occupancy_yx(flow_ab)
-    hole, collision = occupancy_scores(
-        occupancy,
+    occupancy_b = forward_splat_occupancy_yx(flow_ab)
+    hole_b, collision_b = occupancy_scores(
+        occupancy_b,
         hole_threshold=hole_threshold,
         collision_threshold=collision_threshold,
         temperature=occupancy_temperature,
     )
+    occupancy_a = forward_splat_occupancy_yx(reverse)
+    hole_a, _ = occupancy_scores(
+        occupancy_a,
+        hole_threshold=hole_threshold,
+        collision_threshold=collision_threshold,
+        temperature=occupancy_temperature,
+    )
+    collision_b_at_a = backward_warp_yx(collision_b, flow_ab)
     return FlowGeometry(
         in_bounds=flow_in_bounds_mask(flow_ab),
         fb_error=fb_error,
         fb_error_normalised=fb_normalised,
         fb_confidence=fb_conf,
-        occupancy=occupancy,
-        hole_score=hole,
-        collision_score=collision,
+        occupancy=occupancy_a,
+        hole_score=hole_a,
+        collision_score=collision_b_at_a,
+        target_occupancy=occupancy_b,
+        target_hole_score=hole_b,
+        target_collision_score=collision_b,
     )

@@ -335,6 +335,13 @@ class Trainer:
 
         # ── State ─────────────────────────────────────────────────────────────
         self.global_step = 0
+        self._global_matcher_warmup_steps = int(
+            cfg.training.get("global_matcher_warmup_steps", 0)
+        )
+        self._freeze_backbone_during_global_warmup = bool(
+            cfg.training.get("freeze_backbone_during_global_warmup", False)
+        )
+        self._global_warmup_active: Optional[bool] = None
         self.history = TrainingHistory(
             run_name=self.run_name,
             total_steps=train_steps,
@@ -473,6 +480,9 @@ class Trainer:
                         "d10_60":  _fmt("d10_60"),
                         "d60_140": _fmt("d60_140"),
                         "d140+":   _fmt("d140_plus"),
+                        "hf_r":    _fmt("hf_recovery"),
+                        "hf_a":    _fmt("hf_alignment"),
+                        "b_epe":   _fmt("boundary_epe"),
                         "lr":      f"{lr:.2e}",
                     }
                     postfix["smooth"] = _fmt("smooth", ".4f")
@@ -695,7 +705,27 @@ class Trainer:
     # Single training step
     # ─────────────────────────────────────────────────────────────────────── #
 
+    def _configure_global_matcher_warmup(self) -> None:
+        """Optionally pretrain the global proposal before joint optimisation."""
+        active = (
+            self._freeze_backbone_during_global_warmup
+            and self.global_step < self._global_matcher_warmup_steps
+        )
+        if active == self._global_warmup_active:
+            return
+        for name, parameter in self.model.named_parameters():
+            parameter.requires_grad_(not active or name.startswith("pgma."))
+        self._global_warmup_active = active
+        if active:
+            logger.info(
+                "Global-matcher warmup active: only model.pgma parameters "
+                f"train until step {self._global_matcher_warmup_steps}."
+            )
+        else:
+            logger.info("Joint model optimisation active.")
+
     def _train_step(self, batch: Dict) -> Dict[str, float]:
+        self._configure_global_matcher_warmup()
         self.optimizer.zero_grad(set_to_none=True)
 
         img1  = batch["image1"].to(self.device, non_blocking=True)
@@ -704,25 +734,31 @@ class Trainer:
         valid = batch["valid"].to(self.device, non_blocking=True)
         occ_batch = batch.get("occlusion")
         inv_batch = batch.get("invalid")
-
-        # ---- Build oracle masks for debugging target image leakage ----
-        # DEBUGGING ORACLE MASKS!
-        # --------------------------------------------------
-
-        source_valid, target_valid = self.build_oracle_source_target_masks(
-            flow_gt_xy=flow,
-            valid=valid,
-            occlusion=occ_batch,
-            invalid=inv_batch,
-        )
-
-        # --------------------------------------------------
+        synthetic_occ_batch = batch.get("synthetic_occlusion")
+        if occ_batch is not None:
+            occ_batch = occ_batch.to(self.device, non_blocking=True)
+        if inv_batch is not None:
+            inv_batch = inv_batch.to(self.device, non_blocking=True)
+        if synthetic_occ_batch is not None:
+            synthetic_occ_batch = synthetic_occ_batch.to(
+                self.device, non_blocking=True
+            )
 
         with torch.autocast(device_type=self.device.type, enabled=self._use_amp):
-            # out       = self.model(img1, img2)
-            out       = self.model(img1, img2, source_valid=source_valid, target_valid=target_valid)
+            # Ground-truth and augmentation masks are loss targets only.
+            out = self.model(img1, img2)
+            if hasattr(self.criterion, "set_step"):
+                self.criterion.set_step(self.global_step)
             loss_dict = self.criterion(
-                out["flow_preds"], flow, valid, img1, img2, model_outputs=out
+                out["flow_preds"],
+                flow,
+                valid,
+                img1,
+                img2,
+                model_outputs=out,
+                occlusion=occ_batch,
+                invalid=inv_batch,
+                synthetic_occlusion=synthetic_occ_batch,
             )
 
         self.scaler.scale(loss_dict["loss"]).backward()
@@ -751,7 +787,8 @@ class Trainer:
             batch_metrics: Dict[str, list] = {
                 "epe": [], "epe_matched": [], "epe_unmatched": [], "epe_all": [],
                 "f1": [], "s0_10": [], "s10_40": [], "s40_plus": [],
-                "d0": [], "d0_10": [], "d10_60": [], "d60_140": [], "d140_plus": []
+                "d0": [], "d0_10": [], "d10_60": [], "d60_140": [], "d140_plus": [],
+                "hf_recovery": [], "hf_alignment": [], "boundary_epe": [],
             }
             for b in range(pred_final.shape[0]):
                 occ = None
@@ -907,15 +944,6 @@ class Trainer:
                     inv_batch=inv_batch,
                 )
 
-                # Build oracle masks for debugging target image leakage, if occlusion/invalid masks are present
-                # DEBUGGING ORACLE MASKS!
-                source_valid, target_valid = self.build_oracle_source_target_masks(
-                    flow_gt_xy=flow,
-                    valid=valid,
-                    occlusion=occ_batch,
-                    invalid=inv_batch,
-                )
-
                 if occ_batch is None and not self._warned_missing_occ_masks:
                     logger.warning(
                         "Validation batches do not include occlusion masks; "
@@ -927,20 +955,8 @@ class Trainer:
                 padder = InputPadder(img1.shape, divisor=8)
                 img1, img2 = padder.pad(img1, img2)
 
-                # Pad masks too. Images use replicate padding, but masks should mark padded
-                # regions as invalid.
-                pad_tuple = (
-                    padder._left,
-                    padder._right,
-                    padder._top,
-                    padder._bottom,
-                )
-
-                source_valid = F.pad(source_valid, pad_tuple, mode="constant", value=0.0)
-                target_valid = F.pad(target_valid, pad_tuple, mode="constant", value=0.0)
-
                 with torch.autocast(device_type=self.device.type, enabled=self._use_amp):
-                    out  = self.model(img1, img2, source_valid=source_valid, target_valid=target_valid)
+                    out = self.model(img1, img2)
                 pred = padder.unpad(out["flow_preds"][-1])
 
                 for b in range(img1.shape[0]):
@@ -1193,4 +1209,3 @@ class Trainer:
     def _infinite_loader(loader: DataLoader):
         while True:
             yield from loader
-

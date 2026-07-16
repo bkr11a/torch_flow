@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -41,6 +41,9 @@ class PhysicsGatedMatchingAttention(nn.Module):
         gate_init_hqs: float = 1.5,
         gate_init_global: float = -1.0,
         gate_init_prox: float = -1.0,
+        query_chunk_size: int = 512,
+        position_scale: float = 0.05,
+        confidence_floor: float = 0.05,
     ):
         super().__init__()
 
@@ -53,6 +56,11 @@ class PhysicsGatedMatchingAttention(nn.Module):
         self.topk = int(topk)
         self.use_topk = bool(use_topk)
         self.match_mode = match_mode
+        self.query_chunk_size = max(1, int(query_chunk_size))
+        self.position_scale = float(position_scale)
+        self.confidence_floor = float(confidence_floor)
+        if not 0.0 <= self.confidence_floor < 1.0:
+            raise ValueError("confidence_floor must be in [0, 1).")
 
         if use_feature_enhancer:
             self.feature_enhancer = nn.Sequential(
@@ -111,6 +119,124 @@ class PhysicsGatedMatchingAttention(nn.Module):
     def _norm1(x: torch.Tensor) -> torch.Tensor:
         return x.abs().mean(dim=1, keepdim=True)
 
+    @staticmethod
+    def _position_encoding(
+        batch: int,
+        channels: int,
+        height: int,
+        width: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Fixed 2-D sine/cosine encoding with shape ``[B,C,H,W]``."""
+        bands = max(1, math.ceil(channels / 4))
+        y = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype)
+        x = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        frequency = torch.linspace(1.0, 8.0, bands, device=device, dtype=dtype)
+        frequency = frequency.view(bands, 1, 1) * math.pi
+        pos = torch.cat(
+            (
+                torch.sin(frequency * yy),
+                torch.cos(frequency * yy),
+                torch.sin(frequency * xx),
+                torch.cos(frequency * xx),
+            ),
+            dim=0,
+        )[:channels]
+        return pos.unsqueeze(0).expand(batch, -1, -1, -1)
+
+    def _match_direction(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        coords_flat: torch.Tensor,
+        target_valid: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Full-distribution matching, evaluated in query chunks.
+
+        Chunking bounds peak memory without truncating the probability
+        distribution.  Entropy, peak probability and margin therefore remain
+        calibrated against every target candidate rather than a renormalised
+        top-k subset.
+        """
+        b, n, _ = query.shape
+        valid_flat: Optional[torch.Tensor] = None
+        if target_valid is not None:
+            valid_flat = target_valid.flatten(1).bool()
+            # A completely empty target mask must not create a uniform softmax
+            # over identical -inf-style logits.
+            empty = ~valid_flat.any(dim=1)
+            if empty.any():
+                valid_flat = valid_flat.clone()
+                valid_flat[empty] = True
+
+        soft_coords_parts = []
+        hard_coords_parts = []
+        peak_parts = []
+        entropy_parts = []
+        margin_parts = []
+        index_parts = []
+        key_t = key.transpose(1, 2)
+        entropy_denominator = math.log(float(max(n, 2)))
+
+        for start in range(0, n, self.query_chunk_size):
+            stop = min(n, start + self.query_chunk_size)
+            logits = torch.bmm(query[:, start:stop], key_t)
+            logits = logits / max(self.temperature, 1e-6)
+            if valid_flat is not None:
+                logits = logits.masked_fill(~valid_flat[:, None, :], -1e4)
+
+            probability = torch.softmax(logits, dim=-1)
+            soft_coords_parts.append(torch.bmm(probability, coords_flat))
+
+            top2 = torch.topk(probability, k=min(2, n), dim=-1)
+            top1_index = top2.indices[..., 0]
+            hard_coords_parts.append(
+                torch.gather(
+                    coords_flat,
+                    dim=1,
+                    index=top1_index.unsqueeze(-1).expand(-1, -1, 2),
+                )
+            )
+            peak = top2.values[..., 0:1]
+            if n > 1:
+                margin = peak - top2.values[..., 1:2]
+            else:
+                margin = peak
+            entropy = -(
+                probability * torch.log(probability.clamp_min(1e-8))
+            ).sum(dim=-1, keepdim=True) / entropy_denominator
+
+            peak_parts.append(peak)
+            margin_parts.append(margin)
+            entropy_parts.append(entropy.clamp(0.0, 1.0))
+            index_parts.append(top1_index)
+
+        soft_coords = torch.cat(soft_coords_parts, dim=1)
+        hard_coords = torch.cat(hard_coords_parts, dim=1)
+        peak = torch.cat(peak_parts, dim=1)
+        entropy = torch.cat(entropy_parts, dim=1)
+        margin = torch.cat(margin_parts, dim=1)
+        top1_index = torch.cat(index_parts, dim=1)
+
+        if self.match_mode == "soft":
+            selected_coords = soft_coords
+        elif self.match_mode == "hard":
+            selected_coords = hard_coords
+        else:
+            selected_coords = soft_coords + (hard_coords - soft_coords).detach()
+
+        return {
+            "flow": selected_coords - coords_flat,
+            "hard_flow": hard_coords - coords_flat,
+            "peak": peak,
+            "entropy": entropy,
+            "margin": margin,
+            "top1_index": top1_index,
+        }
+
     def global_match(
         self,
         f1: torch.Tensor,
@@ -145,92 +271,72 @@ class PhysicsGatedMatchingAttention(nn.Module):
         f1e = self.feature_enhancer(f1)
         f2e = self.feature_enhancer(f2)
 
-        q = self.q_proj(f1e)
-        k = self.k_proj(f2e)
+        position = self._position_encoding(
+            b, c, h, w, device=f1.device, dtype=f1.dtype
+        )
+        q1 = self.q_proj(f1e) + self.position_scale * position
+        k2 = self.k_proj(f2e) + self.position_scale * position
+        q2 = self.q_proj(f2e) + self.position_scale * position
+        k1 = self.k_proj(f1e) + self.position_scale * position
 
-        q = F.normalize(q.flatten(2).transpose(1, 2), dim=-1)  # [B, N, C]
-        k = F.normalize(k.flatten(2), dim=1)                   # [B, C, N]
+        q1 = F.normalize(q1.flatten(2).transpose(1, 2), dim=-1)
+        k2 = F.normalize(k2.flatten(2).transpose(1, 2), dim=-1)
+        q2 = F.normalize(q2.flatten(2).transpose(1, 2), dim=-1)
+        k1 = F.normalize(k1.flatten(2).transpose(1, 2), dim=-1)
 
-        logits = torch.bmm(q, k) / max(self.temperature, 1e-6)  # [B, N, N]
-
-        if target_valid is not None:
-            if target_valid.shape[-2:] != (h, w):
-                target_valid = F.interpolate(
-                    target_valid.float(), size=(h, w), mode="nearest"
-                )
-            valid_flat = target_valid.flatten(2).bool()         # [B, 1, N]
-            logits = logits.masked_fill(~valid_flat, -1e4)
+        if target_valid is not None and target_valid.shape[-2:] != (h, w):
+            target_valid = F.interpolate(
+                target_valid.float(), size=(h, w), mode="nearest"
+            )
 
         coords = self.coords_grid_yx(b, h, w, f1.device, f1.dtype)
         coords_flat = coords.flatten(2).transpose(1, 2)         # [B, N, 2]
 
-        # Hard argmax correspondence.
-        hard_idx = logits.argmax(dim=-1)                        # [B, N]
-        hard_coords = torch.gather(
-            coords_flat,
-            dim=1,
-            index=hard_idx.unsqueeze(-1).expand(-1, -1, 2),
+        forward = self._match_direction(q1, k2, coords_flat, target_valid)
+        reverse = self._match_direction(q2, k1, coords_flat, None)
+
+        query_index = torch.arange(n, device=f1.device).view(1, n).expand(b, -1)
+        reverse_at_forward = torch.gather(
+            reverse["top1_index"], dim=1, index=forward["top1_index"]
         )
-        hard_flow = hard_coords - coords_flat                   # [B, N, 2]
-        hard_flow_yx = hard_flow.transpose(1, 2).view(b, 2, h, w)
+        mutual = (reverse_at_forward == query_index).to(f1.dtype).unsqueeze(-1)
+        forward_conf = torch.sqrt(
+            forward["peak"].clamp_min(0.0)
+            * (1.0 - forward["entropy"]).clamp_min(0.0)
+        )
+        forward_conf = forward_conf * (
+            self.confidence_floor + (1.0 - self.confidence_floor) * mutual
+        )
 
-        if self.use_topk and self.topk > 0 and self.topk < n:
-            vals, idx = torch.topk(logits, k=self.topk, dim=-1)  # [B, N, K]
-            prob = F.softmax(vals, dim=-1)
+        forward_at_reverse = torch.gather(
+            forward["top1_index"], dim=1, index=reverse["top1_index"]
+        )
+        reverse_mutual = (forward_at_reverse == query_index).to(f1.dtype).unsqueeze(-1)
+        reverse_conf = torch.sqrt(
+            reverse["peak"].clamp_min(0.0)
+            * (1.0 - reverse["entropy"]).clamp_min(0.0)
+        )
+        reverse_conf = reverse_conf * (
+            self.confidence_floor
+            + (1.0 - self.confidence_floor) * reverse_mutual
+        )
 
-            coords_all = coords_flat[:, None, :, :].expand(b, n, n, 2)
-            coords_k = torch.gather(
-                coords_all,
-                dim=2,
-                index=idx.unsqueeze(-1).expand(-1, -1, -1, 2),
-            )
-
-            soft_coords = (prob.unsqueeze(-1) * coords_k).sum(dim=2)
-
-            conf = prob.max(dim=-1, keepdim=True).values
-
-            if self.topk >= 2:
-                top2 = torch.topk(prob, k=2, dim=-1).values
-                margin = top2[:, :, 0:1] - top2[:, :, 1:2]
-            else:
-                margin = conf
-
-            entropy = -(prob * (prob + 1e-8).log()).sum(dim=-1, keepdim=True)
-            entropy = entropy / math.log(float(self.topk))
-
-            # Top-1 index in the full target grid.
-            top_pos = prob.argmax(dim=-1, keepdim=True)
-            top1_index = torch.gather(idx, dim=-1, index=top_pos)
-        else:
-            prob = F.softmax(logits, dim=-1)
-            soft_coords = torch.bmm(prob, coords_flat)
-
-            top2 = torch.topk(prob, k=2, dim=-1)
-            conf = top2.values[:, :, 0:1]
-            margin = top2.values[:, :, 0:1] - top2.values[:, :, 1:2]
-            top1_index = top2.indices[:, :, 0:1]
-
-            entropy = -(prob * (prob + 1e-8).log()).sum(dim=-1, keepdim=True)
-            entropy = entropy / math.log(float(n))
-
-        if self.match_mode == "soft":
-            match_coords = soft_coords
-        elif self.match_mode == "hard":
-            match_coords = hard_coords
-        else:
-            # Forward pass uses hard correspondence, gradient follows soft path.
-            match_coords = soft_coords + (hard_coords - soft_coords).detach()
-
-        flow = match_coords - coords_flat
-        flow_yx = flow.transpose(1, 2).view(b, 2, h, w)
+        def chw(value: torch.Tensor, channels: int) -> torch.Tensor:
+            return value.transpose(1, 2).reshape(b, channels, h, w)
 
         return {
-            "flow_yx": flow_yx,
-            "hard_flow_yx": hard_flow_yx,
-            "conf": conf.transpose(1, 2).view(b, 1, h, w),
-            "entropy": entropy.transpose(1, 2).view(b, 1, h, w),
-            "margin": margin.transpose(1, 2).view(b, 1, h, w),
-            "top1_index": top1_index.transpose(1, 2).view(b, 1, h, w),
+            "flow_yx": chw(forward["flow"], 2),
+            "hard_flow_yx": chw(forward["hard_flow"], 2),
+            "conf": chw(forward_conf, 1),
+            "entropy": chw(forward["entropy"], 1),
+            "margin": chw(forward["margin"], 1),
+            "mutual": chw(mutual, 1),
+            "top1_index": chw(forward["top1_index"].unsqueeze(-1), 1),
+            "reverse_flow_yx": chw(reverse["flow"], 2),
+            "reverse_hard_flow_yx": chw(reverse["hard_flow"], 2),
+            "reverse_conf": chw(reverse_conf, 1),
+            "reverse_entropy": chw(reverse["entropy"], 1),
+            "reverse_margin": chw(reverse["margin"], 1),
         }
 
     def forward(
@@ -245,8 +351,13 @@ class PhysicsGatedMatchingAttention(nn.Module):
         validity: torch.Tensor,
         iter_frac: torch.Tensor,
         target_valid: Optional[torch.Tensor] = None,
+        global_match_result: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
-        gm = self.global_match(f1, f2, target_valid=target_valid)
+        gm = (
+            global_match_result
+            if global_match_result is not None
+            else self.global_match(f1, f2, target_valid=target_valid)
+        )
 
         global_flow_yx = gm["flow_yx"]
         global_conf = gm["conf"]

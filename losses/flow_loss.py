@@ -12,6 +12,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional
 
+from hqs_pytorch.customML.customModels.band_split_refinement import fixed_high_pass
+from hqs_pytorch.customML.customModels.factorised_reliability import ReliabilityState
+from hqs_pytorch.customML.customModels.occlusion_geometry import (
+    backward_warp_yx,
+    flow_in_bounds_mask,
+)
+from .occlusion_aware_losses import (
+    forward_backward_cycle_loss,
+    matchability_supervision_loss,
+    reliability_temporal_loss,
+    visibility_prior_loss,
+    visibility_supervision_loss,
+    visible_outlier_mixture_nll,
+)
+
 
 # ---------------------------------------------------------------------------
 # Charbonnier (robust L1) loss
@@ -365,6 +380,62 @@ class HQSFlowLoss(nn.Module):
         self.iter_damp_start_frac = cfg.get("iter_damp_start_frac", 0.5)
         self.photo_weight  = cfg.get("photo_weight",  0.0)
         self.ofce_weight   = cfg.get("ofce_weight",   0.0)
+        self.detail_weight = float(cfg.get("detail_weight", 0.0))
+        self.detail_start_step = int(cfg.get("detail_start_step", 0))
+        self.detail_ramp_steps = int(cfg.get("detail_ramp_steps", 0))
+        self.detail_boundary_threshold = float(
+            cfg.get("detail_boundary_threshold", 1.0)
+        )
+        self.detail_boundary_boost = float(
+            cfg.get("detail_boundary_boost", 2.0)
+        )
+        self.detail_high_pass_factor = int(
+            cfg.get("detail_high_pass_factor", 2)
+        )
+        self.global_init_weight = float(cfg.get("global_init_weight", 0.0))
+        self.global_confidence_weight = float(
+            cfg.get("global_confidence_weight", 0.0)
+        )
+        self.global_confidence_tau = float(
+            cfg.get("global_confidence_tau", 1.0)
+        )
+        self.global_large_motion_threshold = float(
+            cfg.get("global_large_motion_threshold", 40.0)
+        )
+        self.global_large_motion_boost = float(
+            cfg.get("global_large_motion_boost", 2.0)
+        )
+
+        occ_cfg = cfg.get("occlusion_aware", {})
+        self.occlusion_aware_enabled = bool(occ_cfg.get("enabled", False))
+        self.occ_mixture_weight = float(occ_cfg.get("mixture_weight", 0.02))
+        self.occ_visibility_weight = float(
+            occ_cfg.get("visibility_weight", 0.01)
+        )
+        self.occ_matchability_weight = float(
+            occ_cfg.get("matchability_weight", 0.005)
+        )
+        self.occ_cycle_weight = float(occ_cfg.get("cycle_weight", 0.01))
+        self.occ_temporal_weight = float(occ_cfg.get("temporal_weight", 0.001))
+        self.occ_visibility_prior_weight = float(
+            occ_cfg.get("visibility_prior_weight", 0.001)
+        )
+        self.occ_boundary_weight = float(
+            occ_cfg.get("boundary_weight", 0.005)
+        )
+        self.occ_outlier_scale = float(occ_cfg.get("outlier_scale", 20.0))
+        self.occ_detach_reverse_for_cycle = bool(
+            occ_cfg.get("detach_reverse_for_cycle", True)
+        )
+        self.occ_expected_visible_fraction = float(
+            occ_cfg.get("expected_visible_fraction", 0.85)
+        )
+        self.occ_visibility_prior_tolerance = float(
+            occ_cfg.get("visibility_prior_tolerance", 0.10)
+        )
+        self.register_buffer(
+            "_training_step", torch.zeros((), dtype=torch.long), persistent=False
+        )
 
         # Always instantiate auxiliary terms so we can report their values
         # even when their weights are zero.
@@ -372,11 +443,260 @@ class HQSFlowLoss(nn.Module):
         self.photo_loss = PhotometricLoss()
         self.ofce_loss = OFCELoss()
 
+    def set_step(self, step: int) -> None:
+        self._training_step.fill_(int(step))
+
+    def _detail_weight_at_step(self) -> float:
+        step = int(self._training_step.item())
+        if step < self.detail_start_step:
+            return 0.0
+        if self.detail_ramp_steps <= 0:
+            return self.detail_weight
+        fraction = min(
+            1.0,
+            float(step - self.detail_start_step + 1)
+            / float(self.detail_ramp_steps),
+        )
+        return self.detail_weight * fraction
+
     @staticmethod
     def _flow_grad(flow: torch.Tensor):
         dx = flow[:, :, :, 1:] - flow[:, :, :, :-1]
         dy = flow[:, :, 1:, :] - flow[:, :, :-1, :]
         return dx, dy
+
+    @staticmethod
+    def _mask4(
+        mask: Optional[torch.Tensor],
+        reference: torch.Tensor,
+        *,
+        default: float,
+    ) -> torch.Tensor:
+        b, _, h, w = reference.shape
+        if mask is None:
+            return reference.new_full((b, 1, h, w), float(default))
+        if mask.ndim == 3:
+            mask = mask.unsqueeze(1)
+        if mask.ndim != 4:
+            raise ValueError(f"Expected mask [B,H,W] or [B,1,H,W], got {mask.shape}")
+        mask = mask.to(device=reference.device, dtype=reference.dtype)
+        if mask.shape[1] != 1:
+            mask = mask.mean(dim=1, keepdim=True)
+        if mask.shape[-2:] != (h, w):
+            mask = F.interpolate(mask, size=(h, w), mode="nearest")
+        return mask.clamp(0.0, 1.0)
+
+    @staticmethod
+    def _resize_flow_gt(
+        flow_gt_xy: torch.Tensor, size: tuple[int, int]
+    ) -> torch.Tensor:
+        in_h, in_w = flow_gt_xy.shape[-2:]
+        out_h, out_w = size
+        if (in_h, in_w) == (out_h, out_w):
+            return flow_gt_xy
+        result = F.interpolate(
+            flow_gt_xy, size=size, mode="bilinear", align_corners=True
+        )
+        result = result.clone()
+        result[:, 0] *= float(out_w) / float(in_w)
+        result[:, 1] *= float(out_h) / float(in_h)
+        return result
+
+    def _motion_boundary_map(self, flow_gt: torch.Tensor) -> torch.Tensor:
+        dx, dy = self._flow_grad(flow_gt)
+        dx = F.pad(dx, (0, 1, 0, 0))
+        dy = F.pad(dy, (0, 0, 0, 1))
+        magnitude = torch.sqrt(
+            dx.square().sum(1, keepdim=True)
+            + dy.square().sum(1, keepdim=True)
+            + 1e-9
+        )
+        return (magnitude > self.detail_boundary_threshold).to(flow_gt.dtype)
+
+    def _detail_loss_and_metrics(
+        self,
+        prediction: torch.Tensor,
+        flow_gt: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        high_prediction = fixed_high_pass(
+            prediction, factor=self.detail_high_pass_factor
+        )
+        high_gt = fixed_high_pass(flow_gt, factor=self.detail_high_pass_factor)
+        point = charbonnier(high_prediction - high_gt).mean(1, keepdim=True)
+        valid4 = self._mask4(valid, flow_gt, default=1.0)
+        boundary = self._motion_boundary_map(flow_gt)
+        weight = valid4 * (1.0 + self.detail_boundary_boost * boundary)
+        detail = (point * weight).sum() / weight.sum().clamp_min(1.0)
+
+        with torch.no_grad():
+            recovery = (
+                (high_prediction.abs() * valid4).sum()
+                / (high_gt.abs() * valid4).sum().clamp_min(1e-6)
+            )
+            pred_flat = (high_prediction * valid4).flatten(1)
+            gt_flat = (high_gt * valid4).flatten(1)
+            alignment = (
+                (pred_flat * gt_flat).sum(1)
+                / (
+                    pred_flat.norm(dim=1) * gt_flat.norm(dim=1)
+                ).clamp_min(1e-6)
+            ).mean()
+        return detail, recovery, alignment
+
+    def _visibility_targets(
+        self,
+        flow_gt_xy: torch.Tensor,
+        valid: torch.Tensor,
+        occlusion: Optional[torch.Tensor],
+        invalid: Optional[torch.Tensor],
+        synthetic_occlusion: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        valid4 = self._mask4(valid, flow_gt_xy, default=1.0)
+        invalid4 = self._mask4(invalid, flow_gt_xy, default=0.0)
+        occlusion4 = self._mask4(occlusion, flow_gt_xy, default=0.0)
+        flow_gt_yx = torch.stack(
+            (flow_gt_xy[:, 1], flow_gt_xy[:, 0]), dim=1
+        )
+        in_bounds = flow_in_bounds_mask(flow_gt_yx)
+
+        erased_at_correspondence = torch.zeros_like(occlusion4)
+        if synthetic_occlusion is not None:
+            erased_target = self._mask4(
+                synthetic_occlusion, flow_gt_xy, default=0.0
+            )
+            # Synthetic erase is recorded in target coordinates.  Ground-truth
+            # flow is used here only to construct a loss target in source
+            # coordinates; it never enters model.forward().
+            erased_at_correspondence = backward_warp_yx(
+                erased_target, flow_gt_yx
+            ).clamp(0.0, 1.0)
+
+        reliable_gt = valid4 * (1.0 - invalid4)
+        visibility = (
+            (1.0 - occlusion4)
+            * (1.0 - erased_at_correspondence)
+            * in_bounds
+        ).clamp(0.0, 1.0)
+        return visibility, reliable_gt
+
+    def _factorised_reliability_loss(
+        self,
+        model_outputs: Dict[str, object],
+        flow_gt: torch.Tensor,
+        valid: torch.Tensor,
+        occlusion: Optional[torch.Tensor],
+        invalid: Optional[torch.Tensor],
+        synthetic_occlusion: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        states = model_outputs.get("reliability_states", [])
+        low_predictions = model_outputs.get("flow_low", [])
+        if not isinstance(states, list) or not states:
+            return {}
+
+        visibility, reliable_gt = self._visibility_targets(
+            flow_gt,
+            valid,
+            occlusion,
+            invalid,
+            synthetic_occlusion,
+        )
+        mixture_terms = []
+        visibility_terms = []
+        match_terms = []
+        boundary_terms = []
+        prior_terms = []
+        temporal_terms = []
+        boundary_full = self._motion_boundary_map(flow_gt) * reliable_gt
+
+        previous: Optional[ReliabilityState] = None
+        for index, state in enumerate(states):
+            if not isinstance(state, ReliabilityState):
+                continue
+            size = state.visibility_logits.shape[-2:]
+            visibility_low = F.interpolate(
+                visibility, size=size, mode="nearest"
+            )
+            reliable_low = F.interpolate(
+                reliable_gt, size=size, mode="nearest"
+            )
+            visibility_terms.append(
+                visibility_supervision_loss(
+                    state, visibility_low, valid=reliable_low
+                )
+            )
+            match_terms.append(
+                matchability_supervision_loss(
+                    state, visibility_low, valid=reliable_low
+                )
+            )
+            # Motion boundaries are loss-only GT geometry.  Max pooling keeps
+            # one-pixel structures alive when constructing a lower-resolution
+            # target for the predicted regularisation boundary factor.
+            boundary_low = F.adaptive_max_pool2d(boundary_full, size)
+            positives = (boundary_low * reliable_low).sum()
+            negatives = ((1.0 - boundary_low) * reliable_low).sum()
+            positive_weight = (negatives / positives.clamp_min(1.0)).clamp(
+                1.0, 20.0
+            )
+            boundary_point = F.binary_cross_entropy_with_logits(
+                state.boundary_logits,
+                boundary_low,
+                reduction="none",
+                pos_weight=positive_weight,
+            )
+            boundary_terms.append(
+                (boundary_point * reliable_low).sum()
+                / reliable_low.sum().clamp_min(1.0)
+            )
+            prior_terms.append(
+                visibility_prior_loss(
+                    state,
+                    expected_visible_fraction=self.occ_expected_visible_fraction,
+                    tolerance=self.occ_visibility_prior_tolerance,
+                )
+            )
+            if previous is not None and previous.p_visible.shape == state.p_visible.shape:
+                temporal_terms.append(reliability_temporal_loss(state, previous))
+            previous = state
+
+            if isinstance(low_predictions, list) and index < len(low_predictions):
+                prediction_low = low_predictions[index]
+                gt_low = self._resize_flow_gt(flow_gt, size)
+                mixture_terms.append(
+                    visible_outlier_mixture_nll(
+                        prediction_low - gt_low,
+                        state,
+                        valid=reliable_low,
+                        outlier_scale=self.occ_outlier_scale,
+                    )
+                )
+
+        def mean_or_zero(values: List[torch.Tensor]) -> torch.Tensor:
+            if not values:
+                return flow_gt.new_zeros(())
+            return torch.stack(values).mean()
+
+        result = {
+            "occ_mixture": mean_or_zero(mixture_terms),
+            "occ_visibility": mean_or_zero(visibility_terms),
+            "occ_matchability": mean_or_zero(match_terms),
+            "occ_boundary": mean_or_zero(boundary_terms),
+            "occ_temporal": mean_or_zero(temporal_terms),
+            "occ_visibility_prior": mean_or_zero(prior_terms),
+        }
+
+        flow_ab = model_outputs.get("gmflow_init_flow_yx")
+        flow_ba = model_outputs.get("gmflow_reverse_flow_yx")
+        if isinstance(flow_ab, torch.Tensor) and isinstance(flow_ba, torch.Tensor):
+            result["occ_cycle"] = forward_backward_cycle_loss(
+                flow_ab,
+                flow_ba,
+                detach_reverse=self.occ_detach_reverse_for_cycle,
+            )
+        else:
+            result["occ_cycle"] = flow_gt.new_zeros(())
+        return result
 
     def _boundary_loss(
         self,
@@ -409,7 +729,11 @@ class HQSFlowLoss(nn.Module):
             return loss
         return loss / float(count)
 
-    def _iteration_damping(self, flow_preds: List[torch.Tensor]) -> torch.Tensor:
+    def _iteration_damping(
+        self,
+        flow_preds: List[torch.Tensor],
+        low_predictions: Optional[List[torch.Tensor]] = None,
+    ) -> torch.Tensor:
         if len(flow_preds) < 2:
             return flow_preds[0].new_zeros(())
 
@@ -417,6 +741,15 @@ class HQSFlowLoss(nn.Module):
         start_idx = max(1, min(start_idx, len(flow_preds) - 1))
         terms = []
         for i in range(start_idx, len(flow_preds)):
+            # A coarse-to-fine transition is expected to make a substantial
+            # correction.  Do not penalise it as recurrent instability.
+            if (
+                low_predictions is not None
+                and i < len(low_predictions)
+                and low_predictions[i].shape[-2:]
+                != low_predictions[i - 1].shape[-2:]
+            ):
+                continue
             terms.append((flow_preds[i] - flow_preds[i - 1]).abs().mean())
         if not terms:
             return flow_preds[0].new_zeros(())
@@ -430,6 +763,9 @@ class HQSFlowLoss(nn.Module):
         image1: Optional[torch.Tensor] = None,
         image2: Optional[torch.Tensor] = None,
         model_outputs: Optional[Dict[str, object]] = None,
+        occlusion: Optional[torch.Tensor] = None,
+        invalid: Optional[torch.Tensor] = None,
+        synthetic_occlusion: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         out = self.seq_loss(flow_preds, flow_gt, valid)
         total = out["loss"]
@@ -449,7 +785,12 @@ class HQSFlowLoss(nn.Module):
 
         if self.iter_damp_weight > 0:
             damp_source = raw_preds if raw_preds is not None else flow_preds
-            damp = self._iteration_damping(damp_source)
+            low_predictions = None
+            if isinstance(model_outputs, dict):
+                candidate_low = model_outputs.get("flow_low", None)
+                if isinstance(candidate_low, list):
+                    low_predictions = candidate_low
+            damp = self._iteration_damping(damp_source, low_predictions)
             out["iter_damp"] = damp
             total = total + self.iter_damp_weight * damp
 
@@ -495,6 +836,134 @@ class HQSFlowLoss(nn.Module):
             out["ofce"] = o
             if self.ofce_weight > 0:
                 total = total + self.ofce_weight * o
+
+        detail_weight = self._detail_weight_at_step()
+        if detail_weight > 0:
+            detail, recovery, alignment = self._detail_loss_and_metrics(
+                pred_final, flow_gt, valid
+            )
+        else:
+            with torch.no_grad():
+                detail, recovery, alignment = self._detail_loss_and_metrics(
+                    pred_final.detach(), flow_gt, valid
+                )
+        out["detail"] = detail
+        out["hf_recovery"] = recovery
+        out["hf_alignment"] = alignment
+        if detail_weight > 0:
+            total = total + detail_weight * detail
+        out["detail_weight"] = total.new_tensor(detail_weight)
+
+        if isinstance(model_outputs, dict):
+            initial_yx = model_outputs.get("gmflow_init_flow_yx")
+            if isinstance(initial_yx, torch.Tensor):
+                initial_xy = torch.stack(
+                    (initial_yx[:, 1], initial_yx[:, 0]), dim=1
+                )
+                gt_initial = self._resize_flow_gt(
+                    flow_gt, initial_xy.shape[-2:]
+                )
+                # A matching/data proposal must not be trained to explain
+                # pixels without an observation in frame 2.  Those pixels are
+                # supervised through the final source-conditioned solution.
+                visible_full, reliable_full = self._visibility_targets(
+                    flow_gt,
+                    valid,
+                    occlusion,
+                    invalid,
+                    synthetic_occlusion,
+                )
+                valid_initial = F.interpolate(
+                    visible_full * reliable_full,
+                    size=initial_xy.shape[-2:],
+                    mode="nearest",
+                )
+                magnitude_full = flow_gt.square().sum(1, keepdim=True).sqrt()
+                large_motion = F.interpolate(
+                    (
+                        magnitude_full >= self.global_large_motion_threshold
+                    ).to(flow_gt.dtype),
+                    size=initial_xy.shape[-2:],
+                    mode="nearest",
+                )
+                initial_weight = valid_initial * (
+                    1.0 + self.global_large_motion_boost * large_motion
+                )
+                init_point = charbonnier(initial_xy - gt_initial).mean(
+                    dim=1, keepdim=True
+                )
+                init_loss = (
+                    (init_point * initial_weight).sum()
+                    / initial_weight.sum().clamp_min(1.0)
+                )
+                out["global_init"] = init_loss
+                if self.global_init_weight > 0:
+                    total = total + self.global_init_weight * init_loss
+
+                confidence = model_outputs.get("gmflow_init_conf")
+                if isinstance(confidence, torch.Tensor):
+                    if confidence.shape[-2:] != initial_xy.shape[-2:]:
+                        confidence = F.interpolate(
+                            confidence,
+                            size=initial_xy.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    init_epe = (initial_xy - gt_initial).square().sum(
+                        1, keepdim=True
+                    ).sqrt()
+                    confidence_target = torch.exp(
+                        -init_epe.detach()
+                        / max(self.global_confidence_tau, 1e-6)
+                    )
+                    eps = 1e-6
+                    confidence_point = -(
+                        confidence_target * torch.log(confidence + eps)
+                        + (1.0 - confidence_target)
+                        * torch.log(1.0 - confidence + eps)
+                    )
+                    confidence_loss = (
+                        (confidence_point * valid_initial).sum()
+                        / valid_initial.sum().clamp_min(1.0)
+                    )
+                    out["global_confidence"] = confidence_loss
+                    if self.global_confidence_weight > 0:
+                        total = (
+                            total
+                            + self.global_confidence_weight * confidence_loss
+                        )
+
+        if self.occlusion_aware_enabled and isinstance(model_outputs, dict):
+            occ_terms = self._factorised_reliability_loss(
+                model_outputs,
+                flow_gt,
+                valid,
+                occlusion,
+                invalid,
+                synthetic_occlusion,
+            )
+            out.update(occ_terms)
+            total = total + self.occ_mixture_weight * occ_terms.get(
+                "occ_mixture", total.new_zeros(())
+            )
+            total = total + self.occ_visibility_weight * occ_terms.get(
+                "occ_visibility", total.new_zeros(())
+            )
+            total = total + self.occ_matchability_weight * occ_terms.get(
+                "occ_matchability", total.new_zeros(())
+            )
+            total = total + self.occ_boundary_weight * occ_terms.get(
+                "occ_boundary", total.new_zeros(())
+            )
+            total = total + self.occ_cycle_weight * occ_terms.get(
+                "occ_cycle", total.new_zeros(())
+            )
+            total = total + self.occ_temporal_weight * occ_terms.get(
+                "occ_temporal", total.new_zeros(())
+            )
+            total = total + self.occ_visibility_prior_weight * occ_terms.get(
+                "occ_visibility_prior", total.new_zeros(())
+            )
 
         out["loss"] = total
         return out

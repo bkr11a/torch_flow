@@ -33,8 +33,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def setup_logging(log_dir: str, run_name: str) -> None:
-    os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"{run_name}.log")
+    os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",

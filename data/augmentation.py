@@ -137,6 +137,8 @@ class RandomCrop:
             sample["occlusion"] = _crop(sample["occlusion"])
         if "invalid" in sample and sample["invalid"] is not None:
             sample["invalid"] = _crop(sample["invalid"])
+        if "synthetic_occlusion" in sample and sample["synthetic_occlusion"] is not None:
+            sample["synthetic_occlusion"] = _crop(sample["synthetic_occlusion"])
         return sample
 
 
@@ -158,6 +160,10 @@ class RandomHorizontalFlip:
                 sample["occlusion"] = np.ascontiguousarray(sample["occlusion"][:, ::-1])
             if "invalid" in sample and sample["invalid"] is not None:
                 sample["invalid"] = np.ascontiguousarray(sample["invalid"][:, ::-1])
+            if "synthetic_occlusion" in sample and sample["synthetic_occlusion"] is not None:
+                sample["synthetic_occlusion"] = np.ascontiguousarray(
+                    sample["synthetic_occlusion"][:, ::-1]
+                )
         return sample
 
 
@@ -179,6 +185,10 @@ class RandomVerticalFlip:
                 sample["occlusion"] = np.ascontiguousarray(sample["occlusion"][::-1])
             if "invalid" in sample and sample["invalid"] is not None:
                 sample["invalid"] = np.ascontiguousarray(sample["invalid"][::-1])
+            if "synthetic_occlusion" in sample and sample["synthetic_occlusion"] is not None:
+                sample["synthetic_occlusion"] = np.ascontiguousarray(
+                    sample["synthetic_occlusion"][::-1]
+                )
         return sample
 
 
@@ -199,16 +209,60 @@ class RandomScaleAndCrop:
         self.stretch_prob = stretch_prob
         self.detail_crop_prob = detail_crop_prob
 
-    def _sample_crop(self, img: np.ndarray, new_h: int, new_w: int) -> Tuple[int, int]:
+    @staticmethod
+    def _normalise_score(score: np.ndarray) -> np.ndarray:
+        finite = np.isfinite(score)
+        if not finite.any():
+            return np.zeros_like(score, dtype=np.float32)
+        values = score[finite]
+        scale = np.percentile(values, 95)
+        if scale <= 1e-6:
+            return np.zeros_like(score, dtype=np.float32)
+        return np.clip(score / scale, 0.0, 1.0).astype(np.float32)
+
+    def _sample_crop(self, sample: Dict, new_h: int, new_w: int) -> Tuple[int, int]:
         max_y = new_h - self.crop_h
         max_x = new_w - self.crop_w
 
         if self.detail_crop_prob > 0 and random.random() < self.detail_crop_prob:
-            gray = cv2.cvtColor(np.clip(img, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
-            gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-            gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-            mag = np.sqrt(gx * gx + gy * gy)
-            yy, xx = np.unravel_index(np.argmax(mag), mag.shape)
+            flow = sample.get("flow")
+            if flow is not None:
+                du_dx = cv2.Sobel(flow[..., 0], cv2.CV_32F, 1, 0, ksize=3)
+                du_dy = cv2.Sobel(flow[..., 0], cv2.CV_32F, 0, 1, ksize=3)
+                dv_dx = cv2.Sobel(flow[..., 1], cv2.CV_32F, 1, 0, ksize=3)
+                dv_dy = cv2.Sobel(flow[..., 1], cv2.CV_32F, 0, 1, ksize=3)
+                boundary = np.sqrt(
+                    du_dx * du_dx + du_dy * du_dy
+                    + dv_dx * dv_dx + dv_dy * dv_dy
+                )
+                speed = np.linalg.norm(flow, axis=2)
+                score = self._normalise_score(boundary)
+                score += 0.75 * (speed >= 40.0).astype(np.float32)
+
+                occlusion = sample.get("occlusion")
+                if occlusion is not None:
+                    occ = occlusion.astype(np.float32)
+                    occ_edge = np.abs(cv2.Laplacian(occ, cv2.CV_32F))
+                    score += self._normalise_score(occ_edge)
+                invalid = sample.get("invalid")
+                if invalid is not None:
+                    score *= 1.0 - invalid.astype(np.float32)
+            else:
+                img = sample["image1"]
+                gray = cv2.cvtColor(
+                    np.clip(img, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY
+                )
+                gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+                gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+                score = self._normalise_score(np.sqrt(gx * gx + gy * gy))
+
+            # Select from the strongest one percent rather than always taking
+            # one deterministic maximum edge.
+            flat = score.reshape(-1)
+            count = max(1, min(flat.size, flat.size // 100))
+            candidates = np.argpartition(flat, -count)[-count:]
+            selected = int(random.choice(candidates.tolist()))
+            yy, xx = np.unravel_index(selected, score.shape)
 
             y0 = int(np.clip(yy - self.crop_h // 2, 0, max_y))
             x0 = int(np.clip(xx - self.crop_w // 2, 0, max_x))
@@ -266,13 +320,22 @@ class RandomScaleAndCrop:
                 interpolation=cv2.INTER_NEAREST
             ).astype(bool)
 
+        if "synthetic_occlusion" in sample and sample["synthetic_occlusion"] is not None:
+            sample["synthetic_occlusion"] = cv2.resize(
+                sample["synthetic_occlusion"].astype(np.uint8), (new_W, new_H),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
+
         # Random crop
-        y0, x0 = self._sample_crop(sample["image1"], new_H, new_W)
+        y0, x0 = self._sample_crop(sample, new_H, new_W)
 
         def _crop(arr: np.ndarray) -> np.ndarray:
             return arr[y0:y0 + self.crop_h, x0:x0 + self.crop_w]
 
-        for k in ("image1", "image2", "flow", "valid", "occlusion", "invalid"):
+        for k in (
+            "image1", "image2", "flow", "valid", "occlusion", "invalid",
+            "synthetic_occlusion",
+        ):
             if k in sample and sample[k] is not None:
                 sample[k] = _crop(sample[k])
 
@@ -297,7 +360,14 @@ class RandomErase:
         self.num_patches = num_patches
 
     def __call__(self, sample: Dict) -> Dict:
+        h, w = sample["image2"].shape[:2]
+        erase_mask = sample.get("synthetic_occlusion")
+        if erase_mask is None:
+            erase_mask = np.zeros((h, w), dtype=bool)
+        else:
+            erase_mask = erase_mask.astype(bool).copy()
         if random.random() > self.prob:
+            sample["synthetic_occlusion"] = erase_mask
             return sample
         img = sample["image2"].copy()
         H, W = img.shape[:2]
@@ -308,7 +378,9 @@ class RandomErase:
             y1 = random.randint(0, H - dy)
             mean_col = img.mean(axis=(0, 1))
             img[y1:y1 + dy, x1:x1 + dx] = mean_col
+            erase_mask[y1:y1 + dy, x1:x1 + dx] = True
         sample["image2"] = img
+        sample["synthetic_occlusion"] = erase_mask
         return sample
 
 

@@ -340,6 +340,7 @@ class SpringDataset(FlowDataset):
             "valid": valid,
             "occlusion": None,
             "invalid": None,
+            "synthetic_occlusion": None,
         }
 
         if self.augmentor is not None and self.split == "train":
@@ -356,6 +357,13 @@ class SpringDataset(FlowDataset):
             ),
             "occlusion": None,
             "invalid": None,
+            "synthetic_occlusion": (
+                torch.from_numpy(
+                    sample["synthetic_occlusion"].astype(np.float32)
+                )
+                if sample.get("synthetic_occlusion") is not None
+                else None
+            ),
         }
 
     @staticmethod

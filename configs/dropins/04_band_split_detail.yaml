@@ -1,0 +1,36 @@
+run_name: dropins/04_band_split_detail
+model:
+  model_backbone:
+    allow_external_validity_inputs: false
+    freeze_correction_last_n_l1: 0
+    pyramid_l1_iters: 4
+    use_transformer_feature_enhancer: false
+    use_band_split_refiner: true
+    pyramid_l0_iters: 2
+    detail_hidden_dim: 96
+    detail_data_beta: 0.10
+    detail_half_step: 0.50
+    detail_max_data_delta: 1.50
+    detail_max_prior_delta: 1.00
+    detail_max_prox_delta: 0.50
+    detail_max_full_delta: 4.0
+    detail_photometric_tau: 0.10
+    detail_high_pass_factor: 2
+loss:
+  num_stages: 9
+  inter_smooth_weight: 0.0
+  iter_damp_weight: 0.0
+  boundary_weight: 0.0
+  boundary_thresh: 1.0
+  detail_weight: 0.015
+  detail_start_step: 2000
+  detail_ramp_steps: 3000
+  detail_boundary_threshold: 1.0
+  detail_boundary_boost: 2.0
+  detail_high_pass_factor: 2
+training:
+  strict: false
+data:
+  # This now samples GT motion boundaries, s40+ pixels and occlusions rather
+  # than a single photometric Sobel maximum.
+  detail_crop_prob: 0.35

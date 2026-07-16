@@ -22,6 +22,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from hqs_pytorch.customML.customModels.pgma import PhysicsGatedMatchingAttention
+from hqs_pytorch.customML.customModels.band_split_refinement import (
+    BandSplitHQSRefiner,
+)
+from hqs_pytorch.customML.customModels.correlation_statistics import (
+    correlation_statistics,
+)
+from hqs_pytorch.customML.customModels.factorised_reliability import (
+    FactorisedReliabilityHead,
+    ReliabilityState,
+    assemble_reliability_features,
+)
+from hqs_pytorch.customML.customModels.occlusion_geometry import (
+    FlowGeometry,
+    compute_flow_geometry_yx,
+)
+from hqs_pytorch.customML.customModels.reliability_aware_blocks import (
+    BoundaryAwareProximalNet,
+)
 from hqs_pytorch.customML.customModels.sota_addons import (DirectInitialFlowHead,
     TransformerFeatureEnhancer,
     MultiScaleGlobalLocalInitializer,
@@ -267,9 +285,13 @@ class PriorMotionEncoder(nn.Module):
     It can update flow using:
       - current flow
       - HQS residual w - q
-      - data reliability/confidence
-      - photometric residual
-      - warp validity
+      - source-image edge magnitude
+      - iteration progress
+      - state-derived in-bounds validity
+
+    It must not receive a target photometric residual or target-derived
+    confidence; the forward pass enforces this while retaining the historical
+    seven-channel module interface for checkpoint compatibility.
 
     The intention is to provide an inpainting / regularising update path
     for regions where target-frame matching evidence is unreliable.
@@ -646,6 +668,14 @@ class HQSFlowModelTFPort(nn.Module):
             _cfg_get(mb, "correction_gate_nonincreasing", True)
         )
         self.freeze_correction_last_n = int(_cfg_get(mb, "freeze_correction_last_n", 1))
+        # Fine refinement needs an independent freeze policy.  Reusing the
+        # coarse value can silently disable half of a two-iteration L1 loop.
+        self.freeze_correction_last_n_l1 = int(
+            _cfg_get(mb, "freeze_correction_last_n_l1", 0)
+        )
+        self.allow_external_validity_inputs = bool(
+            _cfg_get(mb, "allow_external_validity_inputs", False)
+        )
 
         self.hqs_beta_steps = nn.Parameter(torch.zeros(self.num_hqs_iterations))
         self.hqs_lambda_ratio_steps = nn.Parameter(torch.zeros(self.num_hqs_iterations))
@@ -792,6 +822,46 @@ class HQSFlowModelTFPort(nn.Module):
             m_min=self.data_reliability_m_min,
         )
 
+        # Factorised inference-time validity.  This replaces a single generic
+        # confidence with visibility, matchability, uncertainty and boundary
+        # factors, while accepting no ground-truth input in forward().
+        self.use_factorised_reliability = bool(
+            _cfg_get(mb, "use_factorised_reliability", False)
+        )
+        self.minimum_data_gate = float(
+            _cfg_get(mb, "minimum_data_gate", 0.0)
+        )
+        self.detach_reverse_for_geometry = bool(
+            _cfg_get(mb, "detach_reverse_for_geometry", True)
+        )
+        self.fb_alpha = float(_cfg_get(mb, "fb_alpha", 0.01))
+        self.fb_beta = float(_cfg_get(mb, "fb_beta", 0.5))
+        self.occupancy_hole_threshold = float(
+            _cfg_get(mb, "occupancy_hole_threshold", 0.25)
+        )
+        self.occupancy_collision_threshold = float(
+            _cfg_get(mb, "occupancy_collision_threshold", 1.25)
+        )
+        self.occupancy_temperature = float(
+            _cfg_get(mb, "occupancy_temperature", 0.10)
+        )
+        self.reliability_corr_temperature = float(
+            _cfg_get(mb, "reliability_corr_temperature", 0.10)
+        )
+        self.factorised_reliability_head = (
+            FactorisedReliabilityHead(
+                in_channels=11,
+                hidden_channels=int(
+                    _cfg_get(mb, "factorised_reliability_hidden_dim", 48)
+                ),
+                recurrent_channels=int(
+                    _cfg_get(mb, "reliability_recurrent_channels", 0)
+                ),
+            )
+            if self.use_factorised_reliability
+            else None
+        )
+
         self.use_learned_prox_net = bool(
             _cfg_get(mb, "use_learned_prox", False)
         )
@@ -805,6 +875,19 @@ class HQSFlowModelTFPort(nn.Module):
 
         else:
             self.learned_prox = None
+
+        self.use_boundary_aware_prox = bool(
+            _cfg_get(mb, "use_boundary_aware_prox", False)
+        ) and self.use_factorised_reliability
+        self.boundary_aware_prox = (
+            BoundaryAwareProximalNet(
+                context_channels=context_dim,
+                hidden_channels=int(_cfg_get(mb, "prox_hidden_dim", 96)),
+                max_delta=float(_cfg_get(mb, "proximal_max_delta", 1.0)),
+            )
+            if self.use_boundary_aware_prox
+            else None
+        )
 
         # Masked OFCE warp: option to mask the warping function with a validity mask to prevent corrupting features with out-of-bounds or invalid pixel within the warps.
         self.use_masked_ofce_warp = bool(
@@ -856,8 +939,19 @@ class HQSFlowModelTFPort(nn.Module):
         self.gmflow_init_scale = float(
             _cfg_get(mb, "gmflow_init_scale", 1.0)
         )
+        self.gmflow_confidence_gated = bool(
+            _cfg_get(mb, "gmflow_confidence_gated", True)
+        )
+        self.gmflow_confidence_floor = float(
+            _cfg_get(mb, "gmflow_confidence_floor", 0.05)
+        )
 
-        if self.use_pgma or self.use_gmflow_init or self.use_pgma_iter:
+        if (
+            self.use_pgma
+            or self.use_gmflow_init
+            or self.use_pgma_iter
+            or self.use_factorised_reliability
+        ):
             self.pgma = PhysicsGatedMatchingAttention(
                 feature_dim=feature_dim,
                 gate_hidden=int(_cfg_get(mb, "pgma_hidden_dim", 64)),
@@ -868,7 +962,10 @@ class HQSFlowModelTFPort(nn.Module):
                 use_feature_enhancer=bool(_cfg_get(mb, "pgma_use_feature_enhancer", True)),
                 gate_init_hqs=float(_cfg_get(mb, "pgma_gate_init_hqs", 1.5)),
                 gate_init_global=float(_cfg_get(mb, "pgma_gate_init_global", -1.0)),
-                gate_init_prox=float(_cfg_get(mb, "pgma_gate_init_prox", -1.0))
+                gate_init_prox=float(_cfg_get(mb, "pgma_gate_init_prox", -1.0)),
+                query_chunk_size=int(_cfg_get(mb, "pgma_query_chunk_size", 512)),
+                position_scale=float(_cfg_get(mb, "pgma_position_scale", 0.05)),
+                confidence_floor=float(_cfg_get(mb, "pgma_confidence_floor", 0.05)),
             )
         else:
             self.pgma = None
@@ -964,6 +1061,30 @@ class HQSFlowModelTFPort(nn.Module):
         # Stable initialisation: initially produces uniform 3x3 convex weights.
         nn.init.zeros_(self.level1_upsample_mask_head[-1].weight)
         nn.init.zeros_(self.level1_upsample_mask_head[-1].bias)
+
+        # Optional half-resolution analytic/data-prior refinement followed by a
+        # full-resolution high-pass residual.  All learned heads are zero
+        # initialised, so enabling it from an older checkpoint is controlled.
+        self.use_band_split_refiner = bool(
+            _cfg_get(mb, "use_band_split_refiner", False)
+        )
+        self.band_split_refiner = (
+            BandSplitHQSRefiner(
+                context_channels=feature_dim,
+                hidden_channels=int(_cfg_get(mb, "detail_hidden_dim", 96)),
+                half_iterations=int(_cfg_get(mb, "pyramid_l0_iters", 2)),
+                data_beta=float(_cfg_get(mb, "detail_data_beta", 0.10)),
+                half_step=float(_cfg_get(mb, "detail_half_step", 0.50)),
+                max_data_delta=float(_cfg_get(mb, "detail_max_data_delta", 1.50)),
+                max_prior_delta=float(_cfg_get(mb, "detail_max_prior_delta", 1.00)),
+                max_prox_delta=float(_cfg_get(mb, "detail_max_prox_delta", 0.50)),
+                max_full_detail=float(_cfg_get(mb, "detail_max_full_delta", 4.0)),
+                photometric_tau=float(_cfg_get(mb, "detail_photometric_tau", 0.10)),
+                high_pass_factor=int(_cfg_get(mb, "detail_high_pass_factor", 2)),
+            )
+            if self.use_band_split_refiner
+            else None
+        )
 
     @staticmethod
     def _normalise(img: torch.Tensor) -> torch.Tensor:
@@ -1462,6 +1583,8 @@ class HQSFlowModelTFPort(nn.Module):
             gy2_warp = self._warp_yx(gy2_native, flow_yx)
             bounds_valid = self._valid_warp_mask(flow_yx).to(device=i1.device, dtype=i1.dtype)
             target_warp_valid = bounds_valid  # If not using masked warp, we can only guarantee validity based on bounds.
+            gx2_valid = bounds_valid
+            gy2_valid = bounds_valid
 
         source_valid = self._resize_mask(
             source_valid,
@@ -1651,33 +1774,38 @@ class HQSFlowModelTFPort(nn.Module):
     def convex_transition_upsample_yx(
         self,
         flow_yx: torch.Tensor,
-        f1_l2: torch.Tensor,
-        f1_l1: torch.Tensor,
-        f2_l1: torch.Tensor,
+        source_l2: torch.Tensor,
+        source_l1: torch.Tensor,
     ) -> torch.Tensor:
-        # Build low-res conditioning features at level-2 resolution.
-        f1_l1_down = F.interpolate(
-            f1_l1,
+        """Source-guided 1/8 -> 1/4 transition.
+
+        The convex mask is part of the learned prior/regularisation path.  It
+        therefore uses source geometry only; target features remain confined
+        to matching and the data correction.
+        """
+        source_l1_down = F.interpolate(
+            source_l1,
             size=flow_yx.shape[-2:],
             mode="bilinear",
             align_corners=False,
         )
-
-        f2_l1_down = F.interpolate(
-            f2_l1,
-            size=flow_yx.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        mask_in = torch.cat([flow_yx, f1_l1_down, f2_l1_down], dim=1)
+        if source_l2.shape[-2:] != flow_yx.shape[-2:]:
+            source_l2 = F.interpolate(
+                source_l2,
+                size=flow_yx.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        mask_in = torch.cat([flow_yx, source_l2, source_l1_down], dim=1)
         mask_logits = self.level1_transition_mask(mask_in)
 
         flow_up = self.convex_upsample(flow_yx, mask_logits, rate=self.transition_upsample_rate)
 
         # Safely resize if shapes are not exactly 2x due to odd dimensions.
-        if flow_up.shape[-2:] != f1_l1.shape[-2:]:
-            flow_up = self._resize_flow_yx(flow_up, f1_l1.shape[-2], f1_l1.shape[-1])
+        if flow_up.shape[-2:] != source_l1.shape[-2:]:
+            flow_up = self._resize_flow_yx(
+                flow_up, source_l1.shape[-2], source_l1.shape[-1]
+            )
 
         return flow_up
 
@@ -1697,6 +1825,57 @@ class HQSFlowModelTFPort(nn.Module):
         """
         return torch.exp(-it.abs() / tau).clamp(0.0, 1.0)
 
+    def _predict_factorised_reliability(
+        self,
+        *,
+        flow_yx: torch.Tensor,
+        reverse_flow_yx: torch.Tensor,
+        photometric_residual: torch.Tensor,
+        ix: torch.Tensor,
+        iy: torch.Tensor,
+        legacy_confidence: torch.Tensor,
+        hqs_residual_yx: torch.Tensor,
+        correlation_features: torch.Tensor,
+        previous_hidden: Optional[torch.Tensor],
+    ) -> Tuple[ReliabilityState, FlowGeometry]:
+        if self.factorised_reliability_head is None:
+            raise RuntimeError("Factorised reliability is not enabled.")
+        if reverse_flow_yx.shape[-2:] != flow_yx.shape[-2:]:
+            reverse_flow_yx = self._resize_flow_yx(
+                reverse_flow_yx, flow_yx.shape[-2], flow_yx.shape[-1]
+            )
+        geometry = compute_flow_geometry_yx(
+            flow_yx,
+            reverse_flow_yx,
+            fb_alpha=self.fb_alpha,
+            fb_beta=self.fb_beta,
+            hole_threshold=self.occupancy_hole_threshold,
+            collision_threshold=self.occupancy_collision_threshold,
+            occupancy_temperature=self.occupancy_temperature,
+            detach_reverse_for_geometry=self.detach_reverse_for_geometry,
+        )
+        corr_entropy, _, corr_margin = correlation_statistics(
+            correlation_features,
+            candidate_dim=1,
+            temperature=self.reliability_corr_temperature,
+        )
+        image_gradient = torch.sqrt(ix.square() + iy.square() + 1e-6)
+        features = assemble_reliability_features(
+            photometric_residual=photometric_residual,
+            image_gradient=image_gradient,
+            in_bounds=geometry.in_bounds,
+            legacy_confidence=legacy_confidence,
+            hqs_residual_yx=hqs_residual_yx,
+            flow_yx=flow_yx,
+            fb_confidence=geometry.fb_confidence,
+            hole_score=geometry.hole_score,
+            collision_score=geometry.collision_score,
+            corr_entropy=corr_entropy,
+            corr_margin=corr_margin,
+            detach_inputs=self.detach_data_reliability_inputs,
+        )
+        return self.factorised_reliability_head(features, previous_hidden), geometry
+
     def forward(
         self,
         image1: torch.Tensor,
@@ -1715,11 +1894,15 @@ class HQSFlowModelTFPort(nn.Module):
         i1 = self._normalise(image1)
         i2 = self._normalise(image2)
 
-        # Force source_valid and target_valid to be None.
-        # This is a temporary measure to ensure that the model does not use the external masks in order to establise a baseline.
-        # Still TODO: remove the source_valid and target_valid arguments from the forward() signature, and remove the corresponding code in the training loop.
-        source_valid = None
-        target_valid = None
+        if (
+            source_valid is not None or target_valid is not None
+        ) and not self.allow_external_validity_inputs:
+            raise ValueError(
+                "Ground-truth/external validity must not enter model.forward(). "
+                "Use occlusion and synthetic-erasure masks only as loss targets. "
+                "Set allow_external_validity_inputs=true only for an explicitly "
+                "labelled oracle diagnostic."
+            )
 
         # Photometric tensors for OFCE/data term
         # Remember these are deliberately NOT normalised according to ImageNet stats.
@@ -1738,9 +1921,14 @@ class HQSFlowModelTFPort(nn.Module):
         feat1 = self.feature_encoder(i1)
         feat2 = self.feature_encoder(i2)
 
-        f1_l1 = feat1["level1"]
+        # Preserve immutable source-only features for every learned prior and
+        # upsampling path.  Cross-enhanced copies are used only for matching.
+        f1_source_l0 = feat1["level0"]
+        f1_source_l1 = feat1["level1"]
+        f1_source_l2 = feat1["level2"]
+        f1_l1 = f1_source_l1
         f2_l1 = feat2["level1"]
-        f1 = feat1["level2"]
+        f1 = f1_source_l2
         f2 = feat2["level2"]
 
         if self.use_transformer_feature_enhancer:
@@ -1810,30 +1998,44 @@ class HQSFlowModelTFPort(nn.Module):
         # from all-pairs feature attention.
         # -------------------------------------------------------------------------
         pgma_init_out = None
+        pgma_cached = None
+        reverse_flow_l2_yx = -flow_yx.detach()
 
-        if self.use_gmflow_init:
+        if self.pgma is not None and (
+            self.use_gmflow_init
+            or self.use_pgma_iter
+            or self.use_factorised_reliability
+        ):
             gm_init = self.pgma.global_match(
                 f1,
                 f2,
                 target_valid=target_valid_lvl if "target_valid_lvl" in locals() else None,
             )
-
-            # This is a full global proposal, not a local residual lookup.
-            gm_flow_yx = gm_init["flow_yx"]
-
-            # Optional scaling allows conservative warm start.
-            flow_yx = (1.0 - self.gmflow_init_scale) * flow_yx + self.gmflow_init_scale * gm_flow_yx
-
-            # Keep auxiliary variable aligned with the initialised flow.
-            # This prevents the first HQS residual w - q from becoming artificially huge.
+            pgma_cached = gm_init
+            reverse_flow_l2_yx = gm_init["reverse_flow_yx"]
 
             pgma_init_out = {
-                "gmflow_init_flow_yx": gm_flow_yx.detach(),
-                "gmflow_init_hard_flow_yx": gm_init["hard_flow_yx"].detach(),
-                "gmflow_init_conf": gm_init["conf"].detach(),
-                "gmflow_init_entropy": gm_init["entropy"].detach(),
-                "gmflow_init_margin": gm_init["margin"].detach(),
+                # Preserve gradients: the explicit initialisation loss must
+                # train the matcher rather than merely log a detached tensor.
+                "gmflow_init_flow_yx": gm_init["flow_yx"],
+                "gmflow_init_hard_flow_yx": gm_init["hard_flow_yx"],
+                "gmflow_init_conf": gm_init["conf"],
+                "gmflow_init_entropy": gm_init["entropy"],
+                "gmflow_init_margin": gm_init["margin"],
+                "gmflow_init_mutual": gm_init["mutual"],
+                "gmflow_reverse_flow_yx": reverse_flow_l2_yx,
             }
+
+            if self.use_gmflow_init:
+                gm_flow_yx = gm_init["flow_yx"]
+                if self.gmflow_confidence_gated:
+                    confidence_gate = self.gmflow_confidence_floor + (
+                        1.0 - self.gmflow_confidence_floor
+                    ) * gm_init["conf"].clamp(0.0, 1.0)
+                else:
+                    confidence_gate = torch.ones_like(gm_init["conf"])
+                blend = (self.gmflow_init_scale * confidence_gate).clamp(0.0, 1.0)
+                flow_yx = flow_yx + blend * (gm_flow_yx - flow_yx)
 
         # -------------------------------------------------------------------------
         # Direct initial flow regression head
@@ -1873,6 +2075,11 @@ class HQSFlowModelTFPort(nn.Module):
         pgma_global_conf_lows: List[torch.Tensor] = []
         pgma_gate_lows: List[torch.Tensor] = []
         pgma_delta_global_lows: List[torch.Tensor] = []
+        reliability_states: List[ReliabilityState] = []
+        reliability_geometries: List[FlowGeometry] = []
+        reliability_residuals: List[torch.Tensor] = []
+        factorised_data_gates: List[torch.Tensor] = []
+        reliability_hidden: Optional[torch.Tensor] = None
 
         beta_schedule, lambda_schedule = self._hqs_penalties()
         correction_gates = self._correction_gates()
@@ -1907,6 +2114,9 @@ class HQSFlowModelTFPort(nn.Module):
         for k in range(iters):
             beta = beta_schedule[k]
             lam = lambda_schedule[k]
+            iter_fraction_k = flow_yx.new_full(
+                (b, 1, h, w), float(k + 1) / float(max(iters, 1))
+            )
 
             # Sample correlation pyramid at current flow position.
             coords_query = coords1 + flow_yx.permute(0, 2, 3, 1)
@@ -1968,12 +2178,42 @@ class HQSFlowModelTFPort(nn.Module):
 
             matchability_lows.append(confidence_raw.detach())
 
-            confidence_masked = confidence_raw * data_valid_k
-
             # ------------------------------------------------------------
             # Data reliability weighting
             # ------------------------------------------------------------
-            if self.use_data_reliability_mask:
+            reliability_state: Optional[ReliabilityState] = None
+            if self.use_factorised_reliability:
+                reliability_state, geometry = self._predict_factorised_reliability(
+                    flow_yx=flow_yx,
+                    reverse_flow_yx=reverse_flow_l2_yx,
+                    photometric_residual=it,
+                    ix=ix,
+                    iy=iy,
+                    legacy_confidence=confidence_raw,
+                    hqs_residual_yx=flow_yx - aux_yx,
+                    correlation_features=corr_feat_k_chw,
+                    previous_hidden=reliability_hidden,
+                )
+                reliability_hidden = reliability_state.hidden
+                data_valid_k = (data_valid_k * geometry.in_bounds).clamp(0.0, 1.0)
+                data_weight = reliability_state.data_gate(
+                    data_valid_k, self.minimum_data_gate
+                )
+                # sigma=1 is neutral; only predicted scale above one attenuates
+                # the data operator.
+                uncertainty_weight = torch.exp(
+                    -F.relu(reliability_state.log_sigma_data)
+                )
+                data_weight = (data_weight * uncertainty_weight).clamp(0.0, 1.0)
+                data_reliability = (
+                    reliability_state.p_visible * reliability_state.p_match
+                )
+                reliability_states.append(reliability_state)
+                reliability_geometries.append(geometry)
+                reliability_residuals.append(it)
+                factorised_data_gates.append(data_weight)
+            elif self.use_data_reliability_mask:
+                confidence_masked = confidence_raw * data_valid_k
                 grad_mag = torch.sqrt(ix_safe * ix_safe + iy_safe * iy_safe + 1e-6)
                 hqs_mag = torch.norm(flow_yx - aux_yx, dim=1, keepdim=True)
                 flow_mag = torch.norm(flow_yx, dim=1, keepdim=True)
@@ -1994,10 +2234,10 @@ class HQSFlowModelTFPort(nn.Module):
                     rel_inputs = rel_inputs.detach()
 
                 data_reliability = self.data_reliability_head(rel_inputs)
+                data_weight = (data_valid_k * data_reliability).clamp(0.0, 1.0)
             else:                
                 data_reliability = torch.ones_like(data_valid_k)
-
-            data_weight = (data_valid_k * data_reliability).clamp(0.0, 1.0)
+                data_weight = data_valid_k
 
             confidence_k = (confidence_raw * data_weight).clamp(0.0, 1.0)
 
@@ -2020,9 +2260,23 @@ class HQSFlowModelTFPort(nn.Module):
 
             # ------------------------------------------------------------
 
-            if self.use_learned_prox_net:
-                # Use the learned prox network to predict the smoothed flow directly, rather than running the Jacobi iterations.
-                aux_yx, _ = self.learned_prox(flow_yx=flow_yx, prev_aux_yx=aux_yx, context_feat=f1, validity=data_weight)
+            if self.use_boundary_aware_prox:
+                assert reliability_state is not None
+                aux_yx, _ = self.boundary_aware_prox(
+                    flow_yx,
+                    aux_yx,
+                    context_feat_lvl,
+                    reliability_state,
+                )
+            elif self.use_learned_prox_net:
+                # The proximal operator is a source-only prior.  In particular,
+                # never pass the cross-enhanced matching feature f1 here.
+                aux_yx, _ = self.learned_prox(
+                    flow_yx=flow_yx,
+                    prev_aux_yx=aux_yx,
+                    context_feat=context_feat_lvl,
+                    validity=data_weight,
+                )
             else:
                 # otherwise HQS v-step: Jacobi TV-proximal smoothing.
                 aux_yx, _, _ = self.hqs_prox_step(
@@ -2057,9 +2311,17 @@ class HQSFlowModelTFPort(nn.Module):
                 # It has its own recurrent hidden state.
                 # --------------------------------------------------------
 
-                prior_confidence_k = confidence_k
-                prior_it_k = it_safe
-                prior_valid_k = data_valid_k
+                # Source/prior path: no photometric residual, target-derived
+                # confidence or correlation is admitted.  Retain the historical
+                # seven-channel encoder contract by supplying source edge,
+                # iteration progress and state-derived in-bounds validity.
+                prior_confidence_k = torch.sqrt(
+                    self.central_grad_x(i1_lvl).square()
+                    + self.central_grad_y(i1_lvl).square()
+                    + 1e-6
+                ).mean(dim=1, keepdim=True)
+                prior_it_k = iter_fraction_k
+                prior_valid_k = self._valid_warp_mask(flow_yx)
 
                 if self.detach_reliability_inputs:
                     prior_confidence_k = prior_confidence_k.detach()
@@ -2093,15 +2355,17 @@ class HQSFlowModelTFPort(nn.Module):
                     gate_it = gate_it.detach()
                     gate_valid = gate_valid.detach()
 
-                alpha = self.reliability_gate(
-                    gate_flow,
-                    gate_resid,
-                    gate_conf,
-                    gate_it,
-                    gate_valid,
-                )
-
-                alpha = alpha * data_valid_k.detach()
+                if self.use_factorised_reliability:
+                    alpha = data_weight
+                else:
+                    alpha = self.reliability_gate(
+                        gate_flow,
+                        gate_resid,
+                        gate_conf,
+                        gate_it,
+                        gate_valid,
+                    )
+                    alpha = alpha * data_valid_k.detach()
                 delta_hqs = alpha * delta_match + (1.0 - alpha) * delta_prior
             else:
                 alpha = torch.ones_like(confidence_k)
@@ -2129,8 +2393,9 @@ class HQSFlowModelTFPort(nn.Module):
                     hqs_resid=hqs_resid,
                     local_conf=confidence_k,
                     validity=data_valid_k.detach(),
-                    iter_frac=it_safe.abs(),
+                    iter_frac=iter_fraction_k,
                     target_valid=target_valid_lvl if "target_valid_lvl" in locals() else None,
+                    global_match_result=pgma_cached,
                 )
 
                 delta = pgma_out["delta"]
@@ -2189,9 +2454,21 @@ class HQSFlowModelTFPort(nn.Module):
             # Existing residual update.
             flow_yx = flow_yx + correction_gates[k] * delta
 
-            if self.use_learned_prox_net:
-                # Use the learned prox network to predict the smoothed flow directly, rather than running the Jacobi iterations.
-                aux_yx, _ = self.learned_prox(flow_yx=flow_yx, prev_aux_yx=aux_yx, context_feat=f1, validity=data_weight)
+            if self.use_boundary_aware_prox:
+                assert reliability_state is not None
+                aux_yx, _ = self.boundary_aware_prox(
+                    flow_yx,
+                    aux_yx,
+                    context_feat_lvl,
+                    reliability_state,
+                )
+            elif self.use_learned_prox_net:
+                aux_yx, _ = self.learned_prox(
+                    flow_yx=flow_yx,
+                    prev_aux_yx=aux_yx,
+                    context_feat=context_feat_lvl,
+                    validity=data_weight,
+                )
             else:
                 aux_yx, _, _ = self.hqs_prox_step(
                     flow_yx, i1_lvl, beta, lam, validity_mask=data_weight, num_iter=self.prox_jacobi_iters
@@ -2227,8 +2504,12 @@ class HQSFlowModelTFPort(nn.Module):
             # flow_l1 = self._resize_flow_yx(flow_yx, h1, w1)
             # aux_l1 = self._resize_flow_yx(aux_yx, h1, w1)
             # ------ New convex upsample-based transfer (Option B) -----
-            flow_l1 = self.convex_transition_upsample_yx(flow_yx, f1, f1_l1, f2_l1)
-            aux_l1 = self.convex_transition_upsample_yx(aux_yx, f1, f1_l1, f2_l1)
+            flow_l1 = self.convex_transition_upsample_yx(
+                flow_yx, f1_source_l2, f1_source_l1
+            )
+            aux_l1 = self.convex_transition_upsample_yx(
+                aux_yx, f1_source_l2, f1_source_l1
+            )
 
             i1_l1 = F.interpolate(i1_photo, size=(h1, w1), mode="bilinear", align_corners=True)
             i2_l1 = F.interpolate(i2_photo, size=(h1, w1), mode="bilinear", align_corners=True)
@@ -2263,16 +2544,50 @@ class HQSFlowModelTFPort(nn.Module):
                 self.hqs_beta_steps_l1, self.hqs_lambda_ratio_steps_l1
             )
             gates_l1 = self._compute_correction_gates_from(self.delta_gate_logits_l1)
-            freeze_n_l1 = min(self.freeze_correction_last_n, self.pyramid_l1_iters)
+            freeze_n_l1 = min(
+                self.freeze_correction_last_n_l1, self.pyramid_l1_iters
+            )
             if freeze_n_l1 > 0:
                 gates_l1 = gates_l1.clone()
                 gates_l1[self.pyramid_l1_iters - freeze_n_l1:] = 0.0
 
             net_l1_prior = net_l1.clone()
+            reliability_hidden_l1: Optional[torch.Tensor] = None
+            reverse_flow_l1_yx = self._resize_flow_yx(
+                reverse_flow_l2_yx, h1, w1
+            )
+            pgma_cached_l1 = None
+            if self.use_pgma_iter and pgma_cached is not None:
+                pgma_cached_l1 = {
+                    "flow_yx": self._resize_flow_yx(pgma_cached["flow_yx"], h1, w1),
+                    "hard_flow_yx": self._resize_flow_yx(
+                        pgma_cached["hard_flow_yx"], h1, w1
+                    ),
+                    "conf": F.interpolate(
+                        pgma_cached["conf"], size=(h1, w1), mode="bilinear", align_corners=False
+                    ),
+                    "entropy": F.interpolate(
+                        pgma_cached["entropy"], size=(h1, w1), mode="bilinear", align_corners=False
+                    ),
+                    "margin": F.interpolate(
+                        pgma_cached["margin"], size=(h1, w1), mode="bilinear", align_corners=False
+                    ),
+                    "mutual": F.interpolate(
+                        pgma_cached["mutual"], size=(h1, w1), mode="nearest"
+                    ),
+                    # Diagnostic only; PGMA's gate does not consume the index.
+                    "top1_index": F.interpolate(
+                        pgma_cached["top1_index"].float(), size=(h1, w1), mode="nearest"
+                    ).long(),
+                }
 
             for k_l1 in range(self.pyramid_l1_iters):
                 beta = beta_l1_sched[k_l1]
                 lam = lam_l1_sched[k_l1]
+                iter_fraction_l1 = flow_l1.new_full(
+                    (b, 1, h1, w1),
+                    float(k_l1 + 1) / float(max(self.pyramid_l1_iters, 1)),
+                )
 
                 coords_query_l1 = coords_l1 + flow_l1.permute(0, 2, 3, 1)
                 corr_feat_l1 = self.sample_all_pairs_corr_pyramid(
@@ -2323,9 +2638,40 @@ class HQSFlowModelTFPort(nn.Module):
                     confidence_raw_l1 = confidence_raw_l1 * photometric_conf_l1
 
                 matchability_lows.append(confidence_raw_l1.detach())
-                confidence_masked_l1 = confidence_raw_l1 * data_valid_l1
-
-                if self.use_data_reliability_mask:
+                reliability_state_l1: Optional[ReliabilityState] = None
+                if self.use_factorised_reliability:
+                    reliability_state_l1, geometry_l1 = self._predict_factorised_reliability(
+                        flow_yx=flow_l1,
+                        reverse_flow_yx=reverse_flow_l1_yx,
+                        photometric_residual=it,
+                        ix=ix,
+                        iy=iy,
+                        legacy_confidence=confidence_raw_l1,
+                        hqs_residual_yx=flow_l1 - aux_l1,
+                        correlation_features=corr_feat_l1_chw,
+                        previous_hidden=reliability_hidden_l1,
+                    )
+                    reliability_hidden_l1 = reliability_state_l1.hidden
+                    data_valid_l1 = (
+                        data_valid_l1 * geometry_l1.in_bounds
+                    ).clamp(0.0, 1.0)
+                    data_weight = reliability_state_l1.data_gate(
+                        data_valid_l1, self.minimum_data_gate
+                    )
+                    data_weight = data_weight * torch.exp(
+                        -F.relu(reliability_state_l1.log_sigma_data)
+                    )
+                    data_weight = data_weight.clamp(0.0, 1.0)
+                    data_reliability_l1 = (
+                        reliability_state_l1.p_visible
+                        * reliability_state_l1.p_match
+                    )
+                    reliability_states.append(reliability_state_l1)
+                    reliability_geometries.append(geometry_l1)
+                    reliability_residuals.append(it)
+                    factorised_data_gates.append(data_weight)
+                elif self.use_data_reliability_mask:
+                    confidence_masked_l1 = confidence_raw_l1 * data_valid_l1
                     grad_mag = torch.sqrt(ix_safe * ix_safe + iy_safe * iy_safe + 1e-6)
                     hqs_mag = torch.norm(flow_l1 - aux_l1, dim=1, keepdim=True)
                     flow_mag = torch.norm(flow_l1, dim=1, keepdim=True)
@@ -2346,10 +2692,12 @@ class HQSFlowModelTFPort(nn.Module):
                         rel_inputs = rel_inputs.detach()
 
                     data_reliability_l1 = self.data_reliability_head(rel_inputs)
+                    data_weight = (
+                        data_valid_l1 * data_reliability_l1
+                    ).clamp(0.0, 1.0)
                 else:
                     data_reliability_l1 = torch.ones_like(data_valid_l1)
-
-                data_weight = (data_valid_l1 * data_reliability_l1).clamp(0.0, 1.0)
+                    data_weight = data_valid_l1
                 confidence_l1 = (confidence_raw_l1 * data_weight).clamp(0.0, 1.0)
 
                 data_valid_lows.append(data_valid_l1.detach())
@@ -2368,10 +2716,20 @@ class HQSFlowModelTFPort(nn.Module):
 
                 # ------------------------------------------------------------
 
-                if self.use_learned_prox_net:
-                    # Use the learned prox network to predict the smoothed flow directly, rather than running the Jacobi iterations.
+                if self.use_boundary_aware_prox:
+                    assert reliability_state_l1 is not None
+                    aux_l1, _ = self.boundary_aware_prox(
+                        flow_l1,
+                        aux_l1,
+                        context_l1,
+                        reliability_state_l1,
+                    )
+                elif self.use_learned_prox_net:
                     aux_l1, _ = self.learned_prox(
-                        flow_yx=flow_l1, prev_aux_yx=aux_l1, context_feat=f1_l1, validity=data_weight
+                        flow_yx=flow_l1,
+                        prev_aux_yx=aux_l1,
+                        context_feat=context_l1,
+                        validity=data_weight,
                     )
                 else:
                     aux_l1, _, _ = self.hqs_prox_step(
@@ -2405,9 +2763,13 @@ class HQSFlowModelTFPort(nn.Module):
                 )
 
                 if self.use_split_delta_update:
-                    prior_confidence_l1 = confidence_l1
-                    prior_it_l1 = it_safe
-                    prior_valid_l1 = data_valid_l1
+                    prior_confidence_l1 = torch.sqrt(
+                        self.central_grad_x(i1_l1).square()
+                        + self.central_grad_y(i1_l1).square()
+                        + 1e-6
+                    ).mean(dim=1, keepdim=True)
+                    prior_it_l1 = iter_fraction_l1
+                    prior_valid_l1 = self._valid_warp_mask(flow_l1)
 
                     if self.detach_reliability_inputs:
                         prior_confidence_l1 = prior_confidence_l1.detach()
@@ -2441,15 +2803,17 @@ class HQSFlowModelTFPort(nn.Module):
                         gate_it_l1 = gate_it_l1.detach()
                         gate_valid_l1 = gate_valid_l1.detach()
 
-                    alpha_l1 = self.reliability_gate(
-                        gate_flow_l1,
-                        gate_resid_l1,
-                        gate_conf_l1,
-                        gate_it_l1,
-                        gate_valid_l1,
-                    )
-
-                    alpha_l1 = alpha_l1 * data_valid_l1.detach()
+                    if self.use_factorised_reliability:
+                        alpha_l1 = data_weight
+                    else:
+                        alpha_l1 = self.reliability_gate(
+                            gate_flow_l1,
+                            gate_resid_l1,
+                            gate_conf_l1,
+                            gate_it_l1,
+                            gate_valid_l1,
+                        )
+                        alpha_l1 = alpha_l1 * data_valid_l1.detach()
                     delta_l1 = alpha_l1 * delta_l1_match + (1.0 - alpha_l1) * delta_l1_prior
                 else:
                     alpha_l1 = torch.ones_like(confidence_l1)
@@ -2469,8 +2833,9 @@ class HQSFlowModelTFPort(nn.Module):
                         hqs_resid=hqs_resid_l1,
                         local_conf=confidence_l1,
                         validity=data_valid_l1.detach(),
-                        iter_frac=it_safe.abs(),
+                        iter_frac=iter_fraction_l1,
                         target_valid=target_valid_l1 if "target_valid_l1" in locals() else None,
+                        global_match_result=pgma_cached_l1,
                     )
 
                     delta_l1 = pgma_out_l1["delta"]
@@ -2525,10 +2890,20 @@ class HQSFlowModelTFPort(nn.Module):
 
                 flow_l1 = flow_l1 + gates_l1[k_l1] * delta_l1
 
-                if self.use_learned_prox_net:
-                    # Use the learned prox network to predict the smoothed flow directly, rather than running the Jacobi iterations.
+                if self.use_boundary_aware_prox:
+                    assert reliability_state_l1 is not None
+                    aux_l1, _ = self.boundary_aware_prox(
+                        flow_l1,
+                        aux_l1,
+                        context_l1,
+                        reliability_state_l1,
+                    )
+                elif self.use_learned_prox_net:
                     aux_l1, _ = self.learned_prox(
-                        flow_yx=flow_l1, prev_aux_yx=aux_l1, context_feat=f1_l1, validity=data_weight
+                        flow_yx=flow_l1,
+                        prev_aux_yx=aux_l1,
+                        context_feat=context_l1,
+                        validity=data_weight,
                     )
                 else:
                     aux_l1, _, _ = self.hqs_prox_step(
@@ -2750,6 +3125,62 @@ class HQSFlowModelTFPort(nn.Module):
                     )
                 ]
 
+        band_split_out = None
+        if self.use_band_split_refiner:
+            if factorised_data_gates:
+                detail_data_gate = factorised_data_gates[-1]
+            elif data_weight_lows:
+                detail_data_gate = data_weight_lows[-1]
+            else:
+                detail_data_gate = None
+            detail_boundary = (
+                reliability_states[-1].p_boundary
+                if reliability_states
+                else None
+            )
+            band_split_out = self.band_split_refiner(
+                source_context=f1_source_l0,
+                source_image=self._photo_tensor(image1),
+                target_image=self._photo_tensor(image2),
+                initial_flow_yx=flow_yx,
+                data_gate=detail_data_gate,
+                boundary_probability=detail_boundary,
+            )
+            flow_up_yx = band_split_out["flow_yx"]
+            flow_up_xy = torch.stack(
+                (flow_up_yx[:, 1], flow_up_yx[:, 0]), dim=1
+            )
+            flow_preds.append(flow_up_xy)
+            flow_half_yx = band_split_out["flow_half_yx"]
+            aux_half_yx = band_split_out["aux_half_yx"]
+            flow_lows.append(
+                torch.stack((flow_half_yx[:, 1], flow_half_yx[:, 0]), dim=1)
+            )
+            aux_lows.append(
+                torch.stack((aux_half_yx[:, 1], aux_half_yx[:, 0]), dim=1)
+            )
+            detail_delta = band_split_out["detail_delta_yx"]
+            delta_lows.append(
+                torch.stack((detail_delta[:, 1], detail_delta[:, 0]), dim=1)
+            )
+            coupling_residual_lows.append(
+                torch.stack(
+                    (
+                        (flow_half_yx - aux_half_yx)[:, 1],
+                        (flow_half_yx - aux_half_yx)[:, 0],
+                    ),
+                    dim=1,
+                )
+            )
+            hidden_states.append(
+                F.interpolate(
+                    net,
+                    size=flow_half_yx.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            )
+
         out = dict({
             "flow_preds": flow_preds,
             "flow_preds_raw": raw_flow_preds,
@@ -2770,15 +3201,23 @@ class HQSFlowModelTFPort(nn.Module):
             "data_weight_lows": data_weight_lows,
             "data_reliability_lows": data_reliability_lows,
             "matchability_lows": matchability_lows,
+            "reliability_states": reliability_states,
+            "reliability_geometries": reliability_geometries,
+            "reliability_residuals": reliability_residuals,
+            "factorised_data_gates": factorised_data_gates,
+            "reverse_flow_l2_yx": reverse_flow_l2_yx,
+            "band_split": band_split_out,
         })
 
         # Update the output dictionary with PGMA outputs if applicable.
-        if self.use_gmflow_init and pgma_init_out is not None:
+        if pgma_init_out is not None:
             out["gmflow_init_flow_yx"] = pgma_init_out["gmflow_init_flow_yx"]
             out["gmflow_init_hard_flow_yx"] = pgma_init_out["gmflow_init_hard_flow_yx"]
             out["gmflow_init_conf"] = pgma_init_out["gmflow_init_conf"]
             out["gmflow_init_entropy"] = pgma_init_out["gmflow_init_entropy"]
             out["gmflow_init_margin"] = pgma_init_out["gmflow_init_margin"]
+            out["gmflow_init_mutual"] = pgma_init_out["gmflow_init_mutual"]
+            out["gmflow_reverse_flow_yx"] = pgma_init_out["gmflow_reverse_flow_yx"]
 
         if self.use_pgma_iter:
             out["pgma_global_flow_lows"] = pgma_global_flow_lows
@@ -2840,6 +3279,21 @@ class HQSFlowModelTFPort(nn.Module):
         base["prior_update_unit"] = count(self.prior_update_unit) if hasattr(self, "prior_update_unit") else 0
         base["reliability_gate"] = count(self.reliability_gate) if hasattr(self, "reliability_gate") else 0
         base["learned_prox"] = count(self.learned_prox) if self.learned_prox is not None else 0
+        base["factorised_reliability"] = (
+            count(self.factorised_reliability_head)
+            if self.factorised_reliability_head is not None
+            else 0
+        )
+        base["boundary_aware_prox"] = (
+            count(self.boundary_aware_prox)
+            if self.boundary_aware_prox is not None
+            else 0
+        )
+        base["band_split_refiner"] = (
+            count(self.band_split_refiner)
+            if self.band_split_refiner is not None
+            else 0
+        )
 
         # Per-component trainable counts for logging parity.
         base["feature_encoder_trainable"] = count_trainable(self.feature_encoder)
@@ -2855,6 +3309,21 @@ class HQSFlowModelTFPort(nn.Module):
         base["hidden_proj_trainable"] = count_trainable(self.hidden_proj)
         base["level1_transition_mask_trainable"] = count_trainable(self.level1_transition_mask)
         base["learned_prox_trainable"] = count_trainable(self.learned_prox) if self.learned_prox is not None else 0
+        base["factorised_reliability_trainable"] = (
+            count_trainable(self.factorised_reliability_head)
+            if self.factorised_reliability_head is not None
+            else 0
+        )
+        base["boundary_aware_prox_trainable"] = (
+            count_trainable(self.boundary_aware_prox)
+            if self.boundary_aware_prox is not None
+            else 0
+        )
+        base["band_split_refiner_trainable"] = (
+            count_trainable(self.band_split_refiner)
+            if self.band_split_refiner is not None
+            else 0
+        )
         base["total_non_trainable"] = base["total"] - base["total_trainable"]
 
         # PGMA module counts if present

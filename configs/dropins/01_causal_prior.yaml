@@ -1,0 +1,13 @@
+run_name: dropins/01_causal_prior
+model:
+  model_backbone:
+    allow_external_validity_inputs: false
+    freeze_correction_last_n_l1: 0
+    pyramid_l1_iters: 2
+    use_transformer_feature_enhancer: false
+loss:
+  inter_smooth_weight: 0.0
+  iter_damp_weight: 0.0
+  boundary_thresh: 1.0
+training:
+  strict: true

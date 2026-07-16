@@ -56,10 +56,14 @@ class ReliabilityState:
         return torch.sigmoid(self.boundary_logits)
 
     def data_gate(self, in_bounds: Tensor, minimum: float = 0.0) -> Tensor:
-        gate = in_bounds * self.p_visible * self.p_match
-        if minimum > 0:
-            gate = minimum + (1.0 - minimum) * gate
-        return gate
+        if not 0.0 <= minimum < 1.0:
+            raise ValueError("minimum must be in [0, 1).")
+        # The floor applies only to in-bounds samples.  Applying it after the
+        # in-bounds product would otherwise re-enable the data operator outside
+        # the image domain.
+        return in_bounds * (
+            minimum + (1.0 - minimum) * self.p_visible * self.p_match
+        )
 
     def detached_dict(self) -> dict[str, Tensor]:
         return {

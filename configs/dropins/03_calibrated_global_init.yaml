@@ -1,0 +1,29 @@
+run_name: dropins/03_calibrated_global_init
+model:
+  model_backbone:
+    allow_external_validity_inputs: false
+    use_pgma: true
+    use_gmflow_init: true
+    use_pgma_iter: false
+    gmflow_init_scale: 1.0
+    gmflow_confidence_gated: true
+    gmflow_confidence_floor: 0.05
+    pgma_temperature: 0.10
+    pgma_use_topk: false
+    pgma_match_mode: soft
+    pgma_query_chunk_size: 512
+    pgma_position_scale: 0.05
+    pgma_confidence_floor: 0.05
+    use_transformer_feature_enhancer: false
+    use_multiscale_global_init: false
+loss:
+  global_init_weight: 0.10
+  global_confidence_weight: 0.01
+  global_confidence_tau: 1.0
+  global_large_motion_threshold: 40.0
+  global_large_motion_boost: 2.0
+  iter_damp_weight: 0.0
+training:
+  strict: false
+  global_matcher_warmup_steps: 5000
+  freeze_backbone_during_global_warmup: true

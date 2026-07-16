@@ -230,25 +230,23 @@ class TransformerFeatureEnhancer(nn.Module):
         b, c, h, w = shape
         return x.transpose(1, 2).view(b, c, h, w)
 
-    def forward(self, f1: torch.Tensor, f2: torch.Tensor):
-        b, c, h, w = f1.shape
-        n = h * w
+    def _position_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        b, _, h, w = x.shape
+        y = torch.linspace(-1.0, 1.0, h, device=x.device, dtype=x.dtype)
+        xx = torch.linspace(-1.0, 1.0, w, device=x.device, dtype=x.dtype)
+        yy, xx = torch.meshgrid(y, xx, indexing="ij")
+        base = torch.stack(
+            (yy, xx, torch.sin(math.pi * yy), torch.sin(math.pi * xx)), dim=-1
+        ).view(1, h * w, 4)
+        repeats = math.ceil(self.feature_dim / 4)
+        return base.repeat(b, 1, repeats)[..., : self.feature_dim]
 
-        # Safety fallback: if resolution is too large, downsample for attention
-        # and then upsample enhanced residual.
-        if n > self.max_tokens:
-            scale = math.sqrt(self.max_tokens / float(n))
-            h2 = max(4, int(h * scale))
-            w2 = max(4, int(w * scale))
-            f1_small = F.interpolate(f1, size=(h2, w2), mode="bilinear", align_corners=True)
-            f2_small = F.interpolate(f2, size=(h2, w2), mode="bilinear", align_corners=True)
-            e1, e2 = self.forward(f1_small, f2_small)
-            e1 = F.interpolate(e1, size=(h, w), mode="bilinear", align_corners=True)
-            e2 = F.interpolate(e2, size=(h, w), mode="bilinear", align_corners=True)
-            return f1 + e1, f2 + e2
-
+    def _forward_dense(self, f1: torch.Tensor, f2: torch.Tensor):
         x1, shape = self._flatten(f1)
         x2, _ = self._flatten(f2)
+        position = 0.05 * self._position_tokens(f1)
+        x1 = x1 + position
+        x2 = x2 + position
 
         for i in range(len(self.self_attn_1)):
             n11, n22, n12, n21 = self.norms[i]
@@ -267,6 +265,38 @@ class TransformerFeatureEnhancer(nn.Module):
             x2 = x2 + self.ffn_2[i](x2)
 
         return self._unflatten(x1, shape), self._unflatten(x2, shape)
+
+    def forward(self, f1: torch.Tensor, f2: torch.Tensor):
+        b, c, h, w = f1.shape
+        n = h * w
+
+        # Preserve the native feature grid.  The old fallback reduced every
+        # large feature map to roughly max_tokens samples and then bilinearly
+        # restored it, imposing a direct low-pass bottleneck.  Windowed native
+        # attention bounds memory without deleting thin structures.
+        if n > self.max_tokens:
+            aspect = float(h) / float(max(w, 1))
+            window_h = max(1, min(h, int(math.sqrt(self.max_tokens * aspect))))
+            window_w = max(1, min(w, self.max_tokens // window_h))
+            rows1 = []
+            rows2 = []
+            for y0 in range(0, h, window_h):
+                tiles1 = []
+                tiles2 = []
+                for x0 in range(0, w, window_w):
+                    y1 = min(h, y0 + window_h)
+                    x1 = min(w, x0 + window_w)
+                    e1, e2 = self._forward_dense(
+                        f1[..., y0:y1, x0:x1],
+                        f2[..., y0:y1, x0:x1],
+                    )
+                    tiles1.append(e1)
+                    tiles2.append(e2)
+                rows1.append(torch.cat(tiles1, dim=-1))
+                rows2.append(torch.cat(tiles2, dim=-1))
+            return torch.cat(rows1, dim=-2), torch.cat(rows2, dim=-2)
+
+        return self._forward_dense(f1, f2)
 
 
 # -----------------------------------------------------------------------------

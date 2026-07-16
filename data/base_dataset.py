@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 from torch.utils.data.dataloader import default_collate
 
 # Keys whose values may be None (datasets without occlusion/invalid masks).
-_NULLABLE_KEYS = {"occlusion", "invalid"}
+_NULLABLE_KEYS = {"occlusion", "invalid", "synthetic_occlusion"}
 
 
 def flow_collate_fn(batch):
@@ -159,11 +159,12 @@ class FlowDataset(Dataset, ABC):
                 valid = np.ones((flow.shape[0], flow.shape[1]), dtype=bool)
                 valid &= np.isfinite(flow[:, :, 0]) & np.isfinite(flow[:, :, 1])
 
-            # Apply occlusion mask: occluded pixels have no correct answer in
-            # image2 so exclude them from loss and metrics.
+            # Occlusion describes correspondence validity, not GT-flow
+            # validity.  Sintel supplies a valid flow vector for these pixels;
+            # retain it for prior/null-space supervision and use the occlusion
+            # mask separately as a visibility target.
             if s.get("occlusion") is not None:
                 occ_np = ~self._load_mask_png(s["occlusion"])  # True = occluded
-                valid &= ~occ_np
 
             # Apply invalid mask: GT unreliable (blur, reflections, etc.)
             if s.get("invalid") is not None:
@@ -177,6 +178,7 @@ class FlowDataset(Dataset, ABC):
             "valid":     valid,
             "occlusion": occ_np,
             "invalid":   inv_np,
+            "synthetic_occlusion": None,
         }
 
         if self.augmentor is not None and self.split == "train":
@@ -198,6 +200,9 @@ class FlowDataset(Dataset, ABC):
                          else torch.ones(1, 1),
             "occlusion": _mask_to_tensor(sample.get("occlusion")),
             "invalid":   _mask_to_tensor(sample.get("invalid")),
+            "synthetic_occlusion": _mask_to_tensor(
+                sample.get("synthetic_occlusion")
+            ),
         }
 
     def __len__(self) -> int:

@@ -1,0 +1,87 @@
+run_name: dropins/05_full_physics_spectral
+model:
+  model_backbone:
+    allow_external_validity_inputs: false
+    freeze_correction_last_n_l1: 0
+    pyramid_l1_iters: 4
+
+    use_data_reliability_mask: false
+    use_factorised_reliability: true
+    factorised_reliability_hidden_dim: 48
+    reliability_recurrent_channels: 0
+    minimum_data_gate: 0.0
+    detach_reverse_for_geometry: true
+    fb_alpha: 0.01
+    fb_beta: 0.5
+    occupancy_hole_threshold: 0.25
+    occupancy_collision_threshold: 1.25
+    occupancy_temperature: 0.10
+    reliability_corr_temperature: 0.10
+    use_boundary_aware_prox: true
+    proximal_max_delta: 1.0
+
+    use_pgma: true
+    use_gmflow_init: true
+    use_pgma_iter: false
+    gmflow_init_scale: 1.0
+    gmflow_confidence_gated: true
+    gmflow_confidence_floor: 0.05
+    pgma_temperature: 0.10
+    pgma_use_topk: false
+    pgma_match_mode: soft
+    pgma_query_chunk_size: 512
+    pgma_position_scale: 0.05
+    pgma_confidence_floor: 0.05
+    use_multiscale_global_init: false
+    use_transformer_feature_enhancer: false
+
+    use_band_split_refiner: true
+    pyramid_l0_iters: 2
+    detail_hidden_dim: 96
+    detail_data_beta: 0.10
+    detail_half_step: 0.50
+    detail_max_data_delta: 1.50
+    detail_max_prior_delta: 1.00
+    detail_max_prox_delta: 0.50
+    detail_max_full_delta: 4.0
+    detail_photometric_tau: 0.10
+    detail_high_pass_factor: 2
+
+loss:
+  num_stages: 9
+  inter_smooth_weight: 0.0
+  iter_damp_weight: 0.0
+  boundary_weight: 0.0
+  boundary_thresh: 1.0
+  detail_weight: 0.015
+  detail_start_step: 5000
+  detail_ramp_steps: 3000
+  detail_boundary_threshold: 1.0
+  detail_boundary_boost: 2.0
+  detail_high_pass_factor: 2
+  global_init_weight: 0.10
+  global_confidence_weight: 0.01
+  global_confidence_tau: 1.0
+  global_large_motion_threshold: 40.0
+  global_large_motion_boost: 2.0
+  occlusion_aware:
+    enabled: true
+    mixture_weight: 0.02
+    visibility_weight: 0.01
+    matchability_weight: 0.005
+    cycle_weight: 0.005
+    temporal_weight: 0.001
+    visibility_prior_weight: 0.001
+    boundary_weight: 0.005
+    outlier_scale: 20.0
+    detach_reverse_for_cycle: true
+    expected_visible_fraction: 0.85
+    visibility_prior_tolerance: 0.10
+
+training:
+  strict: false
+  global_matcher_warmup_steps: 5000
+  freeze_backbone_during_global_warmup: true
+
+data:
+  detail_crop_prob: 0.35

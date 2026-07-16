@@ -190,7 +190,11 @@ class BoundaryAwareProximalNet(nn.Module):
         nn.init.zeros_(self.delta_head.weight)
         nn.init.zeros_(self.delta_head.bias)
         nn.init.zeros_(self.mix_head.weight)
-        nn.init.zeros_(self.mix_head.bias)
+        # Start close to the current data/prior consensus away from predicted
+        # boundaries, while still allowing the boundary factor to weaken
+        # coupling.  A zero bias would retain only about 44% of a proposal at
+        # the default p_boundary and over-smooth a newly enabled drop-in.
+        nn.init.constant_(self.mix_head.bias, 2.0)
 
     def forward(
         self,

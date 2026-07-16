@@ -69,6 +69,8 @@ model:
     correction_gate_max: 0.50
     correction_gate_nonincreasing: true
     freeze_correction_last_n: 1
+    freeze_correction_last_n_l1: 0
+    allow_external_validity_inputs: false
 
     # ── Reliability mask update regime ─────────────────────────────────────
     use_split_delta_update: true
@@ -86,6 +88,21 @@ model:
     detach_data_reliability_inputs: true
     data_reliability_m_min: 0.00
     data_reliability_hidden_dim: 96
+
+    # Factorised predicted validity; GT masks remain loss-only.
+    use_factorised_reliability: false
+    factorised_reliability_hidden_dim: 48
+    reliability_recurrent_channels: 0
+    minimum_data_gate: 0.0
+    detach_reverse_for_geometry: true
+    fb_alpha: 0.01
+    fb_beta: 0.5
+    occupancy_hole_threshold: 0.25
+    occupancy_collision_threshold: 1.25
+    occupancy_temperature: 0.10
+    reliability_corr_temperature: 0.10
+    use_boundary_aware_prox: false
+    proximal_max_delta: 1.0
 
     # -- Use a learned proximal operator instead of jacobi iterations (ablation) --
     use_learned_prox: true
@@ -110,6 +127,8 @@ model:
     use_pgma_iter: true
     pgma_max_delta_step: 0.0
     gmflow_init_scale: 1.0
+    gmflow_confidence_gated: true
+    gmflow_confidence_floor: 0.05
 
     pgma_hidden_dim: 64
     pgma_temperature: 0.07
@@ -120,6 +139,9 @@ model:
     pgma_gate_init_hqs: 1.5
     pgma_gate_init_global: -1.0
     pgma_gate_init_prox: -1.0
+    pgma_query_chunk_size: 512
+    pgma_position_scale: 0.05
+    pgma_confidence_floor: 0.05
 
     # -- Direct initial flow regression head settings --
     use_direct_init_head: true
@@ -141,6 +163,19 @@ model:
     ms_local_temperature: 0.05
     use_level1: true
 
+    # Half-resolution analytic HQS + fixed high-pass full-resolution detail.
+    use_band_split_refiner: false
+    pyramid_l0_iters: 2
+    detail_hidden_dim: 96
+    detail_data_beta: 0.10
+    detail_half_step: 0.50
+    detail_max_data_delta: 1.50
+    detail_max_prior_delta: 1.00
+    detail_max_prox_delta: 0.50
+    detail_max_full_delta: 4.0
+    detail_photometric_tau: 0.10
+    detail_high_pass_factor: 2
+
 # ── Loss ──────────────────────────────────────────────────────────────────
 loss:
   gamma: 0.85                     # geometric decay over stages (used when stage_weight_mode: geometric)
@@ -159,6 +194,30 @@ loss:
   iter_damp_start_frac: 0.5       # apply damping from this fraction of iterations onward
   photo_weight: 0.0
   ofce_weight: 0.0                # Optical Flow Constraint Equation loss
+  detail_weight: 0.0
+  detail_start_step: 0
+  detail_ramp_steps: 0
+  detail_boundary_threshold: 1.0
+  detail_boundary_boost: 2.0
+  detail_high_pass_factor: 2
+  global_init_weight: 0.0
+  global_confidence_weight: 0.0
+  global_confidence_tau: 1.0
+  global_large_motion_threshold: 40.0
+  global_large_motion_boost: 2.0
+  occlusion_aware:
+    enabled: false
+    mixture_weight: 0.02
+    visibility_weight: 0.01
+    matchability_weight: 0.005
+    cycle_weight: 0.01
+    temporal_weight: 0.001
+    visibility_prior_weight: 0.001
+    boundary_weight: 0.005
+    outlier_scale: 20.0
+    detach_reverse_for_cycle: true
+    expected_visible_fraction: 0.85
+    visibility_prior_tolerance: 0.10
 
 # ── Training ──────────────────────────────────────────────────────────────
 training:
@@ -166,6 +225,8 @@ training:
   lr: 4.0e-4
   weight_decay: 1.0e-4
   warmup_pct: 0.05
+  global_matcher_warmup_steps: 0
+  freeze_backbone_during_global_warmup: false
   grad_clip: 1.0
   log_every: 100
   val_every: 5000

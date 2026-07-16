@@ -1593,16 +1593,9 @@ class FlowEvaluator:
                     occ_cpu = occ.detach().cpu() if occ is not None else None
                     inv_cpu = inv.detach().cpu() if inv is not None else None
 
-                    # Build oracle masks for debugging target image leakage, if occlusion/invalid masks are present
-                    # DEBUGGING ORACLE MASKS!
-                    source_valid, target_valid = self.build_oracle_source_target_masks(
-                        flow_gt_xy=flow_gt,
-                        valid=valid,
-                        occlusion=occ_cpu,
-                        invalid=inv_cpu,
-                    )
-
-                    out = self.model(img1, img2, source_valid=source_valid, target_valid=target_valid)
+                    # Evaluation must match deployable inference: GT visibility
+                    # and flow-derived target masks never enter the model.
+                    out = self.model(img1, img2)
                     flow_preds = out.get("flow_preds_raw", out["flow_preds"])
                     flow_final = out["flow_preds"][-1]
                     flow_low = out.get("flow_low_raw", out.get("flow_low", [flow_preds[-1]]))

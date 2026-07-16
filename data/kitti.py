@@ -299,6 +299,7 @@ class KITTIDataset(FlowDataset):
             "valid": valid,
             "occlusion": occ_np,
             "invalid": inv_np,
+            "synthetic_occlusion": None,
         }
 
         if self.augmentor is not None and self.split == "train":
@@ -318,4 +319,7 @@ class KITTIDataset(FlowDataset):
             ),
             "occlusion": _mask_to_tensor(sample.get("occlusion")),
             "invalid": _mask_to_tensor(sample.get("invalid")),
+            "synthetic_occlusion": _mask_to_tensor(
+                sample.get("synthetic_occlusion")
+            ),
         }

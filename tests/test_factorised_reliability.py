@@ -2,6 +2,7 @@ import torch
 
 from hqs_pytorch.customML.customModels.factorised_reliability import (
     FactorisedReliabilityHead,
+    ReliabilityState,
 )
 from hqs_pytorch.customML.customModels.reliability_aware_blocks import (
     OcclusionPriorNet,
@@ -25,3 +26,18 @@ def test_prior_has_no_target_argument():
     signature_names = prior.forward.__code__.co_varnames[: prior.forward.__code__.co_argcount]
     forbidden = {"target", "warped_target", "corr", "image2", "fmap2"}
     assert forbidden.isdisjoint(signature_names)
+
+
+def test_minimum_gate_never_reenables_out_of_bounds_data():
+    logits = torch.full((1, 1, 2, 3), 10.0)
+    state = ReliabilityState(
+        visibility_logits=logits,
+        match_logits=logits,
+        log_sigma_data=torch.zeros_like(logits),
+        boundary_logits=torch.zeros_like(logits),
+    )
+    in_bounds = torch.ones_like(logits)
+    in_bounds[..., -1] = 0.0
+    gate = state.data_gate(in_bounds, minimum=0.2)
+    assert torch.all(gate[..., -1] == 0.0)
+    assert torch.all(gate[..., :-1] >= 0.2)

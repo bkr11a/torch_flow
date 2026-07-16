@@ -2,10 +2,10 @@
 Custom models for PyTorch HQS optical flow.
 """
 
+from importlib import import_module
+
 from .OpticalFlowFeatureEncoder import OpticalFlowFeatureEncoder
 from .OpticalFlowContextEncoder import OpticalFlowContextEncoder
-from .HQSFlowModel import HQSFlowModel
-from .HQSFlowModelTFPort import HQSFlowModelTFPort
 
 __all__ = [
     'OpticalFlowFeatureEncoder',
@@ -13,3 +13,12 @@ __all__ = [
     'HQSFlowModel',
     'HQSFlowModelTFPort',
 ]
+
+
+def __getattr__(name: str):
+    if name not in {"HQSFlowModel", "HQSFlowModelTFPort"}:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = import_module(f".{name}", __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value

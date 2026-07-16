@@ -27,6 +27,7 @@ pixels near occlusion edges are harder due to ambiguous correspondences.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from typing import Dict, Optional
 
@@ -159,6 +160,50 @@ def compute_metrics(
     ):
         mask = (mag_valid >= lo) & (mag_valid < hi)
         out[key] = epe_valid[mask].mean().item() if mask.any() else float("nan")
+
+    # Spatial high-frequency recovery and phase/location alignment.  Reporting
+    # both prevents an increase in boundary noise from being mistaken for
+    # successful detail recovery.
+    def high_pass(value: torch.Tensor) -> torch.Tensor:
+        low = F.avg_pool2d(
+            value,
+            kernel_size=2,
+            stride=2,
+            ceil_mode=True,
+            count_include_pad=False,
+        )
+        reconstruction = low.repeat_interleave(2, dim=-2).repeat_interleave(
+            2, dim=-1
+        )
+        reconstruction = reconstruction[
+            ..., : value.shape[-2], : value.shape[-1]
+        ]
+        return value - reconstruction
+
+    pred_high = high_pass(pred)
+    gt_high = high_pass(gt)
+    high_mask = all_mask.unsqueeze(1).to(pred.dtype)
+    numerator = (pred_high.abs() * high_mask).sum()
+    denominator = (gt_high.abs() * high_mask).sum().clamp_min(1e-6)
+    out["hf_recovery"] = (numerator / denominator).item()
+    pred_vector = (pred_high * high_mask).flatten(1)
+    gt_vector = (gt_high * high_mask).flatten(1)
+    alignment = (pred_vector * gt_vector).sum(1) / (
+        pred_vector.norm(dim=1) * gt_vector.norm(dim=1)
+    ).clamp_min(1e-6)
+    out["hf_alignment"] = alignment.mean().item()
+
+    gt_dx = F.pad(gt[..., 1:] - gt[..., :-1], (0, 1, 0, 0))
+    gt_dy = F.pad(gt[..., 1:, :] - gt[..., :-1, :], (0, 0, 0, 1))
+    boundary_strength = torch.sqrt(
+        gt_dx.square().sum(1) + gt_dy.square().sum(1) + 1e-9
+    )
+    boundary_mask = (boundary_strength > 1.0) & all_mask
+    out["boundary_epe"] = (
+        epe_map[boundary_mask].mean().item()
+        if boundary_mask.any()
+        else float("nan")
+    )
 
     # ---- Distance-to-occlusion-boundary metrics (Sintel) ---------------
     if occ_mask is not None:
