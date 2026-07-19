@@ -1008,12 +1008,18 @@ class Trainer:
         launch_cfg = self.cfg.get("launch", {}) if hasattr(self.cfg, "get") else {}
         launch_config_path = launch_cfg.get("config_path") if isinstance(launch_cfg, dict) else None
         launch_override_path = launch_cfg.get("override_path") if isinstance(launch_cfg, dict) else None
+        launch_curriculum_path = launch_cfg.get("curriculum_path") if isinstance(launch_cfg, dict) else None
         launch_cli_overrides = launch_cfg.get("cli_overrides") if isinstance(launch_cfg, dict) else None
 
         if launch_config_path and os.path.isfile(launch_config_path):
             shutil.copy2(launch_config_path, os.path.join(self.config_dir, "launch_config.yaml"))
         if launch_override_path and os.path.isfile(launch_override_path):
             shutil.copy2(launch_override_path, os.path.join(self.config_dir, "override_config.yaml"))
+        if launch_curriculum_path and os.path.isfile(launch_curriculum_path):
+            shutil.copy2(
+                launch_curriculum_path,
+                os.path.join(self.config_dir, "curriculum_config.yaml"),
+            )
         if launch_cli_overrides:
             cli_path = os.path.join(self.config_dir, "cli_overrides.txt")
             with open(cli_path, "w") as f:

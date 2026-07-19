@@ -69,6 +69,95 @@ def upsample_flow(flow: torch.Tensor, scale_factor: int = 8) -> torch.Tensor:
     )
 
 
+def resize_flow(
+    flow: torch.Tensor,
+    size: tuple[int, int],
+    *,
+    align_corners: bool = True,
+) -> torch.Tensor:
+    """Resize an ``(x, y)`` flow field while preserving pixel displacement.
+
+    A flow component is measured in pixels of its current grid.  Spatial
+    interpolation alone is therefore insufficient: horizontal and vertical
+    components must also be scaled by the corresponding grid-size ratios.
+    This helper handles non-power-of-two and odd-sized transitions safely.
+    """
+    if flow.ndim != 4 or flow.shape[1] != 2:
+        raise ValueError(f"Expected flow [B,2,H,W], got {tuple(flow.shape)}")
+
+    in_h, in_w = flow.shape[-2:]
+    out_h, out_w = int(size[0]), int(size[1])
+    if out_h <= 0 or out_w <= 0:
+        raise ValueError(f"Invalid output size: {(out_h, out_w)}")
+    if (in_h, in_w) == (out_h, out_w):
+        return flow
+
+    result = F.interpolate(
+        flow,
+        size=(out_h, out_w),
+        mode="bilinear",
+        align_corners=align_corners,
+    )
+    scale = result.new_tensor(
+        [float(out_w) / float(in_w), float(out_h) / float(in_h)]
+    ).view(1, 2, 1, 1)
+    return result * scale
+
+
+def flow_in_bounds_mask(flow: torch.Tensor) -> torch.Tensor:
+    """Return a hard source-grid mask for valid backward-warp coordinates.
+
+    Args:
+        flow: ``(B,2,H,W)`` flow in repository ``(x,y)`` convention.
+
+    Returns:
+        Float mask ``(B,1,H,W)`` containing exactly zero or one.
+    """
+    if flow.ndim != 4 or flow.shape[1] != 2:
+        raise ValueError(f"Expected flow [B,2,H,W], got {tuple(flow.shape)}")
+    b, _, h, w = flow.shape
+    grid = coords_grid(b, h, w, device=flow.device).to(dtype=flow.dtype)
+    sample = grid + flow
+    valid_x = (sample[:, 0:1] >= 0.0) & (sample[:, 0:1] <= float(w - 1))
+    valid_y = (sample[:, 1:2] >= 0.0) & (sample[:, 1:2] <= float(h - 1))
+    return (valid_x & valid_y).to(dtype=flow.dtype)
+
+
+def convex_upsample(
+    flow: torch.Tensor,
+    mask_logits: torch.Tensor,
+    rate: int,
+) -> torch.Tensor:
+    """RAFT-style learned convex upsampling for an ``(x,y)`` flow field.
+
+    ``mask_logits`` must contain ``9 * rate**2`` channels.  The softmax is
+    taken over a 3x3 neighbourhood, so every output vector is a convex
+    combination of nearby low-resolution vectors.  Multiplication by
+    ``rate`` converts displacement units to the finer grid.
+    """
+    if flow.ndim != 4 or flow.shape[1] != 2:
+        raise ValueError(f"Expected flow [B,2,H,W], got {tuple(flow.shape)}")
+    if rate < 1:
+        raise ValueError(f"rate must be positive, got {rate}")
+
+    b, channels, h, w = flow.shape
+    expected = 9 * rate * rate
+    if mask_logits.shape != (b, expected, h, w):
+        raise ValueError(
+            "Invalid convex-upsample mask shape: "
+            f"expected {(b, expected, h, w)}, got {tuple(mask_logits.shape)}"
+        )
+
+    mask = mask_logits.view(b, 1, 9, rate, rate, h, w)
+    mask = torch.softmax(mask, dim=2)
+    neighbourhood = F.unfold(rate * flow, kernel_size=3, padding=1)
+    neighbourhood = neighbourhood.view(b, channels, 9, 1, 1, h, w)
+    upsampled = torch.sum(mask * neighbourhood, dim=2)
+    return upsampled.permute(0, 1, 4, 2, 5, 3).reshape(
+        b, channels, h * rate, w * rate
+    )
+
+
 def coords_grid(batch: int, height: int, width: int,
                 device: torch.device) -> torch.Tensor:
     """Return (B, 2, H, W) integer coordinate grid (x, y)."""

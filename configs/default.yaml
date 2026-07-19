@@ -26,7 +26,7 @@ mlflow:
 
 # ── Model ─────────────────────────────────────────────────────────────────
 model:
-  model_type: tfport              # "tfport" | "original"
+  model_type: tfport              # "tfport" | "original" | "hqs_core"
   upsample_scale: 8               # 1/upsample_scale encoder resolution → full res
 
   corr:                           # correlation pyramid (shared keys)

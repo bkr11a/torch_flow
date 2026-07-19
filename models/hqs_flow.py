@@ -32,8 +32,9 @@ def build_model(cfg, model_type: str = "tfport"):
     
     Args:
         cfg: Configuration object with cfg.model sub-config
-        model_type: "tfport" (default, faithful TensorFlow recreation) or 
-                    "original" (multi-stage unrolled)
+        model_type: "tfport" (default, faithful TensorFlow recreation),
+                    "original" (multi-stage unrolled), or ``hqs_core``
+                    (compact four-scale operator-structured model).
     
     Returns:
         Instantiated HQS model
@@ -47,8 +48,13 @@ def build_model(cfg, model_type: str = "tfport"):
         return HQSFlowModelTFPort(cfg.model)
     if model_type in {"original", "legacy"}:
         return HQSFlowModel(cfg.model)
+    if model_type in {"hqs_core", "hqscore", "core"}:
+        from hqs_pytorch.customML.customModels.HQSCore import HQSCore
+
+        return HQSCore(cfg.model)
 
     raise ValueError(
         f"Unknown model_type: {model_type}. "
-        "Use one of: tfport | tf_faithful | tf_port | original | legacy."
+        "Use one of: tfport | tf_faithful | tf_port | original | legacy | "
+        "hqs_core | hqscore | core."
     )

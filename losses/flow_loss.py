@@ -405,6 +405,14 @@ class HQSFlowLoss(nn.Module):
         self.global_large_motion_boost = float(
             cfg.get("global_large_motion_boost", 2.0)
         )
+        # Optional supervision for HQSCore's single learned reliability head.
+        # Ground-truth masks remain loss targets and never enter model.forward.
+        self.core_visibility_weight = float(
+            cfg.get("core_visibility_weight", 0.0)
+        )
+        self.core_visibility_last_n = int(
+            cfg.get("core_visibility_last_n", 4)
+        )
 
         occ_cfg = cfg.get("occlusion_aware", {})
         self.occlusion_aware_enabled = bool(occ_cfg.get("enabled", False))
@@ -579,6 +587,54 @@ class HQSFlowLoss(nn.Module):
             * in_bounds
         ).clamp(0.0, 1.0)
         return visibility, reliable_gt
+
+    def _core_visibility_loss(
+        self,
+        reliability_lows: List[torch.Tensor],
+        flow_gt: torch.Tensor,
+        valid: torch.Tensor,
+        occlusion: Optional[torch.Tensor],
+        invalid: Optional[torch.Tensor],
+        synthetic_occlusion: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Supervise HQSCore reliability without leaking labels to inference."""
+        visibility, reliable = self._visibility_targets(
+            flow_gt,
+            valid,
+            occlusion,
+            invalid,
+            synthetic_occlusion,
+        )
+        selected = reliability_lows
+        if self.core_visibility_last_n > 0:
+            selected = selected[-self.core_visibility_last_n :]
+
+        terms: List[torch.Tensor] = []
+        for probability in selected:
+            if not isinstance(probability, torch.Tensor):
+                continue
+            target = F.interpolate(
+                visibility,
+                size=probability.shape[-2:],
+                mode="nearest",
+            ).float()
+            weight = F.interpolate(
+                reliable,
+                size=probability.shape[-2:],
+                mode="nearest",
+            ).float()
+            # Evaluate BCE in float32: 1-1e-5 rounds to exactly one in fp16.
+            probability = probability.float().clamp(1e-5, 1.0 - 1e-5)
+            point = -(
+                target * probability.log()
+                + (1.0 - target) * (1.0 - probability).log()
+            )
+            terms.append(
+                (point * weight).sum() / weight.sum().clamp_min(1.0)
+            )
+        if not terms:
+            return flow_gt.new_zeros(())
+        return torch.stack(terms).mean()
 
     def _factorised_reliability_loss(
         self,
@@ -932,6 +988,23 @@ class HQSFlowLoss(nn.Module):
                             total
                             + self.global_confidence_weight * confidence_loss
                         )
+
+            core_reliability = model_outputs.get("core_reliability_lows")
+            if isinstance(core_reliability, list) and core_reliability:
+                core_visibility = self._core_visibility_loss(
+                    core_reliability,
+                    flow_gt,
+                    valid,
+                    occlusion,
+                    invalid,
+                    synthetic_occlusion,
+                )
+                out["core_visibility"] = core_visibility
+                if self.core_visibility_weight > 0:
+                    total = (
+                        total
+                        + self.core_visibility_weight * core_visibility
+                    )
 
         if self.occlusion_aware_enabled and isinstance(model_outputs, dict):
             occ_terms = self._factorised_reliability_loss(

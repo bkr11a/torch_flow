@@ -1,0 +1,108 @@
+# Compact four-scale operator-structured architecture.
+#
+# Single run:
+#   python train.py --config configs/default.yaml \
+#     --override configs/dropins/06_hqs_core.yaml
+#
+# Curriculum:
+#   python train_curriculum.py --config configs/default.yaml \
+#     --override configs/dropins/06_hqs_core.yaml \
+#     --curriculum configs/curriculum/universal_replay_curriculum.yaml \
+#     --base-run-name hqs_core_2_4_2_2
+
+run_name: hqs_core/core_2_4_2_2
+
+mlflow:
+  registered_model_name: HQSCore
+  tags:
+    architecture: hqs_core
+    operator_structure: warp_validity_data_prox
+
+model:
+  # This is the only switch. The existing TF-port remains the default when
+  # this overlay is absent.
+  model_type: hqs_core
+
+  hqs_core:
+    # Encoder lists are fine-to-coarse: [1/2, 1/4, 1/8, 1/16].
+    feature_channels: [32, 64, 96, 128]
+    match_channels: [64, 96, 128, 128]
+    context_channels: [64, 64, 96, 96]
+    blocks_per_scale: [1, 2, 2, 2]
+    groups: 8
+
+    # Operator lists are coarse-to-fine: [1/16, 1/8, 1/4, 1/2].
+    iterations: [2, 4, 2, 2]
+    jacobi_sweeps: [2, 2, 1, 1]
+    correlation_radii: [4, 4, 4, 3]
+    # All-pairs pyramid levels at [1/16, 1/8].  The finer two scales use
+    # local correlation, so they do not appear here.
+    all_pairs_levels: [1, 4]
+    correlation_embedding_dim: 64
+    # Exact local dot products accumulated in small channel chunks to bound
+    # temporary memory at 1/4 and 1/2 resolution.
+    local_corr_channel_chunk: 4
+    local_corr_checkpoint: true
+
+    coarse_hidden_dim: 96
+    fine_hidden_dim: 64
+    prior_hidden_channels: 64
+    validity_hidden_dim: 32
+    upsample_hidden_dim: 64
+
+    # Native-grid pixel bounds, coarse-to-fine.
+    max_data_delta: [2.0, 2.0, 1.5, 1.0]
+    max_prox_delta: [0.5, 0.5, 0.5, 0.25]
+
+    # Positive, learned HQS schedules are initialised from these values.
+    beta_initial: 0.10
+    beta_minimum: 0.01
+    lambda_initial: 0.08
+    lambda_minimum: 0.001
+    edge_alpha: 10.0
+    analytic_weight: 1.0
+    learned_data_weight: 1.0
+
+    initial_reliability: 0.90
+    allow_external_validity_inputs: false
+
+    # Fixed global all-pairs soft feature matching at 1/16. Matching features
+    # remain learned end-to-end through the shared encoder.
+    global_temperature: 0.07
+    global_query_chunk_size: 512
+    global_confidence_gated: true
+    global_confidence_floor: 0.05
+
+loss:
+  # 2 + 4 + 2 + 2 recurrent predictions. Every prediction is resized to the
+  # full image grid before sequence supervision.
+  num_stages: 10
+  stage_weight_mode: geometric
+  gamma: 0.85
+
+  # Keep the first architectural test interpretable: sequence flow loss plus
+  # small, loss-only supervision of the single reliability estimator and the
+  # global matching initialisation.
+  global_init_weight: 0.05
+  global_confidence_weight: 0.0
+  core_visibility_weight: 0.01
+  core_visibility_last_n: 4
+
+  smooth_weight: 0.0
+  inter_smooth_weight: 0.0
+  boundary_weight: 0.0
+  raw_final_weight: 0.0
+  iter_damp_weight: 0.0
+  photo_weight: 0.0
+  ofce_weight: 0.0
+  detail_weight: 0.0
+  occlusion_aware:
+    enabled: false
+
+training:
+  global_matcher_warmup_steps: 0
+  freeze_backbone_during_global_warmup: false
+  grad_clip: 1.0
+
+data:
+  detail_crop_prob: 0.0

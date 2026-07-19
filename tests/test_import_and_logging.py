@@ -15,9 +15,10 @@ def test_public_and_leaf_imports_do_not_cycle():
         (
             "from hqs_pytorch.customML.customModels.occlusion_geometry import FlowGeometry",
             "from hqs_pytorch import HQSFlowModel",
+            "from hqs_pytorch.customML.customModels import HQSCore",
             "from models import build_model",
             "from losses import HQSFlowLoss",
-            "assert all(x is not None for x in (FlowGeometry, HQSFlowModel, build_model, HQSFlowLoss))",
+            "assert all(x is not None for x in (FlowGeometry, HQSFlowModel, HQSCore, build_model, HQSFlowLoss))",
         )
     )
     result = subprocess.run(

@@ -6,16 +6,24 @@ from .correlation import CorrBlock, LocalCorrBlock, build_corr_block
 from .update_net import DataUpdateNet, ConvGRUCell
 from .reg_net import UNetProxNet, DnCNNProxNet, IdentityProxNet, build_prox_net
 from .hqs_stage import HQSStage
-from .warp import backward_warp, upsample_flow, coords_grid
+from .warp import (
+    backward_warp,
+    convex_upsample,
+    coords_grid,
+    flow_in_bounds_mask,
+    resize_flow,
+    upsample_flow,
+)
 
 __all__ = [
-    "HQSFlow", "build_model",
+    "HQSFlow", "HQSCore", "build_model",
     "BasicEncoder", "SmallEncoder", "build_encoder",
     "CorrBlock", "LocalCorrBlock", "build_corr_block",
     "DataUpdateNet", "ConvGRUCell",
     "UNetProxNet", "DnCNNProxNet", "IdentityProxNet", "build_prox_net",
     "HQSStage",
-    "backward_warp", "upsample_flow", "coords_grid",
+    "backward_warp", "upsample_flow", "resize_flow", "convex_upsample",
+    "flow_in_bounds_mask", "coords_grid",
 ]
 
 
@@ -23,6 +31,13 @@ def __getattr__(name: str):
     # HQSFlowModel imports leaf modules such as models.encoders.  Defer the
     # compatibility shim so those imports cannot re-enter HQSFlowModel while it
     # is still being defined.
+    if name == "HQSCore":
+        module = import_module(
+            "hqs_pytorch.customML.customModels.HQSCore"
+        )
+        value = module.HQSCore
+        globals()[name] = value
+        return value
     if name not in {"HQSFlow", "build_model"}:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     module = import_module(".hqs_flow", __name__)

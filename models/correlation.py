@@ -154,9 +154,16 @@ class LocalCorrBlock(nn.Module):
         max_displacement: Passed as alias for radius when loading older ckpts.
     """
 
-    def __init__(self, radius: int = 4) -> None:
+    def __init__(
+        self,
+        radius: int = 4,
+        channel_chunk_size: int = 0,
+        checkpoint_chunks: bool = False,
+    ) -> None:
         super().__init__()
         self.radius = radius
+        self.channel_chunk_size = int(channel_chunk_size)
+        self.checkpoint_chunks = bool(checkpoint_chunks)
         self._pad = nn.ZeroPad2d(radius)
 
     @property
@@ -179,6 +186,9 @@ class LocalCorrBlock(nn.Module):
         # Warp fmap2 by current flow to align with fmap1
         fmap2_warped = self._warp_fmap2(fmap2, flow)
 
+        if self.channel_chunk_size > 0:
+            return self._chunked_correlation(fmap1, fmap2_warped)
+
         fmap2_pad = self._pad(fmap2_warped)
         corr_list = []
         for dy in range(2 * r + 1):
@@ -188,6 +198,63 @@ class LocalCorrBlock(nn.Module):
                 corr_list.append(dot)
 
         return torch.cat(corr_list, dim=1)  # (B, (2r+1)², H, W)
+
+    def _chunked_correlation(
+        self,
+        fmap1: torch.Tensor,
+        fmap2_warped: torch.Tensor,
+    ) -> torch.Tensor:
+        """Equivalent local correlation with bounded temporary memory.
+
+        ``unfold`` over all channels at 1/2 resolution can be prohibitively
+        large.  Accumulating channel chunks retains the exact dot product while
+        trading a small number of kernels for a controlled peak allocation.
+        """
+        r = self.radius
+        kernel = 2 * r + 1
+        b, channels, h, w = fmap1.shape
+        chunk_size = min(max(self.channel_chunk_size, 1), channels)
+        correlation: torch.Tensor | None = None
+        for start in range(0, channels, chunk_size):
+            stop = min(start + chunk_size, channels)
+            source_chunk = fmap1[:, start:stop]
+            target_chunk = fmap2_warped[:, start:stop]
+            if self.checkpoint_chunks and torch.is_grad_enabled() and (
+                source_chunk.requires_grad or target_chunk.requires_grad
+            ):
+                from torch.utils.checkpoint import checkpoint
+
+                partial = checkpoint(
+                    self._correlate_channel_chunk,
+                    source_chunk,
+                    target_chunk,
+                    r,
+                    use_reentrant=False,
+                )
+            else:
+                partial = self._correlate_channel_chunk(
+                    source_chunk, target_chunk, r
+                )
+            correlation = (
+                partial if correlation is None else correlation + partial
+            )
+        assert correlation is not None
+        return correlation / (channels ** 0.5)
+
+    @staticmethod
+    def _correlate_channel_chunk(
+        source: torch.Tensor,
+        target: torch.Tensor,
+        radius: int,
+    ) -> torch.Tensor:
+        kernel = 2 * int(radius) + 1
+        b, channels, h, w = source.shape
+        patches = F.unfold(
+            target,
+            kernel_size=kernel,
+            padding=int(radius),
+        ).view(b, channels, kernel * kernel, h, w)
+        return (source.unsqueeze(2) * patches).sum(dim=1)
 
     @staticmethod
     def _warp_fmap2(fmap2: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
@@ -207,5 +274,9 @@ def build_corr_block(cfg) -> nn.Module:
             radius=cfg.get("radius", 4),
         )
     if ctype == "local":
-        return LocalCorrBlock(radius=cfg.get("radius", 4))
+        return LocalCorrBlock(
+            radius=cfg.get("radius", 4),
+            channel_chunk_size=cfg.get("channel_chunk_size", 0),
+            checkpoint_chunks=cfg.get("checkpoint_chunks", False),
+        )
     raise ValueError(f"Unknown correlation type: {ctype!r}")
