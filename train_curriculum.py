@@ -13,6 +13,10 @@ RESERVED_STAGE_KEYS = {
 def parse_args():
     p = argparse.ArgumentParser(description="Run staged HQSFlow curriculum")
     p.add_argument("--config", "-c", required=True)
+    p.add_argument(
+        "--override", "-O", default=None,
+        help="Optional model/config overlay merged on top of --config.",
+    )
     p.add_argument("--curriculum", required=True)
     p.add_argument("--start-stage", default=None)
     p.add_argument("--stop-after-stage", default=None)
@@ -91,6 +95,9 @@ def main():
     load_dotenv(override=False)
     args = parse_args()
     base_cfg = OmegaConf.load(args.config)
+    model_override_cfg = (
+        OmegaConf.load(args.override) if args.override else None
+    )
     curr_cfg = OmegaConf.load(args.curriculum)
     curr = curr_cfg.get("curriculum", None)
     if curr is None or not curr.get("enabled", False):
@@ -128,6 +135,10 @@ def main():
         stage_run_name = str(stage.get("run_name", stage_id))
 
         cfg = OmegaConf.merge(base_cfg, stage_to_override(stage))
+        # A named architecture/config overlay is an explicit global switch and
+        # therefore takes precedence over legacy per-stage model/loss fields.
+        if model_override_cfg is not None:
+            cfg = OmegaConf.merge(cfg, model_override_cfg)
         if global_cli_cfg is not None:
             cfg = OmegaConf.merge(cfg, global_cli_cfg)
 
@@ -174,7 +185,10 @@ def main():
             }
             cfg.launch = {
                 "config_path": os.path.abspath(args.config),
-                "override_path": os.path.abspath(args.curriculum),
+                "override_path": (
+                    os.path.abspath(args.override) if args.override else None
+                ),
+                "curriculum_path": os.path.abspath(args.curriculum),
                 "cli_overrides": list(args.overrides),
             }
 
