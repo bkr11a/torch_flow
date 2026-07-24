@@ -224,6 +224,9 @@ class HQSCore(nn.Module):
             learned_data_weight=float(
                 _cfg_get(core_cfg, "learned_data_weight", 1.0)
             ),
+            analytic_validity_mode=str(
+                _cfg_get(core_cfg, "analytic_validity_mode", "post_gate")
+            ),
         )
         self.coarse_cell = StructuredHQSCell(
             context_channels=context_by_scale[16],

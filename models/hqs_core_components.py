@@ -783,6 +783,50 @@ class HQSIterationOutput:
     regularisation: torch.Tensor
 
 
+def weighted_analytic_data_delta(
+    linearisation: Linearisation,
+    validity: torch.Tensor,
+    beta_map: torch.Tensor,
+) -> torch.Tensor:
+    """Solve the confidence-weighted linearised data subproblem.
+
+    For each pixel this returns the unique minimiser of
+
+        0.5 * m * (r + g^T delta)^2 + 0.5 * beta * ||delta||_2^2,
+
+    where ``m`` is ``validity``, ``r`` is the warped photometric residual,
+    and ``g = (Ix, Iy)`` is the warped target-image gradient.  The returned
+    increment is
+
+        delta = -m * g * r / (beta + m * ||g||_2^2).
+
+    ``beta_map`` is strictly positive under ``PositiveSchedule``.  The small
+    denominator clamp is retained for mixed-precision numerical safety.
+    """
+    weight = validity.to(
+        device=linearisation.residual.device,
+        dtype=linearisation.residual.dtype,
+    ).clamp(0.0, 1.0)
+    beta_map = beta_map.to(
+        device=linearisation.residual.device,
+        dtype=linearisation.residual.dtype,
+    )
+    gradient_norm_squared = (
+        linearisation.grad_x.square() + linearisation.grad_y.square()
+    )
+    denominator = (
+        beta_map + weight * gradient_norm_squared
+    ).clamp_min(1e-6)
+    step = -weight * linearisation.residual / denominator
+    return torch.cat(
+        (
+            linearisation.grad_x * step,
+            linearisation.grad_y * step,
+        ),
+        dim=1,
+    )
+
+
 class StructuredHQSCell(nn.Module):
     """One reusable ``prox o data o validity o warp`` HQS iteration."""
 
@@ -802,10 +846,20 @@ class StructuredHQSCell(nn.Module):
         edge_alpha: float = 10.0,
         analytic_weight: float = 1.0,
         learned_data_weight: float = 1.0,
+        analytic_validity_mode: str = "post_gate",
     ) -> None:
         super().__init__()
         self.analytic_weight = float(analytic_weight)
         self.learned_data_weight = float(learned_data_weight)
+        self.analytic_validity_mode = str(analytic_validity_mode).lower()
+        if self.analytic_validity_mode not in {
+            "post_gate",
+            "weighted_solve",
+        }:
+            raise ValueError(
+                "analytic_validity_mode must be 'post_gate' or "
+                f"'weighted_solve', got {analytic_validity_mode!r}"
+            )
         self.warp_linearisation = WarpLinearisation()
         self.data_operator = RecurrentDataOperator(
             correlation_channels,
@@ -868,24 +922,37 @@ class StructuredHQSCell(nn.Module):
             target_grad_y,
             state.q,
         )
-        denominator = (
-            linearisation.grad_x.square()
-            + linearisation.grad_y.square()
-            + beta_map
-        ).clamp_min(1e-6)
-        analytic_delta = torch.cat(
-            (
-                -linearisation.grad_x * linearisation.residual / denominator,
-                -linearisation.grad_y * linearisation.residual / denominator,
-            ),
-            dim=1,
-        )
-        analytic_delta = _bounded_vector(analytic_delta, max_data_delta)
-
         reliability = validity_head(
             correlation, linearisation, state.w, state.q
         )
         validity = linearisation.in_bounds * reliability
+        if self.analytic_validity_mode == "weighted_solve":
+            analytic_delta = weighted_analytic_data_delta(
+                linearisation,
+                validity,
+                beta_map,
+            )
+        else:
+            denominator = (
+                linearisation.grad_x.square()
+                + linearisation.grad_y.square()
+                + beta_map
+            ).clamp_min(1e-6)
+            analytic_delta = torch.cat(
+                (
+                    -linearisation.grad_x
+                    * linearisation.residual
+                    / denominator,
+                    -linearisation.grad_y
+                    * linearisation.residual
+                    / denominator,
+                ),
+                dim=1,
+            )
+        # This is a stability constraint on the exact analytic anchor, not
+        # part of the unconstrained quadratic solve.
+        analytic_delta = _bounded_vector(analytic_delta, max_data_delta)
+
         learned_delta, hidden_next = self.data_operator(
             correlation,
             source_context,
@@ -897,15 +964,32 @@ class StructuredHQSCell(nn.Module):
             validity,
             state.hidden,
         )
-        proposal = (
-            self.analytic_weight * analytic_delta
-            + self.learned_data_weight
-            * float(max_data_delta)
-            * torch.tanh(learned_delta)
+        learned_proposal = (
+            float(max_data_delta) * torch.tanh(learned_delta)
         )
-        data_delta = _bounded_vector(proposal, max_data_delta)
-        # Exact causal invariant: validity == 0 implies w_next == q.
-        flow_w_next = state.q + validity * data_delta
+        if self.analytic_validity_mode == "weighted_solve":
+            # The analytic term already contains validity in both numerator
+            # and denominator.  Gate only the learned residual here; applying
+            # validity to the combined proposal would double-weight the
+            # analytic correction.
+            proposal = (
+                self.analytic_weight * analytic_delta
+                + self.learned_data_weight * validity * learned_proposal
+            )
+            data_delta = _bounded_vector(proposal, max_data_delta)
+            flow_w_next = state.q + data_delta
+        else:
+            # Legacy HQSCore behaviour retained for a controlled ablation and
+            # compatibility with checkpoints trained using 06_hqs_core.yaml.
+            proposal = (
+                self.analytic_weight * analytic_delta
+                + self.learned_data_weight * learned_proposal
+            )
+            data_delta = _bounded_vector(proposal, max_data_delta)
+            flow_w_next = state.q + validity * data_delta
+
+        # Exact causal invariant in both modes:
+        # validity == 0 implies flow_w_next == state.q.
 
         proximal_anchor = self.analytic_prox(
             flow_w_next,
@@ -995,4 +1079,5 @@ __all__ = [
     "WarpLinearisation",
     "edge_magnitude",
     "spatial_gradients",
+    "weighted_analytic_data_delta",
 ]

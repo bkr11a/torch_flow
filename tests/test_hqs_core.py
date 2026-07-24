@@ -14,10 +14,12 @@ from models.correlation import LocalCorrBlock
 from models.hqs_core_components import (
     AllPairsCorrelation,
     HQSState,
+    Linearisation,
     SharedValidityHead,
     SourceConditionedProxResidual,
     StructuredHQSCell,
     spatial_gradients,
+    weighted_analytic_data_delta,
 )
 from models.warp import resize_flow
 
@@ -53,6 +55,20 @@ def test_hqs_core_overlay_is_a_complete_ten_stage_switch():
     assert list(cfg.model.hqs_core.iterations) == [2, 4, 2, 2]
     assert cfg.loss.num_stages == 10
     assert cfg.loss.occlusion_aware.enabled is False
+
+
+def test_weighted_analytic_overlay_selects_corrected_operator():
+    root = Path(__file__).resolve().parents[1]
+    cfg = OmegaConf.merge(
+        OmegaConf.load(root / "configs/default.yaml"),
+        OmegaConf.load(
+            root / "configs/dropins/07_hqs_core_weighted_analytic.yaml"
+        ),
+    )
+    assert cfg.model.model_type == "hqs_core"
+    assert cfg.model.hqs_core.analytic_validity_mode == "weighted_solve"
+    assert list(cfg.model.hqs_core.iterations) == [2, 4, 2, 2]
+    assert cfg.loss.num_stages == 10
 
 
 def test_hqs_core_is_selected_only_by_model_type_switch():
@@ -140,6 +156,142 @@ def test_out_of_bounds_data_update_is_exactly_gated():
         max_prox_delta=0.5,
     )
     assert torch.count_nonzero(output.validity) == 0
+    assert torch.equal(output.state.w, q)
+
+
+def test_weighted_analytic_delta_matches_batched_linear_solve():
+    torch.manual_seed(11)
+    batch, height, width = 3, 4, 5
+    dtype = torch.float64
+    grad_x = torch.randn(batch, 1, height, width, dtype=dtype)
+    grad_y = torch.randn(batch, 1, height, width, dtype=dtype)
+    residual = torch.randn(batch, 1, height, width, dtype=dtype)
+    validity = torch.rand(batch, 1, height, width, dtype=dtype)
+    beta_map = 0.01 + torch.rand(
+        batch, 1, height, width, dtype=dtype
+    )
+    linearisation = Linearisation(
+        residual=residual,
+        grad_x=grad_x,
+        grad_y=grad_y,
+        in_bounds=torch.ones_like(validity),
+    )
+
+    actual = weighted_analytic_data_delta(
+        linearisation,
+        validity,
+        beta_map,
+    )
+
+    gradient = torch.cat((grad_x, grad_y), dim=1)
+    gradient_vectors = gradient.permute(0, 2, 3, 1).unsqueeze(-1)
+    identity = torch.eye(dtype=dtype).view(1, 1, 1, 2, 2)
+    system = (
+        beta_map.permute(0, 2, 3, 1).unsqueeze(-1) * identity
+        + validity.permute(0, 2, 3, 1).unsqueeze(-1)
+        * gradient_vectors
+        * gradient_vectors.transpose(-1, -2)
+    )
+    right_hand_side = (
+        -validity.permute(0, 2, 3, 1).unsqueeze(-1)
+        * residual.permute(0, 2, 3, 1).unsqueeze(-1)
+        * gradient_vectors
+    )
+    expected = torch.linalg.solve(system, right_hand_side)
+    expected = expected.squeeze(-1).permute(0, 3, 1, 2)
+
+    assert torch.allclose(actual, expected, atol=1e-10, rtol=1e-10)
+
+
+def test_weighted_analytic_delta_has_correct_soft_validity_limits():
+    linearisation = Linearisation(
+        residual=torch.ones(1, 1, 1, 1),
+        grad_x=torch.ones(1, 1, 1, 1),
+        grad_y=torch.zeros(1, 1, 1, 1),
+        in_bounds=torch.ones(1, 1, 1, 1),
+    )
+    beta_map = torch.ones(1, 1, 1, 1)
+
+    invalid = weighted_analytic_data_delta(
+        linearisation,
+        torch.zeros(1, 1, 1, 1),
+        beta_map,
+    )
+    soft = weighted_analytic_data_delta(
+        linearisation,
+        torch.full((1, 1, 1, 1), 0.5),
+        beta_map,
+    )
+    valid = weighted_analytic_data_delta(
+        linearisation,
+        torch.ones(1, 1, 1, 1),
+        beta_map,
+    )
+
+    assert torch.equal(invalid, torch.zeros_like(invalid))
+    assert torch.allclose(soft[:, 0], torch.full((1, 1, 1), -1.0 / 3.0))
+    assert torch.allclose(valid[:, 0], torch.full((1, 1, 1), -0.5))
+    assert torch.equal(soft[:, 1], torch.zeros_like(soft[:, 1]))
+
+
+def test_weighted_solve_rejects_unknown_validity_mode():
+    try:
+        StructuredHQSCell(
+            correlation_channels=8,
+            context_channels=8,
+            hidden_channels=8,
+            max_iterations=1,
+            analytic_validity_mode="unknown",
+        )
+    except ValueError as error:
+        assert "analytic_validity_mode" in str(error)
+    else:
+        raise AssertionError("Unknown analytic validity mode was accepted")
+
+
+def test_weighted_solve_preserves_exact_zero_validity_invariant():
+    cell = StructuredHQSCell(
+        correlation_channels=8,
+        context_channels=8,
+        hidden_channels=8,
+        max_iterations=1,
+        prior_hidden_channels=8,
+        groups=4,
+        analytic_validity_mode="weighted_solve",
+    )
+    validity_head = SharedValidityHead(
+        correlation_channels=8, hidden_channels=8
+    )
+    source = torch.rand(1, 1, 8, 8)
+    target = torch.rand(1, 1, 8, 8)
+    grad_x, grad_y = spatial_gradients(target)
+    q = torch.full((1, 2, 8, 8), 100.0)
+    context = torch.rand(1, 8, 8, 8)
+    state = HQSState(
+        w=torch.randn_like(q),
+        q=q,
+        hidden=cell.data_operator.initialise_hidden(context),
+    )
+    output = cell(
+        source_gray=source,
+        target_gray=target,
+        target_grad_x=grad_x,
+        target_grad_y=grad_y,
+        correlation=torch.rand(1, 8, 8, 8),
+        source_context=context,
+        state=state,
+        validity_head=validity_head,
+        iteration=0,
+        jacobi_sweeps=1,
+        max_data_delta=2.0,
+        max_prox_delta=0.5,
+    )
+    assert torch.count_nonzero(output.validity) == 0
+    assert torch.equal(
+        output.analytic_delta,
+        torch.zeros_like(output.analytic_delta),
+    )
+    assert torch.equal(output.data_delta, torch.zeros_like(output.data_delta))
     assert torch.equal(output.state.w, q)
 
 

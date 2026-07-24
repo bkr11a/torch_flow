@@ -1,0 +1,104 @@
+# HQSCore with a confidence-weighted analytic data operator.
+#
+# This is a complete architecture overlay and can be used directly:
+#
+#   python train_curriculum.py \
+#     --config configs/default.yaml \
+#     --override configs/dropins/07_hqs_core_weighted_analytic.yaml \
+#     --curriculum configs/curriculum/universal_replay_curriculum.yaml \
+#     --base-run-name hqs_core_weighted_analytic_2_4_2_2
+#
+# The legacy 06_hqs_core.yaml remains unchanged and therefore provides the
+# post-gating control for a matched ablation.
+
+run_name: hqs_core/weighted_analytic_2_4_2_2
+
+mlflow:
+  registered_model_name: HQSCoreWeightedAnalytic
+  tags:
+    architecture: hqs_core
+    operator_structure: warp_validity_weighted_data_prox
+    analytic_validity_mode: weighted_solve
+
+model:
+  model_type: hqs_core
+
+  hqs_core:
+    # Encoder lists are fine-to-coarse: [1/2, 1/4, 1/8, 1/16].
+    feature_channels: [32, 64, 96, 128]
+    match_channels: [64, 96, 128, 128]
+    context_channels: [64, 64, 96, 96]
+    blocks_per_scale: [1, 2, 2, 2]
+    groups: 8
+
+    # Operator lists are coarse-to-fine: [1/16, 1/8, 1/4, 1/2].
+    iterations: [2, 4, 2, 2]
+    jacobi_sweeps: [2, 2, 1, 1]
+    correlation_radii: [4, 4, 4, 3]
+    all_pairs_levels: [1, 4]
+    correlation_embedding_dim: 64
+    local_corr_channel_chunk: 4
+    local_corr_checkpoint: true
+
+    coarse_hidden_dim: 96
+    fine_hidden_dim: 64
+    prior_hidden_channels: 64
+    validity_hidden_dim: 32
+    upsample_hidden_dim: 64
+
+    # Native-grid pixel bounds, coarse-to-fine.
+    max_data_delta: [2.0, 2.0, 1.5, 1.0]
+    max_prox_delta: [0.5, 0.5, 0.5, 0.25]
+
+    beta_initial: 0.10
+    beta_minimum: 0.01
+    lambda_initial: 0.08
+    lambda_minimum: 0.001
+    edge_alpha: 10.0
+    analytic_weight: 1.0
+    learned_data_weight: 1.0
+
+    # Corrected analytic operator:
+    #
+    #   delta_a = -m g r / (beta + m ||g||^2)
+    #
+    # The learned residual is gated once by m. The combined update is not
+    # multiplied by m again, which avoids double-weighting delta_a.
+    analytic_validity_mode: weighted_solve
+
+    initial_reliability: 0.90
+    allow_external_validity_inputs: false
+
+    global_temperature: 0.07
+    global_query_chunk_size: 512
+    global_confidence_gated: true
+    global_confidence_floor: 0.05
+
+loss:
+  num_stages: 10
+  stage_weight_mode: geometric
+  gamma: 0.85
+
+  global_init_weight: 0.05
+  global_confidence_weight: 0.0
+  core_visibility_weight: 0.01
+  core_visibility_last_n: 4
+
+  smooth_weight: 0.0
+  inter_smooth_weight: 0.0
+  boundary_weight: 0.0
+  raw_final_weight: 0.0
+  iter_damp_weight: 0.0
+  photo_weight: 0.0
+  ofce_weight: 0.0
+  detail_weight: 0.0
+  occlusion_aware:
+    enabled: false
+
+training:
+  global_matcher_warmup_steps: 0
+  freeze_backbone_during_global_warmup: false
+  grad_clip: 1.0
+
+data:
+  detail_crop_prob: 0.0
