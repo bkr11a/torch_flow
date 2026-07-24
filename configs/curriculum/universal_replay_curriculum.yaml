@@ -185,7 +185,7 @@ curriculum:
         deterministic: false
         seed: 31003
         include_dataset_id: true
-        batch_size: 6
+        batch_size: 4
         num_workers: 4
         crop_size: [400, 720]
         min_scale: -0.2
@@ -202,7 +202,7 @@ curriculum:
         deterministic: true
         seed: 931003
         include_dataset_id: true
-        batch_size: 4
+        batch_size: 1
         num_workers: 2
         crop_size: [400, 720]
         datasets:
@@ -262,7 +262,7 @@ curriculum:
         deterministic: false
         seed: 41004
         include_dataset_id: true
-        batch_size: 6
+        batch_size: 4
         num_workers: 4
         crop_size: [320, 768]
         min_scale: -0.2
@@ -282,7 +282,7 @@ curriculum:
         deterministic: true
         seed: 941004
         include_dataset_id: true
-        batch_size: 4
+        batch_size: 1
         num_workers: 2
         crop_size: [320, 768]
         datasets:
