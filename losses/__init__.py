@@ -2,6 +2,7 @@
 from .flow_loss import (
 	SequenceLoss, PhotometricLoss, SmoothnessLoss, OFCELoss, HQSFlowLoss
 )
+from .scene_flow_loss import HQSSceneFlowLoss
 
 __all__ = [
 	"SequenceLoss",
@@ -9,4 +10,5 @@ __all__ = [
 	"SmoothnessLoss",
 	"OFCELoss",
 	"HQSFlowLoss",
+	"HQSSceneFlowLoss",
 ]

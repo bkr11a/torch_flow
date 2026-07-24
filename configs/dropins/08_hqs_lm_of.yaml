@@ -1,0 +1,110 @@
+# HQS-LM-OF: revised HQS optical-flow architecture.
+#
+# Curriculum launch:
+#
+#   python train_curriculum.py \
+#     --config configs/default.yaml \
+#     --override configs/dropins/08_hqs_lm_of.yaml \
+#     --curriculum configs/curriculum/universal_replay_curriculum.yaml \
+#     --base-run-name hqs_lm_of_2_4_2_2
+#
+# The model is isolated from HQSCore and TFPort. Existing checkpoints and
+# architecture paths are not modified.
+
+run_name: hqs_lm_of/revised_2_4_2_2
+
+mlflow:
+  registered_model_name: HQSLMOpticalFlow
+  tags:
+    architecture: hqs_lm_of
+    solver: hqs_proximal_levenberg_marquardt
+    data_operator: robust_feature_match_normal_equation
+    proximal: source_only_motion_completion
+    learned_data_vector_bypass: false
+
+model:
+  model_type: hqs_lm_of
+
+  hqs_lm_of:
+    # Encoder lists are fine-to-coarse: [1/2, 1/4, 1/8, 1/16].
+    feature_channels: [32, 64, 96, 128]
+    match_channels: [64, 96, 128, 128]
+    context_channels: [64, 64, 96, 96]
+    blocks_per_scale: [1, 2, 2, 2]
+    groups: 8
+
+    # Solver lists are coarse-to-fine: [1/16, 1/8, 1/4, 1/2].
+    iterations: [2, 4, 2, 2]
+    jacobi_sweeps: [2, 2, 1, 1]
+    correlation_radii: [4, 4, 4, 3]
+    all_pairs_levels: [1, 4]
+    match_temperatures: [0.07, 0.07, 0.10, 0.10]
+    local_corr_channel_chunk: 4
+    local_corr_checkpoint: true
+
+    prior_hidden_channels: 64
+    reliability_hidden_channels: 32
+    upsample_hidden_dim: 64
+
+    # Pixel-unit trust regions at each native grid.
+    max_data_delta: [2.0, 2.0, 1.5, 1.0]
+    max_prox_delta: [0.5, 0.5, 0.5, 0.25]
+
+    # Positive learned schedules. Each scale owns a schedule with the number
+    # of entries specified by `iterations`.
+    beta_initial: 0.10
+    beta_minimum: 0.01
+    damping_initial: 0.10
+    damping_minimum: 0.001
+    lambda_initial: 0.08
+    lambda_minimum: 0.001
+
+    # Operator-specific robust weighting and correspondence precision.
+    charbonnier_epsilon: 0.03
+    charbonnier_alpha: 0.45
+    initial_validity: 0.90
+    match_precision_floor: 0.01
+    match_precision_ceiling: 1.00
+
+    # Source-only analytic and learned proximal.
+    edge_alpha: 10.0
+    minimum_data_anchor: 0.05
+
+    # Fixed global all-pairs match used only to enter the local LM basin.
+    global_temperature: 0.07
+    global_query_chunk_size: 512
+    global_confidence_gated: true
+    global_confidence_floor: 0.05
+
+    # Ground-truth visibility remains loss-only.
+    allow_external_validity_inputs: false
+
+loss:
+  num_stages: 10
+  stage_weight_mode: geometric
+  gamma: 0.85
+
+  global_init_weight: 0.05
+  global_confidence_weight: 0.0
+  core_visibility_weight: 0.01
+  core_visibility_last_n: 4
+
+  # Keep the first matched experiment attributable to the architecture.
+  smooth_weight: 0.0
+  inter_smooth_weight: 0.0
+  boundary_weight: 0.0
+  raw_final_weight: 0.0
+  iter_damp_weight: 0.0
+  photo_weight: 0.0
+  ofce_weight: 0.0
+  detail_weight: 0.0
+  occlusion_aware:
+    enabled: false
+
+training:
+  global_matcher_warmup_steps: 0
+  freeze_backbone_during_global_warmup: false
+  grad_clip: 1.0
+
+data:
+  detail_crop_prob: 0.0

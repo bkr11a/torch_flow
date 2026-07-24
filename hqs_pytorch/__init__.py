@@ -18,6 +18,8 @@ __all__ = [
     "AngularErrorLoss",
     "OpticalFlowPhysicsLoss",
     "HQSFlowModel",
+    "HQSLMOpticalFlow",
+    "HQSLMSceneFlow",
     "OpticalFlowFeatureEncoder",
     "OpticalFlowContextEncoder",
 ]
@@ -30,10 +32,13 @@ def __getattr__(name: str):
     recursively constructing ``models.hqs_flow`` while HQSFlowModel is only
     partially initialized.
     """
-    if name != "HQSFlowModel":
+    module_by_name = {
+        "HQSFlowModel": ".customML.customModels.HQSFlowModel",
+        "HQSLMOpticalFlow": ".customML.customModels.HQSLMOpticalFlow",
+        "HQSLMSceneFlow": ".customML.customModels.HQSLMSceneFlow",
+    }
+    if name not in module_by_name:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    value = import_module(
-        ".customML.customModels.HQSFlowModel", __name__
-    ).HQSFlowModel
+    value = getattr(import_module(module_by_name[name], __name__), name)
     globals()[name] = value
     return value

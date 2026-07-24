@@ -33,8 +33,9 @@ def build_model(cfg, model_type: str = "tfport"):
     Args:
         cfg: Configuration object with cfg.model sub-config
         model_type: "tfport" (default, faithful TensorFlow recreation),
-                    "original" (multi-stage unrolled), or ``hqs_core``
-                    (compact four-scale operator-structured model).
+                    "original" (multi-stage unrolled), ``hqs_core``,
+                    ``hqs_lm_of`` (revised optical flow), or ``hqs_lm_sf``
+                    (calibrated RGB-D scene-flow prototype).
     
     Returns:
         Instantiated HQS model
@@ -52,9 +53,21 @@ def build_model(cfg, model_type: str = "tfport"):
         from hqs_pytorch.customML.customModels.HQSCore import HQSCore
 
         return HQSCore(cfg.model)
+    if model_type in {"hqs_lm_of", "hqslm_of", "hqs-lm-of"}:
+        from hqs_pytorch.customML.customModels.HQSLMOpticalFlow import (
+            HQSLMOpticalFlow,
+        )
+
+        return HQSLMOpticalFlow(cfg.model)
+    if model_type in {"hqs_lm_sf", "hqslm_sf", "hqs-lm-sf"}:
+        from hqs_pytorch.customML.customModels.HQSLMSceneFlow import (
+            HQSLMSceneFlow,
+        )
+
+        return HQSLMSceneFlow(cfg.model)
 
     raise ValueError(
         f"Unknown model_type: {model_type}. "
         "Use one of: tfport | tf_faithful | tf_port | original | legacy | "
-        "hqs_core | hqscore | core."
+        "hqs_core | hqscore | core | hqs_lm_of | hqs_lm_sf."
     )

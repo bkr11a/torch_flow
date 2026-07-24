@@ -1,0 +1,85 @@
+# HQS-LM-SF: calibrated RGB-D scene-flow prototype.
+#
+# This config builds the prototype through models.build_model. It is not an
+# overlay for the optical-flow Trainer because the model requires depth,
+# intrinsics, temporal extrinsics and scene-flow supervision.
+#
+# Synthetic forward smoke test:
+#
+#   python smoketest_hqs_lm.py --model scene
+
+run_name: hqs_lm_sf/calibrated_rgbd_prototype
+
+mlflow:
+  registered_model_name: HQSLMSceneFlow
+  tags:
+    architecture: hqs_lm_sf
+    solver: hqs_proximal_levenberg_marquardt
+    observation_model: calibrated_rgbd
+    scene_flow_convention: source_camera_metric_before_T21
+    data_operator: appearance_depth_match_normal_equation
+    proximal: source_only_geometry_aware_motion_completion
+    learned_data_vector_bypass: false
+
+model:
+  model_type: hqs_lm_sf
+
+  hqs_lm_sf:
+    # Encoder lists are fine-to-coarse: [1/2, 1/4, 1/8, 1/16].
+    feature_channels: [32, 64, 96, 128]
+    match_channels: [64, 96, 128, 128]
+    context_channels: [64, 64, 96, 96]
+    blocks_per_scale: [1, 2, 2, 2]
+    groups: 8
+    depth_context_channels: 16
+
+    # Solver lists are coarse-to-fine: [1/16, 1/8, 1/4, 1/2].
+    iterations: [2, 4, 2, 2]
+    jacobi_sweeps: [2, 2, 1, 1]
+    correlation_radii: [4, 4, 4, 3]
+    all_pairs_levels: [1, 4]
+    match_temperatures: [0.07, 0.07, 0.10, 0.10]
+    local_corr_channel_chunk: 4
+    local_corr_checkpoint: true
+
+    prior_hidden_channels: 64
+    reliability_hidden_channels: 32
+    upsample_hidden_dim: 64
+
+    # Metric trust regions. Tune after inspecting the dataset's scene-flow
+    # distribution; these defaults are conservative for driving data.
+    max_data_delta_metres: [1.0, 0.75, 0.50, 0.25]
+    max_prox_delta_metres: [0.25, 0.20, 0.10, 0.05]
+
+    beta_initial: 0.10
+    beta_minimum: 0.01
+    damping_initial: 0.10
+    damping_minimum: 0.001
+    lambda_initial: 0.08
+    lambda_minimum: 0.001
+
+    feature_weight: 1.0
+    geometry_weight: 1.0
+    charbonnier_epsilon: 0.03
+    depth_charbonnier_epsilon: 0.10
+    charbonnier_alpha: 0.45
+    initial_validity: 0.90
+    match_precision_floor: 0.01
+    match_precision_ceiling: 1.00
+
+    edge_alpha: 8.0
+    minimum_data_anchor: 0.05
+    maximum_depth: 100.0
+    depth_guidance_weight: 0.5
+
+    global_temperature: 0.07
+    global_query_chunk_size: 512
+    global_confidence_gated: true
+    global_confidence_floor: 0.05
+
+scene_flow_loss:
+  gamma: 0.85
+  induced_flow_weight: 0.10
+  geometry_weight: 0.05
+  coupling_weight: 0.0
+  maximum_scene_epe: 400.0

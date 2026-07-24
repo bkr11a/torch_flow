@@ -16,7 +16,7 @@ from .warp import (
 )
 
 __all__ = [
-    "HQSFlow", "HQSCore", "build_model",
+    "HQSFlow", "HQSCore", "HQSLMOpticalFlow", "HQSLMSceneFlow", "build_model",
     "BasicEncoder", "SmallEncoder", "build_encoder",
     "CorrBlock", "LocalCorrBlock", "build_corr_block",
     "DataUpdateNet", "ConvGRUCell",
@@ -31,11 +31,18 @@ def __getattr__(name: str):
     # HQSFlowModel imports leaf modules such as models.encoders.  Defer the
     # compatibility shim so those imports cannot re-enter HQSFlowModel while it
     # is still being defined.
-    if name == "HQSCore":
-        module = import_module(
-            "hqs_pytorch.customML.customModels.HQSCore"
-        )
-        value = module.HQSCore
+    model_modules = {
+        "HQSCore": "hqs_pytorch.customML.customModels.HQSCore",
+        "HQSLMOpticalFlow": (
+            "hqs_pytorch.customML.customModels.HQSLMOpticalFlow"
+        ),
+        "HQSLMSceneFlow": (
+            "hqs_pytorch.customML.customModels.HQSLMSceneFlow"
+        ),
+    }
+    if name in model_modules:
+        module = import_module(model_modules[name])
+        value = getattr(module, name)
         globals()[name] = value
         return value
     if name not in {"HQSFlow", "build_model"}:
