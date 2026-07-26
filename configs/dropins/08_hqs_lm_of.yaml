@@ -1,4 +1,16 @@
-# HQS-LM-OF: revised HQS optical-flow architecture.
+# HQS-LM-OF: transformer- and attention-enhanced revised architecture.
+#
+# Complete data path:
+#
+#   transformer-enhanced matching features
+#       -> indexed correlation at the current flow
+#       -> per-iteration flow-conditioned hypothesis attention
+#       -> recurrent vector observation + full 2x2 precision
+#       -> analytic LM normal equation
+#       -> source-conditioned proximal
+#
+# Learned target-conditioned vectors are observations inside the LM system.
+# No learned vector is added after the solve.
 #
 # Curriculum launch:
 #
@@ -8,17 +20,19 @@
 #     --curriculum configs/curriculum/universal_replay_curriculum.yaml \
 #     --base-run-name hqs_lm_of_2_4_2_2
 #
-# The model is isolated from HQSCore and TFPort. Existing checkpoints and
-# architecture paths are not modified.
+# This file directly configures the canonical `hqs_lm_of` model path.
 
-run_name: hqs_lm_of/revised_2_4_2_2
+run_name: hqs_lm_of/transformer_attention_2_4_2_2
 
 mlflow:
   registered_model_name: HQSLMOpticalFlow
   tags:
     architecture: hqs_lm_of
     solver: hqs_proximal_levenberg_marquardt
-    data_operator: robust_feature_match_normal_equation
+    data_operator: learned_probabilistic_measurement_inside_lm
+    feature_pipeline: gated_self_cross_transformer
+    iteration_attention: flow_conditioned_correlation
+    correspondence_precision: full_symmetric_2x2
     proximal: source_only_motion_completion
     learned_data_vector_bypass: false
 
@@ -33,6 +47,17 @@ model:
     blocks_per_scale: [1, 2, 2, 2]
     groups: 8
 
+    # Gated transformer enhancement is coarse-to-fine:
+    # [1/16, 1/8, 1/4, 1/2]. Coarse scales obtain long-range self/cross-image
+    # context; 1/4 uses native-grid windows; 1/2 is left convolutional to
+    # preserve thin structures and control memory.
+    feature_transformer_depth: [1, 1, 1, 0]
+    feature_transformer_heads: [4, 4, 4, 4]
+    feature_transformer_max_tokens: [4096, 2048, 1024, 1024]
+    feature_transformer_mlp_ratio: 2.0
+    feature_transformer_dropout: 0.0
+    feature_transformer_initial_blend: 0.10
+
     # Solver lists are coarse-to-fine: [1/16, 1/8, 1/4, 1/2].
     iterations: [2, 4, 2, 2]
     jacobi_sweeps: [2, 2, 1, 1]
@@ -41,6 +66,31 @@ model:
     match_temperatures: [0.07, 0.07, 0.10, 0.10]
     local_corr_channel_chunk: 4
     local_corr_checkpoint: true
+
+    # The recurrent decoder retains every indexed correlation channel. The
+    # vector it predicts is a measurement residual around the analytic soft
+    # match, rather than an update added after the LM solve.
+    proposal_embedding_channels: [64, 64, 64, 64]
+    proposal_hidden_channels: [96, 96, 64, 64]
+    max_learned_proposal_delta: [2.0, 2.0, 1.5, 1.0]
+
+    # Each HQS iteration attends over correspondence hypotheses using the
+    # current data flow, proximal disagreement, feature residual, confidence,
+    # source context and iteration fraction. Attention changes the probabilistic
+    # measurement only; it cannot directly modify flow.
+    correlation_attention_channels: [32, 32, 32, 32]
+    correlation_attention_heads: [4, 4, 4, 4]
+    correlation_attention_temperature: 1.0
+
+    # Full correspondence precision P=[p_xx,p_xy,p_yy]. Matchability gates
+    # the entire matrix and may approach zero. The bounded correlation
+    # coefficient preserves positive semidefiniteness.
+    learned_precision_minimum: 0.0
+    learned_precision_maximum: 1.0
+    learned_precision_initial: 0.20
+    learned_precision_correlation_limit: 0.95
+    initial_matchability: 0.90
+    analytic_confidence_floor: 0.02
 
     prior_hidden_channels: 64
     reliability_hidden_channels: 32
@@ -59,12 +109,10 @@ model:
     lambda_initial: 0.08
     lambda_minimum: 0.001
 
-    # Operator-specific robust weighting and correspondence precision.
+    # Operator-specific robust weighting.
     charbonnier_epsilon: 0.03
     charbonnier_alpha: 0.45
     initial_validity: 0.90
-    match_precision_floor: 0.01
-    match_precision_ceiling: 1.00
 
     # Source-only analytic and learned proximal.
     edge_alpha: 10.0
@@ -89,7 +137,13 @@ loss:
   core_visibility_weight: 0.01
   core_visibility_last_n: 4
 
-  # Keep the first matched experiment attributable to the architecture.
+  # Directly supervise the internal probabilistic observation on visible
+  # pixels. Ground-truth flow and masks remain loss-only.
+  proposal_supervision_weight: 0.02
+  proposal_matchability_weight: 0.002
+  proposal_confidence_tau: 1.0
+  proposal_supervision_last_n: 0
+
   smooth_weight: 0.0
   inter_smooth_weight: 0.0
   boundary_weight: 0.0

@@ -16,7 +16,8 @@ from .warp import (
 )
 
 __all__ = [
-    "HQSFlow", "HQSCore", "HQSLMOpticalFlow", "HQSLMSceneFlow", "build_model",
+    "HQSFlow", "HQSCore", "HQSLMOpticalFlow",
+    "HQSLMSceneFlow", "build_model",
     "BasicEncoder", "SmallEncoder", "build_encoder",
     "CorrBlock", "LocalCorrBlock", "build_corr_block",
     "DataUpdateNet", "ConvGRUCell",

@@ -34,7 +34,8 @@ def build_model(cfg, model_type: str = "tfport"):
         cfg: Configuration object with cfg.model sub-config
         model_type: "tfport" (default, faithful TensorFlow recreation),
                     "original" (multi-stage unrolled), ``hqs_core``,
-                    ``hqs_lm_of`` (revised optical flow), or ``hqs_lm_sf``
+                    ``hqs_lm_of`` (learned probabilistic correspondence and
+                    transformer attention fused inside LM), or ``hqs_lm_sf``
                     (calibrated RGB-D scene-flow prototype).
     
     Returns:

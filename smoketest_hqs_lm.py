@@ -38,6 +38,19 @@ def _load(path: str, *, small: bool):
         if cfg.model.model_type == "hqs_lm_of"
         else "hqs_lm_sf"
     )
+    if cfg.model.model_type == "hqs_lm_of":
+        common.update(
+            {
+                "proposal_embedding_channels": [8, 8, 8, 8],
+                "proposal_hidden_channels": [8, 8, 8, 8],
+                "max_learned_proposal_delta": [1.0, 1.0, 1.0, 1.0],
+                "correlation_attention_channels": [8, 8, 8, 8],
+                "correlation_attention_heads": [2, 2, 2, 2],
+                "feature_transformer_depth": [1, 0, 0, 0],
+                "feature_transformer_heads": [4, 4, 4, 4],
+                "feature_transformer_max_tokens": [64, 64, 64, 64],
+            }
+        )
     cfg.model[key] = OmegaConf.merge(cfg.model[key], common)
     return cfg
 
@@ -49,8 +62,13 @@ def _inputs(device: torch.device):
     return image1, image2
 
 
-def optical(device: torch.device, small: bool) -> None:
-    cfg = _load("configs/dropins/08_hqs_lm_of.yaml", small=small)
+def optical(
+    device: torch.device,
+    small: bool,
+    *,
+    config_path: str = "configs/dropins/08_hqs_lm_of.yaml",
+) -> None:
+    cfg = _load(config_path, small=small)
     model = build_model(cfg).to(device).eval()
     image1, image2 = _inputs(device)
     with torch.no_grad():
@@ -63,7 +81,7 @@ def optical(device: torch.device, small: bool) -> None:
         for value in output["learned_data_delta_lows"]
     )
     print(
-        "HQS-LM-OF:",
+        f"{output['solver']}:",
         tuple(final.shape),
         f"stages={len(output['flow_preds'])}",
         f"parameters={model.param_count()['total']:,}",

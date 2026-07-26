@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -250,7 +250,17 @@ def solve_optical_lm_increment(
     charbonnier_epsilon: float = 0.03,
     charbonnier_alpha: float = 0.45,
 ) -> OpticalNormalEquation:
-    """Solve the robust multi-channel ``2 x 2`` optical-flow LM system."""
+    """Solve the robust multi-channel ``2 x 2`` optical-flow LM system.
+
+    ``match_precision`` accepts three backwards-compatible layouts:
+
+    - one channel: isotropic precision ``[p]``;
+    - two channels: diagonal precision ``[p_xx, p_yy]``;
+    - three channels: full symmetric precision ``[p_xx, p_xy, p_yy]``.
+
+    The canonical HQS-LM-OF model uses the full form; scalar and diagonal
+    layouts remain supported for scene-flow and analytic operator tests.
+    """
     if residual.shape != jacobian_x.shape or residual.shape != jacobian_y.shape:
         raise ValueError("Residual and feature Jacobians must have equal shapes")
     if flow_w.shape != flow_z.shape or flow_w.shape != match_proposal.shape:
@@ -273,31 +283,50 @@ def solve_optical_lm_increment(
     r = residual.float()
     weight32 = weight.float()
 
-    px = match_precision[:, 0:1].float()
-    py = (
-        match_precision[:, 1:2].float()
-        if match_precision.shape[1] > 1
-        else px
-    )
+    if match_precision.ndim != 4 or match_precision.shape[1] not in (1, 2, 3):
+        raise ValueError(
+            "match_precision must have one, two or three channels "
+            f"[p], [p_xx,p_yy], or [p_xx,p_xy,p_yy], got "
+            f"{tuple(match_precision.shape)}"
+        )
+    p11 = match_precision[:, 0:1].float()
+    if match_precision.shape[1] == 1:
+        p12 = torch.zeros_like(p11)
+        p22 = p11
+    elif match_precision.shape[1] == 2:
+        p12 = torch.zeros_like(p11)
+        p22 = match_precision[:, 1:2].float()
+    else:
+        p12 = match_precision[:, 1:2].float()
+        p22 = match_precision[:, 2:3].float()
     beta = beta_map.float()
     damping = damping_map.float()
 
     h11 = normaliser * (weight32 * jx.square()).sum(dim=1, keepdim=True)
     h12 = normaliser * (weight32 * jx * jy).sum(dim=1, keepdim=True)
     h22 = normaliser * (weight32 * jy.square()).sum(dim=1, keepdim=True)
-    h11 = h11 + px + beta + damping
-    h22 = h22 + py + beta + damping
+    h11 = h11 + p11 + beta + damping
+    h12 = h12 + p12
+    h22 = h22 + p22 + beta + damping
 
     g1 = normaliser * (weight32 * jx * r).sum(dim=1, keepdim=True)
     g2 = normaliser * (weight32 * jy * r).sum(dim=1, keepdim=True)
+    match_error_x = (
+        flow_w[:, 0:1].float() - match_proposal[:, 0:1].float()
+    )
+    match_error_y = (
+        flow_w[:, 1:2].float() - match_proposal[:, 1:2].float()
+    )
     g1 = (
         g1
-        + px * (flow_w[:, 0:1].float() - match_proposal[:, 0:1].float())
+        + p11 * match_error_x
+        + p12 * match_error_y
         + beta * (flow_w[:, 0:1].float() - flow_z[:, 0:1].float())
     )
     g2 = (
         g2
-        + py * (flow_w[:, 1:2].float() - match_proposal[:, 1:2].float())
+        + p12 * match_error_x
+        + p22 * match_error_y
         + beta * (flow_w[:, 1:2].float() - flow_z[:, 1:2].float())
     )
 
@@ -587,6 +616,13 @@ class OpticalLMIterationOutput:
     beta: torch.Tensor
     damping: torch.Tensor
     regularisation: torch.Tensor
+    learned_proposal_delta: Optional[torch.Tensor] = None
+    proposal_offset: Optional[torch.Tensor] = None
+    matchability: Optional[torch.Tensor] = None
+    proposal_hidden: Optional[torch.Tensor] = None
+    analytic_match_proposal: Optional[torch.Tensor] = None
+    correlation_attention_entropy: Optional[torch.Tensor] = None
+    correlation_attention_peak: Optional[torch.Tensor] = None
 
 
 class HQSOpticalLMCell(nn.Module):

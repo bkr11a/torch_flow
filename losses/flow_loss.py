@@ -413,6 +413,21 @@ class HQSFlowLoss(nn.Module):
         self.core_visibility_last_n = int(
             cfg.get("core_visibility_last_n", 4)
         )
+        # Optional direct training signal for a learned correspondence
+        # measurement. The proposal remains an internal data observation; this
+        # loss never feeds ground truth into model.forward().
+        self.proposal_supervision_weight = float(
+            cfg.get("proposal_supervision_weight", 0.0)
+        )
+        self.proposal_matchability_weight = float(
+            cfg.get("proposal_matchability_weight", 0.0)
+        )
+        self.proposal_confidence_tau = float(
+            cfg.get("proposal_confidence_tau", 1.0)
+        )
+        self.proposal_supervision_last_n = int(
+            cfg.get("proposal_supervision_last_n", 0)
+        )
 
         occ_cfg = cfg.get("occlusion_aware", {})
         self.occlusion_aware_enabled = bool(occ_cfg.get("enabled", False))
@@ -635,6 +650,92 @@ class HQSFlowLoss(nn.Module):
         if not terms:
             return flow_gt.new_zeros(())
         return torch.stack(terms).mean()
+
+    def _proposal_measurement_loss(
+        self,
+        proposals: List[torch.Tensor],
+        matchabilities: List[torch.Tensor],
+        flow_gt: torch.Tensor,
+        valid: torch.Tensor,
+        occlusion: Optional[torch.Tensor],
+        invalid: Optional[torch.Tensor],
+        synthetic_occlusion: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Supervise correspondence observations only where they are defined.
+
+        Matchability targets combine geometric visibility with the detached
+        accuracy of the current proposal. This does not force a textureless
+        but visible pixel to claim high correspondence confidence.
+        """
+        visibility, reliable = self._visibility_targets(
+            flow_gt,
+            valid,
+            occlusion,
+            invalid,
+            synthetic_occlusion,
+        )
+        pairs = list(zip(proposals, matchabilities))
+        if self.proposal_supervision_last_n > 0:
+            pairs = pairs[-self.proposal_supervision_last_n :]
+
+        proposal_terms: List[torch.Tensor] = []
+        matchability_terms: List[torch.Tensor] = []
+        for proposal, matchability in pairs:
+            if not isinstance(proposal, torch.Tensor):
+                continue
+            gt_low = self._resize_flow_gt(flow_gt, proposal.shape[-2:])
+            visible_low = F.interpolate(
+                visibility, size=proposal.shape[-2:], mode="nearest"
+            )
+            reliable_low = F.interpolate(
+                reliable, size=proposal.shape[-2:], mode="nearest"
+            )
+            proposal_weight = visible_low * reliable_low
+            proposal_point = charbonnier(proposal - gt_low).mean(
+                dim=1, keepdim=True
+            )
+            proposal_terms.append(
+                (proposal_point * proposal_weight).sum()
+                / proposal_weight.sum().clamp_min(1.0)
+            )
+
+            if not isinstance(matchability, torch.Tensor):
+                continue
+            if matchability.shape[-2:] != proposal.shape[-2:]:
+                matchability = F.interpolate(
+                    matchability,
+                    size=proposal.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            proposal_epe = (proposal - gt_low).square().sum(
+                dim=1, keepdim=True
+            ).sqrt()
+            matchability_target = visible_low * torch.exp(
+                -proposal_epe.detach()
+                / max(self.proposal_confidence_tau, 1e-6)
+            )
+            probability = matchability.float().clamp(1e-5, 1.0 - 1e-5)
+            target = matchability_target.float()
+            point = -(
+                target * probability.log()
+                + (1.0 - target) * (1.0 - probability).log()
+            )
+            matchability_terms.append(
+                (point * reliable_low.float()).sum()
+                / reliable_low.sum().clamp_min(1.0)
+            )
+
+        zero = flow_gt.new_zeros(())
+        proposal_loss = (
+            torch.stack(proposal_terms).mean() if proposal_terms else zero
+        )
+        matchability_loss = (
+            torch.stack(matchability_terms).mean()
+            if matchability_terms
+            else zero
+        )
+        return proposal_loss, matchability_loss
 
     def _factorised_reliability_loss(
         self,
@@ -1005,6 +1106,37 @@ class HQSFlowLoss(nn.Module):
                         total
                         + self.core_visibility_weight * core_visibility
                     )
+
+            proposals = model_outputs.get("match_proposal_lows")
+            matchabilities = model_outputs.get("matchability_lows")
+            if (
+                isinstance(proposals, list)
+                and proposals
+                and isinstance(matchabilities, list)
+                and len(proposals) == len(matchabilities)
+                and (
+                    self.proposal_supervision_weight > 0
+                    or self.proposal_matchability_weight > 0
+                )
+            ):
+                proposal_loss, matchability_loss = (
+                    self._proposal_measurement_loss(
+                        proposals,
+                        matchabilities,
+                        flow_gt,
+                        valid,
+                        occlusion,
+                        invalid,
+                        synthetic_occlusion,
+                    )
+                )
+                out["proposal_supervision"] = proposal_loss
+                out["proposal_matchability"] = matchability_loss
+                total = (
+                    total
+                    + self.proposal_supervision_weight * proposal_loss
+                    + self.proposal_matchability_weight * matchability_loss
+                )
 
         if self.occlusion_aware_enabled and isinstance(model_outputs, dict):
             occ_terms = self._factorised_reliability_loss(

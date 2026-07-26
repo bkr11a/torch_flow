@@ -1,21 +1,27 @@
-"""HQS-LM-OF: reliability-weighted proximal LM optical flow.
+"""HQS-LM-OF: transformer-enhanced proximal LM optical flow.
 
 This model is an isolated successor to ``HQSCore``.  It retains the
 coarse-to-fine HQS state and source-conditioned proximal branch, but replaces
 the scalar OFCE update and learned data residual with a robust multi-channel
-Levenberg-Marquardt solve.
+Levenberg-Marquardt solve.  Transformer-enhanced matching features improve
+long-range correspondence discrimination.  At each HQS iteration,
+flow-conditioned correlation attention decodes a bounded vector observation,
+matchability and full ``2 x 2`` precision inside the analytic solve.
 
 At every iteration:
 
-1. correlation is decoded into a local match observation and precision;
-2. target features are warped and linearised at the data state ``w``;
-3. a damped ``2 x 2`` normal equation fuses feature, match and HQS evidence;
-4. a source-only proximal updates ``z``.
+1. the current flow attends over the complete indexed correlation tensor;
+2. attention is decoded into a learned match observation and full precision;
+3. target features are warped and linearised at the data state ``w``;
+4. a damped ``2 x 2`` normal equation fuses feature, match and HQS evidence;
+5. a source-only proximal updates ``z``.
 
-There is no learned vector correction around the data solve.
+The learned vector is a probabilistic observation inside the normal equation.
+There is no learned vector addition after the data solve.
 """
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
@@ -29,11 +35,15 @@ from models.hqs_core_components import (
     spatial_gradients,
 )
 from models.hqs_lm_components import (
-    HQSOpticalLMCell,
     LMState,
     SourceGuidedFieldUpsampler,
 )
+from models.hqs_lm_learned_measurement import (
+    HQSOpticalLearnedMeasurementCell,
+)
 from models.warp import resize_flow
+
+from .sota_addons import TransformerFeatureEnhancer
 
 
 def _cfg_get(cfg, key: str, default):
@@ -157,6 +167,89 @@ class HQSLMOpticalFlow(nn.Module):
             blocks_per_scale=blocks_per_scale,
             groups=groups,
         )
+        match_by_scale = dict(zip((2, 4, 8, 16), match_channels))
+        transformer_depth = dict(
+            zip(
+                self.scale_order,
+                _list(
+                    model_cfg,
+                    "feature_transformer_depth",
+                    (1, 1, 1, 0),
+                    int,
+                ),
+            )
+        )
+        transformer_heads = dict(
+            zip(
+                self.scale_order,
+                _list(
+                    model_cfg,
+                    "feature_transformer_heads",
+                    (4, 4, 4, 4),
+                    int,
+                ),
+            )
+        )
+        transformer_max_tokens = dict(
+            zip(
+                self.scale_order,
+                _list(
+                    model_cfg,
+                    "feature_transformer_max_tokens",
+                    (4096, 2048, 1024, 1024),
+                    int,
+                ),
+            )
+        )
+        transformer_mlp_ratio = float(
+            _cfg_get(model_cfg, "feature_transformer_mlp_ratio", 2.0)
+        )
+        transformer_dropout = float(
+            _cfg_get(model_cfg, "feature_transformer_dropout", 0.0)
+        )
+        initial_blend = float(
+            _cfg_get(
+                model_cfg,
+                "feature_transformer_initial_blend",
+                0.10,
+            )
+        )
+        if not 0.0 < initial_blend < 1.0:
+            raise ValueError(
+                "feature_transformer_initial_blend must be in (0, 1)"
+            )
+        self.match_feature_transformers = nn.ModuleDict()
+        self.match_feature_transformer_logits = nn.ParameterDict()
+        blend_logit = math.log(initial_blend / (1.0 - initial_blend))
+        for scale in self.scale_order:
+            depth = transformer_depth[scale]
+            if depth < 0:
+                raise ValueError(
+                    "feature_transformer_depth entries must be nonnegative"
+                )
+            if depth == 0:
+                continue
+            channels = match_by_scale[scale]
+            heads = transformer_heads[scale]
+            if channels % heads != 0:
+                raise ValueError(
+                    f"1/{scale} matching channels ({channels}) must be "
+                    f"divisible by transformer heads ({heads})"
+                )
+            self.match_feature_transformers[str(scale)] = (
+                TransformerFeatureEnhancer(
+                    feature_dim=channels,
+                    num_heads=heads,
+                    depth=depth,
+                    mlp_ratio=transformer_mlp_ratio,
+                    dropout=transformer_dropout,
+                    max_tokens=transformer_max_tokens[scale],
+                )
+            )
+            self.match_feature_transformer_logits[str(scale)] = nn.Parameter(
+                torch.tensor(blend_logit, dtype=torch.float32)
+            )
+
         local_chunk = int(
             _cfg_get(model_cfg, "local_corr_channel_chunk", 4)
         )
@@ -179,6 +272,69 @@ class HQSLMOpticalFlow(nn.Module):
         )
 
         context_by_scale = dict(zip((2, 4, 8, 16), context_channels))
+        raw_correlation_channels = {
+            16: self.all_pairs_levels[16]
+            * (2 * self.correlation_radii[16] + 1) ** 2,
+            8: self.all_pairs_levels[8]
+            * (2 * self.correlation_radii[8] + 1) ** 2,
+            4: (2 * self.correlation_radii[4] + 1) ** 2,
+            2: (2 * self.correlation_radii[2] + 1) ** 2,
+        }
+        proposal_embedding_channels = dict(
+            zip(
+                self.scale_order,
+                _list(
+                    model_cfg,
+                    "proposal_embedding_channels",
+                    (64, 64, 64, 64),
+                    int,
+                ),
+            )
+        )
+        proposal_hidden_channels = dict(
+            zip(
+                self.scale_order,
+                _list(
+                    model_cfg,
+                    "proposal_hidden_channels",
+                    (96, 96, 64, 64),
+                    int,
+                ),
+            )
+        )
+        maximum_proposal_delta = dict(
+            zip(
+                self.scale_order,
+                _list(
+                    model_cfg,
+                    "max_learned_proposal_delta",
+                    (2.0, 2.0, 1.5, 1.0),
+                    float,
+                ),
+            )
+        )
+        correlation_attention_channels = dict(
+            zip(
+                self.scale_order,
+                _list(
+                    model_cfg,
+                    "correlation_attention_channels",
+                    (32, 32, 32, 32),
+                    int,
+                ),
+            )
+        )
+        correlation_attention_heads = dict(
+            zip(
+                self.scale_order,
+                _list(
+                    model_cfg,
+                    "correlation_attention_heads",
+                    (4, 4, 4, 4),
+                    int,
+                ),
+            )
+        )
         common = dict(
             prior_hidden_channels=int(
                 _cfg_get(model_cfg, "prior_hidden_channels", 64)
@@ -212,11 +368,34 @@ class HQSLMOpticalFlow(nn.Module):
             initial_validity=float(
                 _cfg_get(model_cfg, "initial_validity", 0.90)
             ),
-            match_precision_floor=float(
-                _cfg_get(model_cfg, "match_precision_floor", 0.01)
+            precision_minimum=float(
+                _cfg_get(model_cfg, "learned_precision_minimum", 0.0)
             ),
-            match_precision_ceiling=float(
-                _cfg_get(model_cfg, "match_precision_ceiling", 1.00)
+            precision_maximum=float(
+                _cfg_get(model_cfg, "learned_precision_maximum", 1.00)
+            ),
+            precision_correlation_limit=float(
+                _cfg_get(
+                    model_cfg,
+                    "learned_precision_correlation_limit",
+                    0.95,
+                )
+            ),
+            initial_precision=float(
+                _cfg_get(model_cfg, "learned_precision_initial", 0.20)
+            ),
+            initial_matchability=float(
+                _cfg_get(model_cfg, "initial_matchability", 0.90)
+            ),
+            analytic_confidence_floor=float(
+                _cfg_get(model_cfg, "analytic_confidence_floor", 0.02)
+            ),
+            correlation_attention_temperature=float(
+                _cfg_get(
+                    model_cfg,
+                    "correlation_attention_temperature",
+                    1.0,
+                )
             ),
             charbonnier_epsilon=float(
                 _cfg_get(model_cfg, "charbonnier_epsilon", 0.03)
@@ -227,11 +406,25 @@ class HQSLMOpticalFlow(nn.Module):
         )
         self.cells = nn.ModuleDict(
             {
-                str(scale): HQSOpticalLMCell(
+                str(scale): HQSOpticalLearnedMeasurementCell(
+                    correlation_channels=raw_correlation_channels[scale],
                     context_channels=context_by_scale[scale],
                     max_iterations=self.iterations_by_scale[scale],
                     radius=self.correlation_radii[scale],
                     match_temperature=self.match_temperatures[scale],
+                    maximum_proposal_delta=maximum_proposal_delta[scale],
+                    proposal_embedding_channels=(
+                        proposal_embedding_channels[scale]
+                    ),
+                    proposal_hidden_channels=(
+                        proposal_hidden_channels[scale]
+                    ),
+                    correlation_attention_channels=(
+                        correlation_attention_channels[scale]
+                    ),
+                    correlation_attention_heads=(
+                        correlation_attention_heads[scale]
+                    ),
                     **common,
                 )
                 for scale in self.scale_order
@@ -263,6 +456,7 @@ class HQSLMOpticalFlow(nn.Module):
         self.allow_external_validity_inputs = bool(
             _cfg_get(model_cfg, "allow_external_validity_inputs", False)
         )
+        self.solver_name = "hqs_lm_of"
 
         self.register_buffer(
             "image_mean",
@@ -304,6 +498,41 @@ class HQSLMOpticalFlow(nn.Module):
         return self.local_correlations[str(scale)](
             source_features, target_features, flow_w
         )
+
+    def _enhance_matching_features(
+        self,
+        source_features: Dict[int, torch.Tensor],
+        target_features: Dict[int, torch.Tensor],
+    ) -> Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor]]:
+        """Apply gated self/cross-attention on the matching branch only.
+
+        The proximal context pyramid is deliberately not passed through this
+        cross-image transformer.  Target-conditioned feature enhancement
+        therefore terminates at correspondence and feature data consistency.
+        """
+        enhanced_source = dict(source_features)
+        enhanced_target = dict(target_features)
+        for scale in self.scale_order:
+            key = str(scale)
+            if key not in self.match_feature_transformers:
+                continue
+            source_value, target_value = self.match_feature_transformers[key](
+                source_features[scale],
+                target_features[scale],
+            )
+            blend = torch.sigmoid(
+                self.match_feature_transformer_logits[key]
+            ).to(
+                device=source_value.device,
+                dtype=source_value.dtype,
+            )
+            enhanced_source[scale] = source_features[scale] + blend * (
+                source_value - source_features[scale]
+            )
+            enhanced_target[scale] = target_features[scale] + blend * (
+                target_value - target_features[scale]
+            )
+        return enhanced_source, enhanced_target
 
     def forward(
         self,
@@ -348,6 +577,12 @@ class HQSLMOpticalFlow(nn.Module):
         )
         target_match_raw = self.feature_encoder.project_matching(
             target_backbone
+        )
+        source_match_raw, target_match_raw = (
+            self._enhance_matching_features(
+                source_match_raw,
+                target_match_raw,
+            )
         )
         source_match = {
             scale: F.normalize(value, dim=1, eps=1e-6)
@@ -410,6 +645,10 @@ class HQSLMOpticalFlow(nn.Module):
         coupling_lows: List[torch.Tensor] = []
         delta_lows: List[torch.Tensor] = []
         data_delta_lows: List[torch.Tensor] = []
+        learned_proposal_delta_lows: List[torch.Tensor] = []
+        proposal_offset_lows: List[torch.Tensor] = []
+        analytic_match_proposal_lows: List[torch.Tensor] = []
+        matchability_lows: List[torch.Tensor] = []
         proximal_anchor_lows: List[torch.Tensor] = []
         reliability_lows: List[torch.Tensor] = []
         confidence_lows: List[torch.Tensor] = []
@@ -417,6 +656,8 @@ class HQSLMOpticalFlow(nn.Module):
         match_precision_lows: List[torch.Tensor] = []
         match_confidence_lows: List[torch.Tensor] = []
         match_entropy_lows: List[torch.Tensor] = []
+        correlation_attention_entropy_lows: List[torch.Tensor] = []
+        correlation_attention_peak_lows: List[torch.Tensor] = []
         feature_residual_lows: List[torch.Tensor] = []
         inverse_trace_lows: List[torch.Tensor] = []
         condition_lows: List[torch.Tensor] = []
@@ -445,7 +686,13 @@ class HQSLMOpticalFlow(nn.Module):
                     all_pairs = None
 
             cell = self.cells[str(scale)]
+            proposal_hidden = None
+            if hasattr(cell, "initialise_proposal_hidden"):
+                proposal_hidden = cell.initialise_proposal_hidden(
+                    source_context[scale]
+                )
             for iteration in range(self.iterations_by_scale[scale]):
+                previous_w = state.w
                 previous_z = state.z
                 correlation = self._raw_correlation(
                     scale,
@@ -455,7 +702,7 @@ class HQSLMOpticalFlow(nn.Module):
                     all_pairs,
                 )
                 grad_x, grad_y = target_gradients[scale]
-                update = cell(
+                cell_inputs = dict(
                     source_features=source_match[scale],
                     target_features=target_match[scale],
                     target_grad_x=grad_x,
@@ -469,6 +716,11 @@ class HQSLMOpticalFlow(nn.Module):
                     max_data_delta=self.max_data_delta[scale],
                     max_prox_delta=self.max_prox_delta[scale],
                 )
+                if hasattr(cell, "initialise_proposal_hidden"):
+                    cell_inputs["proposal_hidden"] = proposal_hidden
+                update = cell(**cell_inputs)
+                if update.proposal_hidden is not None:
+                    proposal_hidden = update.proposal_hidden
                 state = update.state
 
                 flow_lows.append(state.z)
@@ -476,6 +728,26 @@ class HQSLMOpticalFlow(nn.Module):
                 coupling_lows.append(state.w - state.z)
                 delta_lows.append(state.z - previous_z)
                 data_delta_lows.append(update.data_delta)
+                learned_proposal_delta_lows.append(
+                    update.learned_proposal_delta
+                    if update.learned_proposal_delta is not None
+                    else torch.zeros_like(update.data_delta)
+                )
+                proposal_offset_lows.append(
+                    update.proposal_offset
+                    if update.proposal_offset is not None
+                    else update.match_proposal - previous_w
+                )
+                analytic_match_proposal_lows.append(
+                    update.analytic_match_proposal
+                    if update.analytic_match_proposal is not None
+                    else update.match_proposal
+                )
+                matchability_lows.append(
+                    update.matchability
+                    if update.matchability is not None
+                    else update.match_confidence
+                )
                 proximal_anchor_lows.append(update.proximal_anchor)
                 reliability_lows.append(update.appearance_validity)
                 confidence_lows.append(update.data_confidence)
@@ -483,6 +755,16 @@ class HQSLMOpticalFlow(nn.Module):
                 match_precision_lows.append(update.match_precision)
                 match_confidence_lows.append(update.match_confidence)
                 match_entropy_lows.append(update.match_entropy)
+                correlation_attention_entropy_lows.append(
+                    update.correlation_attention_entropy
+                    if update.correlation_attention_entropy is not None
+                    else torch.zeros_like(update.match_entropy)
+                )
+                correlation_attention_peak_lows.append(
+                    update.correlation_attention_peak
+                    if update.correlation_attention_peak is not None
+                    else torch.zeros_like(update.match_confidence)
+                )
                 feature_residual_lows.append(update.feature_residual)
                 inverse_trace_lows.append(update.inverse_trace)
                 condition_lows.append(update.condition)
@@ -531,6 +813,15 @@ class HQSLMOpticalFlow(nn.Module):
             "analytic_delta_lows": data_delta_lows,
             # Explicitly zero: HQS-LM-OF has no learned vector data bypass.
             "learned_data_delta_lows": zero_data_residuals,
+            # Learned target-conditioned vectors are correspondence
+            # observations inside the normal equation, never post-solve
+            # additions to the data state.
+            "learned_proposal_delta_lows": learned_proposal_delta_lows,
+            "proposal_offset_lows": proposal_offset_lows,
+            "analytic_match_proposal_lows": (
+                analytic_match_proposal_lows
+            ),
+            "matchability_lows": matchability_lows,
             "proximal_anchor_lows": proximal_anchor_lows,
             # Visibility supervision must act on the learned appearance gate,
             # not on max(appearance, fixed correlation confidence), otherwise
@@ -546,6 +837,12 @@ class HQSLMOpticalFlow(nn.Module):
             "match_precision_lows": match_precision_lows,
             "match_confidence_lows": match_confidence_lows,
             "match_entropy_lows": match_entropy_lows,
+            "correlation_attention_entropy_lows": (
+                correlation_attention_entropy_lows
+            ),
+            "correlation_attention_peak_lows": (
+                correlation_attention_peak_lows
+            ),
             "feature_residual_lows": feature_residual_lows,
             "lm_inverse_trace_lows": inverse_trace_lows,
             "lm_condition_lows": condition_lows,
@@ -570,7 +867,11 @@ class HQSLMOpticalFlow(nn.Module):
             "reliability_residuals": [],
             "factorised_data_gates": [],
             "band_split": None,
-            "solver": "hqs_lm_of",
+            "feature_transformer_blends": {
+                key: torch.sigmoid(value)
+                for key, value in self.match_feature_transformer_logits.items()
+            },
+            "solver": self.solver_name,
         }
 
     def param_count(self) -> Dict[str, int]:
@@ -581,10 +882,16 @@ class HQSLMOpticalFlow(nn.Module):
         feature_count = (
             count(self.feature_encoder.stages)
             + count(self.feature_encoder.match_projections)
+            + count(self.match_feature_transformers)
+            + count(self.match_feature_transformer_logits)
         )
         stage_count = count(self.cells)
         return {
             "feature_encoder": feature_count,
+            "feature_transformer": count(
+                self.match_feature_transformers
+            )
+            + count(self.match_feature_transformer_logits),
             "context_encoder": context_count,
             "cells": stage_count,
             "final_upsampler": count(self.final_upsampler),
