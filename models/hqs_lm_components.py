@@ -48,16 +48,26 @@ def _groups(channels: int, requested: int) -> int:
 
 
 def bounded_vector(vector: torch.Tensor, maximum: float) -> torch.Tensor:
-    """Smoothly bound each per-pixel vector by ``maximum``."""
+    """Smoothly bound each per-pixel vector by ``maximum``.
+
+    The norm and scale are evaluated in float32.  This is important for
+    zero-initialised heads under AMP: ``1e-12`` underflows in float16 and the
+    unselected ``tanh(0) / 0`` branch of ``torch.where`` can otherwise inject
+    NaNs into backward.
+    """
     maximum = max(float(maximum), 1e-6)
-    norm = torch.sqrt(vector.square().sum(dim=1, keepdim=True) + 1e-12)
+    vector32 = vector.float()
+    norm = torch.sqrt(
+        vector32.square().sum(dim=1, keepdim=True).clamp_min(0.0) + 1e-12
+    )
     ratio = norm / maximum
+    large_scale = torch.tanh(ratio) / ratio.clamp_min(1e-6)
     scale = torch.where(
         ratio > 1e-4,
-        torch.tanh(ratio) / ratio,
+        large_scale,
         1.0 - ratio.square() / 3.0,
     )
-    return vector * scale
+    return (vector32 * scale).to(dtype=vector.dtype)
 
 
 def positive_map(
@@ -330,7 +340,12 @@ def solve_optical_lm_increment(
         + beta * (flow_w[:, 1:2].float() - flow_z[:, 1:2].float())
     )
 
-    determinant = (h11 * h22 - h12.square()).clamp_min(1e-8)
+    # The matrix is SPD by construction.  Use a relative determinant floor so
+    # nearly rank-one systems remain finite without allowing the inverse to
+    # explode merely because the matrix scale is small.
+    determinant_raw = h11 * h22 - h12.square()
+    determinant_floor = (1e-6 * h11 * h22).clamp_min(1e-8)
+    determinant = torch.maximum(determinant_raw, determinant_floor)
     delta_x = -(h22 * g1 - h12 * g2) / determinant
     delta_y = -(-h12 * g1 + h11 * g2) / determinant
     delta = torch.cat((delta_x, delta_y), dim=1).to(dtype=flow_w.dtype)
@@ -340,8 +355,10 @@ def solve_optical_lm_increment(
     )
     eigen_max = 0.5 * (h11 + h22 + discriminant)
     eigen_min = 0.5 * (h11 + h22 - discriminant)
-    condition = eigen_max / eigen_min.clamp_min(1e-8)
-    inverse_trace = (h11 + h22) / determinant
+    condition = (
+        eigen_max / eigen_min.clamp_min(1e-8)
+    ).clamp_max(1e6)
+    inverse_trace = ((h11 + h22) / determinant).clamp_max(1e6)
 
     return OpticalNormalEquation(
         delta=delta,
@@ -578,7 +595,12 @@ class SourceOnlyMotionProximal(nn.Module):
                 f"{analytic_proximal.shape[1]}"
             )
         guidance_edge = edge_magnitude(source_guidance)
-        uncertainty = torch.log1p(uncertainty.clamp_min(0.0))
+        # Diagnostic conditioning must never become an unbounded neural input.
+        # The solve itself remains unchanged; only the scalar feature supplied
+        # to the learned source-only proximal is clipped.
+        uncertainty = torch.log1p(
+            uncertainty.float().clamp(min=0.0, max=1e6)
+        ).to(dtype=analytic_proximal.dtype)
         inputs = torch.cat(
             (
                 analytic_proximal,

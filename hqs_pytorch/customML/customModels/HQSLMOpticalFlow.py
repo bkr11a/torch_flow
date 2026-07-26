@@ -397,6 +397,13 @@ class HQSLMOpticalFlow(nn.Module):
                     1.0,
                 )
             ),
+            maximum_attention_correlation_scale=float(
+                _cfg_get(
+                    model_cfg,
+                    "maximum_attention_correlation_scale",
+                    8.0,
+                )
+            ),
             charbonnier_epsilon=float(
                 _cfg_get(model_cfg, "charbonnier_epsilon", 0.03)
             ),
@@ -516,22 +523,33 @@ class HQSLMOpticalFlow(nn.Module):
             key = str(scale)
             if key not in self.match_feature_transformers:
                 continue
-            source_value, target_value = self.match_feature_transformers[key](
-                source_features[scale],
-                target_features[scale],
-            )
-            blend = torch.sigmoid(
-                self.match_feature_transformer_logits[key]
-            ).to(
-                device=source_value.device,
-                dtype=source_value.dtype,
-            )
-            enhanced_source[scale] = source_features[scale] + blend * (
-                source_value - source_features[scale]
-            )
-            enhanced_target[scale] = target_features[scale] + blend * (
-                target_value - target_features[scale]
-            )
+            # Multi-head attention is the most overflow-sensitive part of the
+            # feature pipeline.  Keep it in float32 even when the surrounding
+            # convolutional model is trained under autocast.
+            with torch.autocast(
+                device_type=source_features[scale].device.type,
+                enabled=False,
+            ):
+                source_base = source_features[scale].float()
+                target_base = target_features[scale].float()
+                source_value, target_value = (
+                    self.match_feature_transformers[key](
+                        source_base,
+                        target_base,
+                    )
+                )
+                blend = torch.sigmoid(
+                    self.match_feature_transformer_logits[key]
+                ).to(
+                    device=source_value.device,
+                    dtype=source_value.dtype,
+                )
+                enhanced_source[scale] = source_base + blend * (
+                    source_value - source_base
+                )
+                enhanced_target[scale] = target_base + blend * (
+                    target_value - target_base
+                )
         return enhanced_source, enhanced_target
 
     def forward(
@@ -585,11 +603,11 @@ class HQSLMOpticalFlow(nn.Module):
             )
         )
         source_match = {
-            scale: F.normalize(value, dim=1, eps=1e-6)
+            scale: F.normalize(value.float(), dim=1, eps=1e-6)
             for scale, value in source_match_raw.items()
         }
         target_match = {
-            scale: F.normalize(value, dim=1, eps=1e-6)
+            scale: F.normalize(value.float(), dim=1, eps=1e-6)
             for scale, value in target_match_raw.items()
         }
         # This is the only learned prior/context pyramid.

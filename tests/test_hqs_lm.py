@@ -11,6 +11,7 @@ from models.hqs_lm_components import (
     FeatureLinearisation,
     LocalMatchMeasurement,
     SourceOnlyMotionProximal,
+    bounded_vector,
     local_correlation_measurement,
     solve_optical_lm_increment,
 )
@@ -153,6 +154,13 @@ def test_local_correlation_measurement_decodes_zero_offset():
     assert measurement.confidence.min() > 0.99
 
 
+def test_zero_initialised_bounded_vector_has_finite_backward():
+    vector = torch.zeros(2, 2, 3, 4, requires_grad=True)
+    bounded_vector(vector, 2.0).sum().backward()
+    assert vector.grad is not None
+    assert torch.isfinite(vector.grad).all()
+
+
 def test_learned_measurement_decoder_outputs_valid_full_precision():
     batch, height, width = 2, 3, 5
     decoder = CorrelationProposalPrecisionDecoder(
@@ -227,6 +235,62 @@ def test_learned_measurement_decoder_outputs_valid_full_precision():
     )
 
 
+def test_learned_measurement_zero_gate_has_finite_backward():
+    decoder = CorrelationProposalPrecisionDecoder(
+        correlation_channels=9,
+        context_channels=8,
+        embedding_channels=8,
+        hidden_channels=8,
+        groups=4,
+        attention_channels=8,
+        attention_heads=2,
+    )
+    with torch.no_grad():
+        # Exercise the off-diagonal precision path while half the pixels are
+        # hard-gated out of bounds.
+        decoder.head[-1].bias[4] = 1.0
+        decoder.flow_attention.log_correlation_scale.fill_(100.0)
+
+    flow = torch.zeros(1, 2, 2, 2)
+    in_bounds = torch.tensor([[[[1.0, 0.0], [0.0, 1.0]]]])
+    analytic = LocalMatchMeasurement(
+        proposal=flow.clone(),
+        offset=flow.clone(),
+        confidence=torch.ones(1, 1, 2, 2),
+        entropy=torch.zeros(1, 1, 2, 2),
+        margin=torch.ones(1, 1, 2, 2),
+    )
+    linearisation = FeatureLinearisation(
+        residual=torch.zeros(1, 4, 2, 2),
+        jacobian_x=torch.zeros(1, 4, 2, 2),
+        jacobian_y=torch.zeros(1, 4, 2, 2),
+        in_bounds=in_bounds,
+    )
+    measurement = decoder(
+        correlation=torch.zeros(1, 9, 2, 2),
+        source_context=torch.zeros(1, 8, 2, 2),
+        linearisation=linearisation,
+        analytic_measurement=analytic,
+        flow_w=flow,
+        flow_z=flow,
+        beta_map=_scalar_map(0.1, 2, 2),
+        damping_map=_scalar_map(0.1, 2, 2),
+        hidden=None,
+    )
+    objective = (
+        measurement.proposal.sum()
+        + measurement.precision.sum()
+        + measurement.matchability.sum()
+    )
+    objective.backward()
+    assert torch.isfinite(measurement.precision).all()
+    assert all(
+        torch.isfinite(parameter.grad).all()
+        for parameter in decoder.parameters()
+        if parameter.grad is not None
+    )
+
+
 def test_learned_measurement_matchability_can_reject_a_match():
     decoder = CorrelationProposalPrecisionDecoder(
         correlation_channels=9,
@@ -293,6 +357,32 @@ def test_proposal_auxiliary_loss_respects_native_scale_units():
     assert torch.isfinite(proposal_loss)
     assert torch.isfinite(matchability_loss)
     assert proposal_loss < 2e-3
+
+
+def test_proposal_auxiliary_loss_masks_nonfinite_invalid_ground_truth():
+    criterion = HQSFlowLoss(
+        OmegaConf.create(
+            {
+                "proposal_supervision_weight": 0.02,
+                "proposal_matchability_weight": 0.002,
+            }
+        )
+    )
+    flow_gt = torch.zeros(1, 2, 4, 4)
+    flow_gt[..., 0, 0] = float("nan")
+    valid = torch.ones(1, 4, 4)
+    valid[..., 0, 0] = 0.0
+    proposal_loss, matchability_loss = criterion._proposal_measurement_loss(
+        [torch.zeros(1, 2, 4, 4)],
+        [torch.full((1, 1, 4, 4), 0.9)],
+        flow_gt,
+        valid,
+        None,
+        None,
+        None,
+    )
+    assert torch.isfinite(proposal_loss)
+    assert torch.isfinite(matchability_loss)
 
 
 def test_source_only_proximal_interface_rejects_target_evidence_by_design():

@@ -96,6 +96,7 @@ class FlowConditionedCorrelationAttention(nn.Module):
         num_heads: int = 4,
         groups: int = 8,
         temperature: float = 1.0,
+        maximum_correlation_scale: float = 8.0,
     ) -> None:
         super().__init__()
         correlation_channels = int(correlation_channels)
@@ -114,12 +115,19 @@ class FlowConditionedCorrelationAttention(nn.Module):
             )
         if float(temperature) <= 0.0:
             raise ValueError("attention temperature must be positive")
+        if float(maximum_correlation_scale) < 1.0:
+            raise ValueError(
+                "maximum_correlation_scale must be at least one"
+            )
 
         self.correlation_channels = correlation_channels
         self.attention_channels = attention_channels
         self.num_heads = num_heads
         self.head_channels = attention_channels // num_heads
         self.temperature = float(temperature)
+        self.maximum_correlation_scale = float(
+            maximum_correlation_scale
+        )
 
         query_channels = (
             int(context_channels) + int(statistic_channels) + 1
@@ -230,7 +238,11 @@ class FlowConditionedCorrelationAttention(nn.Module):
             query,
             self.hypothesis_keys.float(),
         ) / math.sqrt(float(self.head_channels))
-        correlation_scale = self.log_correlation_scale.float().exp().view(
+        log_scale_max = math.log(self.maximum_correlation_scale)
+        correlation_scale = self.log_correlation_scale.float().clamp(
+            min=-log_scale_max,
+            max=log_scale_max,
+        ).exp().view(
             1, self.num_heads, 1, 1, 1
         )
         logits = (
@@ -299,6 +311,7 @@ class CorrelationProposalPrecisionDecoder(nn.Module):
         attention_channels: int = 32,
         attention_heads: int = 4,
         attention_temperature: float = 1.0,
+        maximum_attention_correlation_scale: float = 8.0,
     ) -> None:
         super().__init__()
         if int(correlation_channels) < 1:
@@ -339,6 +352,9 @@ class CorrelationProposalPrecisionDecoder(nn.Module):
             num_heads=int(attention_heads),
             groups=groups,
             temperature=float(attention_temperature),
+            maximum_correlation_scale=float(
+                maximum_attention_correlation_scale
+            ),
         )
         input_channels = (
             int(embedding_channels)
@@ -392,9 +408,60 @@ class CorrelationProposalPrecisionDecoder(nn.Module):
             self.head[-1].bias[5] = _logit(initial_matchability)
 
     def initialise_hidden(self, source_context: torch.Tensor) -> torch.Tensor:
-        return torch.tanh(self.hidden_initialiser(source_context))
+        with torch.autocast(
+            device_type=source_context.device.type,
+            enabled=False,
+        ):
+            return torch.tanh(
+                self.hidden_initialiser(source_context.float())
+            )
 
     def forward(
+        self,
+        *,
+        correlation: torch.Tensor,
+        source_context: torch.Tensor,
+        linearisation: FeatureLinearisation,
+        analytic_measurement: LocalMatchMeasurement,
+        flow_w: torch.Tensor,
+        flow_z: torch.Tensor,
+        beta_map: torch.Tensor,
+        damping_map: torch.Tensor,
+        hidden: Optional[torch.Tensor],
+        iteration_fraction: float = 0.0,
+    ) -> LearnedCorrespondenceMeasurement:
+        """Decode the probabilistic observation in an AMP-safe FP32 island."""
+        linearisation32 = FeatureLinearisation(
+            residual=linearisation.residual.float(),
+            jacobian_x=linearisation.jacobian_x.float(),
+            jacobian_y=linearisation.jacobian_y.float(),
+            in_bounds=linearisation.in_bounds.float(),
+        )
+        analytic32 = LocalMatchMeasurement(
+            proposal=analytic_measurement.proposal.float(),
+            offset=analytic_measurement.offset.float(),
+            confidence=analytic_measurement.confidence.float(),
+            entropy=analytic_measurement.entropy.float(),
+            margin=analytic_measurement.margin.float(),
+        )
+        with torch.autocast(
+            device_type=correlation.device.type,
+            enabled=False,
+        ):
+            return self._forward_fp32(
+                correlation=correlation.float(),
+                source_context=source_context.float(),
+                linearisation=linearisation32,
+                analytic_measurement=analytic32,
+                flow_w=flow_w.float(),
+                flow_z=flow_z.float(),
+                beta_map=beta_map.float(),
+                damping_map=damping_map.float(),
+                hidden=None if hidden is None else hidden.float(),
+                iteration_fraction=iteration_fraction,
+            )
+
+    def _forward_fp32(
         self,
         *,
         correlation: torch.Tensor,
@@ -496,7 +563,13 @@ class CorrelationProposalPrecisionDecoder(nn.Module):
         )
         p11 = gate * diagonal_x
         p22 = gate * diagonal_y
-        p12 = rho * torch.sqrt((p11 * p22).clamp_min(0.0))
+        # Apply the hard observation gate *after* constructing the smooth SPD
+        # base matrix.  Taking sqrt(p11*p22) after p11/p22 have been hard-gated
+        # to zero has a singular derivative at out-of-bounds pixels.
+        base_cross_scale = torch.sqrt(
+            (diagonal_x * diagonal_y).clamp_min(1e-8)
+        )
+        p12 = gate * rho * base_cross_scale
         precision = torch.cat((p11, p12, p22), dim=1)
 
         return LearnedCorrespondenceMeasurement(
@@ -547,6 +620,7 @@ class HQSOpticalLearnedMeasurementCell(nn.Module):
         correlation_attention_channels: int = 32,
         correlation_attention_heads: int = 4,
         correlation_attention_temperature: float = 1.0,
+        maximum_attention_correlation_scale: float = 8.0,
         charbonnier_epsilon: float = 0.03,
         charbonnier_alpha: float = 0.45,
     ) -> None:
@@ -579,6 +653,9 @@ class HQSOpticalLearnedMeasurementCell(nn.Module):
             attention_channels=correlation_attention_channels,
             attention_heads=correlation_attention_heads,
             attention_temperature=correlation_attention_temperature,
+            maximum_attention_correlation_scale=(
+                maximum_attention_correlation_scale
+            ),
         )
         self.analytic_proximal = VectorEdgeAwareJacobiProx(
             edge_alpha=edge_alpha,

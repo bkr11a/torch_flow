@@ -77,6 +77,42 @@ def _sanitize_metric_dict(d: Dict[str, object]) -> Dict[str, float]:
     return out
 
 
+def _nonfinite_tensor_paths(
+    value: object,
+    *,
+    prefix: str,
+    limit: int = 12,
+) -> list[str]:
+    """Return a compact path list for tensors containing NaN or Inf.
+
+    This helper is only called after the scalar training loss is already
+    non-finite, so its GPU synchronisations do not affect healthy training.
+    """
+    found: list[str] = []
+
+    def visit(item: object, path: str) -> None:
+        if len(found) >= int(limit):
+            return
+        if isinstance(item, torch.Tensor):
+            if item.numel() and not bool(torch.isfinite(item).all().item()):
+                nonfinite = int((~torch.isfinite(item)).sum().item())
+                found.append(
+                    f"{path} shape={tuple(item.shape)} "
+                    f"dtype={item.dtype} nonfinite={nonfinite}/{item.numel()}"
+                )
+            return
+        if isinstance(item, dict):
+            for key, child in item.items():
+                visit(child, f"{path}.{key}")
+            return
+        if isinstance(item, (list, tuple)):
+            for index, child in enumerate(item):
+                visit(child, f"{path}[{index}]")
+
+    visit(value, prefix)
+    return found
+
+
 # ---------------------------------------------------------------------------
 # Running mean accumulator
 # ---------------------------------------------------------------------------
@@ -246,7 +282,14 @@ class Trainer:
 
         # ── Device ──────────────────────────────────────────────────────────
         self.device = get_device(cfg.get("device", None))
-        logger.info(f"Device: {self.device}  (AMP={'enabled' if amp_enabled(self.device) else 'disabled'})")
+        self._use_amp = (
+            amp_enabled(self.device)
+            and bool(cfg.training.get("amp", True))
+        )
+        logger.info(
+            f"Device: {self.device}  "
+            f"(AMP={'enabled' if self._use_amp else 'disabled'})"
+        )
 
         # ── Model ────────────────────────────────────────────────────────────
         self.model = build_model(cfg).to(self.device)
@@ -285,7 +328,6 @@ class Trainer:
         )
 
         # ── Mixed precision ───────────────────────────────────────────────────
-        self._use_amp = amp_enabled(self.device)
         self.scaler = torch.amp.GradScaler("cuda", enabled=self._use_amp) if self._use_amp else torch.amp.GradScaler("cpu", enabled=False)
 
         # ── Data ─────────────────────────────────────────────────────────────
@@ -759,6 +801,20 @@ class Trainer:
                 occlusion=occ_batch,
                 invalid=inv_batch,
                 synthetic_occlusion=synthetic_occ_batch,
+            )
+
+        if (
+            bool(self.cfg.training.get("fail_on_nonfinite", False))
+            and not bool(torch.isfinite(loss_dict["loss"]).all().item())
+        ):
+            paths = _nonfinite_tensor_paths(out, prefix="model")
+            paths.extend(
+                _nonfinite_tensor_paths(loss_dict, prefix="loss")
+            )
+            detail = "; ".join(paths) if paths else "source not localised"
+            raise FloatingPointError(
+                "Non-finite training loss at global step "
+                f"{self.global_step}. First affected tensors: {detail}"
             )
 
         self.scaler.scale(loss_dict["loss"]).backward()

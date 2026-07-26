@@ -690,8 +690,18 @@ class HQSFlowLoss(nn.Module):
             reliable_low = F.interpolate(
                 reliable, size=proposal.shape[-2:], mode="nearest"
             )
-            proposal_weight = visible_low * reliable_low
-            proposal_point = charbonnier(proposal - gt_low).mean(
+            finite_gt = torch.isfinite(gt_low).all(
+                dim=1, keepdim=True
+            )
+            proposal_weight = (
+                visible_low * reliable_low * finite_gt.to(reliable_low)
+            )
+            gt_safe = torch.where(
+                finite_gt.expand_as(gt_low),
+                gt_low,
+                torch.zeros_like(gt_low),
+            )
+            proposal_point = charbonnier(proposal - gt_safe).mean(
                 dim=1, keepdim=True
             )
             proposal_terms.append(
@@ -708,7 +718,7 @@ class HQSFlowLoss(nn.Module):
                     mode="bilinear",
                     align_corners=False,
                 )
-            proposal_epe = (proposal - gt_low).square().sum(
+            proposal_epe = (proposal - gt_safe).square().sum(
                 dim=1, keepdim=True
             ).sqrt()
             matchability_target = visible_low * torch.exp(
@@ -722,8 +732,8 @@ class HQSFlowLoss(nn.Module):
                 + (1.0 - target) * (1.0 - probability).log()
             )
             matchability_terms.append(
-                (point * reliable_low.float()).sum()
-                / reliable_low.sum().clamp_min(1.0)
+                (point * proposal_weight.float()).sum()
+                / proposal_weight.sum().clamp_min(1.0)
             )
 
         zero = flow_gt.new_zeros(())

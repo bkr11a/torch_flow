@@ -81,6 +81,9 @@ model:
     correlation_attention_channels: [32, 32, 32, 32]
     correlation_attention_heads: [4, 4, 4, 4]
     correlation_attention_temperature: 1.0
+    # Prevent the learned raw-correlation attention gain from growing without
+    # bound and overflowing the softmax logits under mixed precision.
+    maximum_attention_correlation_scale: 8.0
 
     # Full correspondence precision P=[p_xx,p_xy,p_yy]. Matchability gates
     # the entire matrix and may approach zero. The bounded correlation
@@ -156,9 +159,13 @@ loss:
     enabled: false
 
 training:
+  amp: true
   global_matcher_warmup_steps: 0
   freeze_backbone_during_global_warmup: false
   grad_clip: 1.0
+  # Stop at the first failed batch and report the affected internal tensor
+  # instead of silently averaging earlier finite batches around a NaN.
+  fail_on_nonfinite: true
 
 data:
   detail_crop_prob: 0.0
