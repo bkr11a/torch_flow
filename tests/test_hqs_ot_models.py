@@ -99,7 +99,7 @@ def test_hqs_field_v2_overlay_retransports_without_initial_state_bias():
     assert cfg.loss.num_stages == 10
 
 
-def test_blockwise_dustbin_sinkhorn_satisfies_small_problem_marginals():
+def test_blockwise_dustbin_sinkhorn_satisfies_multi_batch_marginals():
     matcher = BlockwiseDustbinSinkhorn(
         temperature=0.2,
         sinkhorn_iterations=40,
@@ -110,7 +110,8 @@ def test_blockwise_dustbin_sinkhorn_satisfies_small_problem_marginals():
         maximum_tokens=8,
         gradient_checkpointing=False,
     )
-    source = torch.randn(1, 4, 2, 2)
+    batch = 3
+    source = torch.randn(batch, 4, 2, 2)
     target = torch.randn_like(source)
     measurement = matcher(source, target)
     source_flat = torch.nn.functional.normalize(
@@ -142,12 +143,12 @@ def test_blockwise_dustbin_sinkhorn_satisfies_small_problem_marginals():
     )
     assert torch.allclose(
         real_plan.sum(-1) + source_bin,
-        torch.ones(1, tokens),
+        torch.ones(batch, tokens),
         atol=2e-4,
     )
     assert torch.allclose(
         real_plan.sum(1) + target_bin,
-        torch.ones(1, tokens),
+        torch.ones(batch, tokens),
         atol=2e-4,
     )
 

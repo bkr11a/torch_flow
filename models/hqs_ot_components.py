@@ -306,7 +306,7 @@ class BlockwiseDustbinSinkhorn(nn.Module):
         real = score + dual_target_real.unsqueeze(1)
         bin_column = (
             self.dustbin_score.float() + dual_target_bin
-        ).expand(source_chunk.shape[0], source_chunk.shape[1], 1)
+        ).unsqueeze(1).expand(-1, source_chunk.shape[1], -1)
         return torch.logsumexp(torch.cat((real, bin_column), dim=-1), dim=-1)
 
     def _column_logsumexp(
@@ -340,7 +340,7 @@ class BlockwiseDustbinSinkhorn(nn.Module):
         real = score + dual_source_real.unsqueeze(-1)
         bin_row = (
             self.dustbin_score.float() + dual_source_bin
-        ).expand(source.shape[0], 1, target_chunk.shape[1])
+        ).unsqueeze(-1).expand(-1, -1, target_chunk.shape[1])
         return torch.logsumexp(torch.cat((real, bin_row), dim=1), dim=1)
 
     def _decode_block(
