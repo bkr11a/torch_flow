@@ -48,7 +48,7 @@ curriculum:
         mode: single
         name: chairs
         root: "/mnt/a/benchmark_data/optical_flow/FlyingChairs_release"
-        batch_size: 6
+        batch_size: 4
         num_workers: 4
         crop_size: [368, 496]
         min_scale: -0.1
@@ -117,7 +117,7 @@ curriculum:
         dstype: clean
         side: both
         direction: forward
-        batch_size: 4
+        batch_size: 2
         num_workers: 4
         crop_size: [400, 720]
         min_scale: -0.2
@@ -185,7 +185,7 @@ curriculum:
         deterministic: false
         seed: 31003
         include_dataset_id: true
-        batch_size: 4
+        batch_size: 2
         num_workers: 4
         crop_size: [400, 720]
         min_scale: -0.2
@@ -262,7 +262,7 @@ curriculum:
         deterministic: false
         seed: 41004
         include_dataset_id: true
-        batch_size: 4
+        batch_size: 2
         num_workers: 4
         crop_size: [320, 768]
         min_scale: -0.2

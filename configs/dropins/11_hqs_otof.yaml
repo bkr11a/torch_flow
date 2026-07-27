@@ -176,7 +176,6 @@ training:
 # blockwise FP32 Sinkhorn normalization.
 # Curriculum stage data settings must retain batch_size=1 for this model.
 data:
-  batch_size: 2
   detail_crop_prob: 0.10
 
 val_data:
