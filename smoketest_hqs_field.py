@@ -69,8 +69,13 @@ def main() -> None:
     assert final.shape == (1, 2, 32, 48)
     assert torch.isfinite(final).all()
     assert output["solver"] == "hqs_field_of"
-    assert len(output["flow_preds"]) == 4
-    assert len(output["hypothesis_proposal_lows"]) == 4
+    expected_stages = sum(
+        int(value) for value in cfg.model.hqs_field_of.iterations
+    )
+    assert int(cfg.loss.num_stages) == expected_stages
+    assert len(output["flow_preds"]) == expected_stages
+    assert len(output["hypothesis_proposal_lows"]) == expected_stages
+    assert len(output["learned_data_delta_lows"]) == expected_stages
     assert all(
         torch.count_nonzero(value) == 0
         for value in output["learned_data_delta_lows"]
