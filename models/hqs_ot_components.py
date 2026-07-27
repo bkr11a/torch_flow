@@ -1019,26 +1019,33 @@ class SourceSemanticGraphProximal(nn.Module):
             )
 
     def _adjacency(self, source_embedding: torch.Tensor) -> torch.Tensor:
-        flat = source_embedding.flatten(2).transpose(1, 2)
-        similarity = torch.bmm(flat, flat.transpose(1, 2))
-        tokens = similarity.shape[-1]
-        diagonal = torch.eye(
-            tokens, device=similarity.device, dtype=torch.bool
-        ).unsqueeze(0)
-        similarity_for_topk = similarity.masked_fill(diagonal, -1e4)
-        neighbours = min(self.neighbours, max(tokens - 1, 1))
-        indices = similarity_for_topk.topk(
-            k=neighbours, dim=-1
-        ).indices
-        selected = torch.gather(similarity, dim=-1, index=indices)
-        weights = torch.exp(
-            (selected - 1.0) / self.feature_temperature
-        )
-        adjacency = torch.zeros_like(similarity).scatter(
-            dim=-1, index=indices, src=weights
-        )
-        adjacency = 0.5 * (adjacency + adjacency.transpose(1, 2))
-        return adjacency.masked_fill(diagonal, 0.0)
+        # This graph is part of the numerical proximal solve.  An outer AMP
+        # context may otherwise autocast ``bmm`` while leaving the pointwise
+        # affinity calculation in FP32, which gives ``scatter`` mismatched
+        # destination/source dtypes and weakens the PSD solve numerically.
+        with torch.autocast(
+            device_type=source_embedding.device.type, enabled=False
+        ):
+            flat = source_embedding.float().flatten(2).transpose(1, 2)
+            similarity = torch.bmm(flat, flat.transpose(1, 2))
+            tokens = similarity.shape[-1]
+            diagonal = torch.eye(
+                tokens, device=similarity.device, dtype=torch.bool
+            ).unsqueeze(0)
+            similarity_for_topk = similarity.masked_fill(diagonal, -1e4)
+            neighbours = min(self.neighbours, max(tokens - 1, 1))
+            indices = similarity_for_topk.topk(
+                k=neighbours, dim=-1
+            ).indices
+            selected = torch.gather(similarity, dim=-1, index=indices)
+            weights = torch.exp(
+                (selected - 1.0) / self.feature_temperature
+            )
+            adjacency = torch.zeros_like(similarity).scatter(
+                dim=-1, index=indices, src=weights
+            )
+            adjacency = 0.5 * (adjacency + adjacency.transpose(1, 2))
+            return adjacency.masked_fill(diagonal, 0.0)
 
     def forward(
         self,
@@ -1062,32 +1069,40 @@ class SourceSemanticGraphProximal(nn.Module):
                 f"maximum_tokens={self.maximum_tokens}; use this proximal only "
                 "on configured coarse scales."
             )
-        adjacency = self._adjacency(source_embedding.float())
-        degree = adjacency.sum(dim=-1, keepdim=True)
-        support = measurement_support.float().flatten(2).transpose(1, 2)
-        beta = beta_map.float().flatten(2).transpose(1, 2)
-        inertia = inertia_map.float().flatten(2).transpose(1, 2)
-        regularisation = (
-            regularisation_map.float().flatten(2).transpose(1, 2)
-        )
-        anchor = beta * (
-            self.anchor_floor + (1.0 - self.anchor_floor) * support
-        )
-        data = data_state.float().flatten(2).transpose(1, 2)
-        previous = previous_proximal.float().flatten(2).transpose(1, 2)
-        current = previous
-        for _ in range(max(int(sweeps), 1)):
-            neighbour_sum = torch.bmm(adjacency, current)
-            current = (
-                anchor * data
-                + inertia * previous
-                + regularisation * neighbour_sum
-            ) / (
-                anchor + inertia + regularisation * degree
-            ).clamp_min(1e-6)
-        return current.transpose(1, 2).reshape(
-            batch, 2, height, width
-        ).to(data_state)
+        with torch.autocast(
+            device_type=data_state.device.type, enabled=False
+        ):
+            adjacency = self._adjacency(source_embedding)
+            degree = adjacency.sum(dim=-1, keepdim=True)
+            support = (
+                measurement_support.float().flatten(2).transpose(1, 2)
+            )
+            beta = beta_map.float().flatten(2).transpose(1, 2)
+            inertia = inertia_map.float().flatten(2).transpose(1, 2)
+            regularisation = (
+                regularisation_map.float().flatten(2).transpose(1, 2)
+            )
+            anchor = beta * (
+                self.anchor_floor + (1.0 - self.anchor_floor) * support
+            )
+            data = data_state.float().flatten(2).transpose(1, 2)
+            previous = (
+                previous_proximal.float().flatten(2).transpose(1, 2)
+            )
+            current = previous
+            for _ in range(max(int(sweeps), 1)):
+                neighbour_sum = torch.bmm(adjacency, current)
+                current = (
+                    anchor * data
+                    + inertia * previous
+                    + regularisation * neighbour_sum
+                ) / (
+                    anchor + inertia + regularisation * degree
+                ).clamp_min(1e-6)
+            result = current.transpose(1, 2).reshape(
+                batch, 2, height, width
+            )
+        return result.to(data_state)
 
 
 class TransportFieldCell(nn.Module):

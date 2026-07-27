@@ -281,6 +281,36 @@ def test_semantic_graph_is_symmetric_nonnegative_and_preserves_constants():
     assert torch.allclose(result, field, atol=1e-5)
 
 
+def test_semantic_graph_proximal_has_amp_safe_fp32_solve_boundary():
+    proximal = SourceSemanticGraphProximal(
+        context_channels=4,
+        embedding_channels=4,
+        groups=1,
+        neighbours=2,
+        maximum_tokens=16,
+    )
+    context = torch.randn(2, 4, 3, 3)
+    field = torch.ones(2, 2, 3, 3, dtype=torch.bfloat16)
+    scalar = torch.ones(2, 1, 3, 3, dtype=torch.bfloat16) * 0.1
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        embedding = proximal.prepare(context)
+        adjacency = proximal._adjacency(embedding)
+        result = proximal(
+            data_state=field,
+            previous_proximal=field,
+            source_embedding=embedding,
+            measurement_support=torch.zeros_like(scalar),
+            beta_map=scalar,
+            regularisation_map=scalar,
+            inertia_map=scalar,
+            sweeps=2,
+        )
+    assert adjacency.dtype == torch.float32
+    assert result.dtype == field.dtype
+    assert torch.isfinite(result.float()).all()
+    assert torch.allclose(result.float(), field.float(), atol=1e-5)
+
+
 def test_transport_field_cell_has_no_target_vector_bypass_interface():
     parameters = set(inspect.signature(TransportFieldCell.forward).parameters)
     forbidden = {
