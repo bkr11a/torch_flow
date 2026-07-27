@@ -428,6 +428,21 @@ class HQSFlowLoss(nn.Module):
         self.proposal_supervision_last_n = int(
             cfg.get("proposal_supervision_last_n", 0)
         )
+        # Optional supervision for HQS-Field-OF's retained correspondence
+        # mixture. Unlike a mean-proposal loss, this objective does not force
+        # spatially separated modes to collapse before the analytic solve.
+        self.mixture_supervision_weight = float(
+            cfg.get("mixture_supervision_weight", 0.0)
+        )
+        self.mixture_matchability_weight = float(
+            cfg.get("mixture_matchability_weight", 0.0)
+        )
+        self.mixture_supervision_temperature = float(
+            cfg.get("mixture_supervision_temperature", 1.0)
+        )
+        self.mixture_supervision_last_n = int(
+            cfg.get("mixture_supervision_last_n", 0)
+        )
 
         occ_cfg = cfg.get("occlusion_aware", {})
         self.occlusion_aware_enabled = bool(occ_cfg.get("enabled", False))
@@ -746,6 +761,127 @@ class HQSFlowLoss(nn.Module):
             else zero
         )
         return proposal_loss, matchability_loss
+
+    def _mixture_measurement_loss(
+        self,
+        hypotheses: List[torch.Tensor],
+        logits: List[torch.Tensor],
+        matchabilities: List[torch.Tensor],
+        flow_gt: torch.Tensor,
+        valid: torch.Tensor,
+        occlusion: Optional[torch.Tensor],
+        invalid: Optional[torch.Tensor],
+        synthetic_occlusion: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Supervise a correspondence mixture without collapsing its modes."""
+        visibility, reliable = self._visibility_targets(
+            flow_gt,
+            valid,
+            occlusion,
+            invalid,
+            synthetic_occlusion,
+        )
+        triples = list(zip(hypotheses, logits, matchabilities))
+        if self.mixture_supervision_last_n > 0:
+            triples = triples[-self.mixture_supervision_last_n :]
+
+        likelihood_terms: List[torch.Tensor] = []
+        matchability_terms: List[torch.Tensor] = []
+        temperature = max(self.mixture_supervision_temperature, 1e-6)
+        for proposals, mixture_logits, matchability in triples:
+            if (
+                not isinstance(proposals, torch.Tensor)
+                or proposals.ndim != 5
+                or proposals.shape[2] != 2
+                or not isinstance(mixture_logits, torch.Tensor)
+            ):
+                continue
+            size = proposals.shape[-2:]
+            gt_low = self._resize_flow_gt(flow_gt, size)
+            visible_low = F.interpolate(
+                visibility, size=size, mode="nearest"
+            )
+            reliable_low = F.interpolate(
+                reliable, size=size, mode="nearest"
+            )
+            finite_gt = torch.isfinite(gt_low).all(
+                dim=1, keepdim=True
+            )
+            gt_safe = torch.where(
+                finite_gt.expand_as(gt_low),
+                gt_low,
+                torch.zeros_like(gt_low),
+            )
+            point = charbonnier(
+                proposals - gt_safe.unsqueeze(1)
+            ).mean(dim=2)
+            log_probability = torch.log_softmax(
+                mixture_logits.float(), dim=1
+            )
+            mixture_nll = -torch.logsumexp(
+                log_probability - point.float() / temperature,
+                dim=1,
+                keepdim=True,
+            )
+            proposal_weight = (
+                visible_low
+                * reliable_low
+                * finite_gt.to(reliable_low)
+            ).float()
+            likelihood_terms.append(
+                (mixture_nll * proposal_weight).sum()
+                / proposal_weight.sum().clamp_min(1.0)
+            )
+
+            if not isinstance(matchability, torch.Tensor):
+                continue
+            if matchability.shape[-2:] != size:
+                matchability = F.interpolate(
+                    matchability,
+                    size=size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            hypothesis_epe = (
+                proposals - gt_safe.unsqueeze(1)
+            ).square().sum(dim=2).sqrt()
+            closest_epe = hypothesis_epe.min(
+                dim=1, keepdim=True
+            ).values
+            matchability_target = visible_low * torch.exp(
+                -closest_epe.detach()
+                / max(self.proposal_confidence_tau, 1e-6)
+            )
+            probability = matchability.float().clamp(
+                1e-5, 1.0 - 1e-5
+            )
+            target = matchability_target.float()
+            bce = -(
+                target * probability.log()
+                + (1.0 - target) * (1.0 - probability).log()
+            )
+            # Unlike proposal regression, matchability must also learn from
+            # reliable invisible pixels, whose target is zero.
+            match_weight = (
+                reliable_low * finite_gt.to(reliable_low)
+            ).float()
+            matchability_terms.append(
+                (bce * match_weight).sum()
+                / match_weight.sum().clamp_min(1.0)
+            )
+
+        zero = flow_gt.new_zeros(())
+        likelihood = (
+            torch.stack(likelihood_terms).mean()
+            if likelihood_terms
+            else zero
+        )
+        matchability_loss = (
+            torch.stack(matchability_terms).mean()
+            if matchability_terms
+            else zero
+        )
+        return likelihood, matchability_loss
 
     def _factorised_reliability_loss(
         self,
@@ -1146,6 +1282,41 @@ class HQSFlowLoss(nn.Module):
                     total
                     + self.proposal_supervision_weight * proposal_loss
                     + self.proposal_matchability_weight * matchability_loss
+                )
+
+            hypotheses = model_outputs.get("hypothesis_proposal_lows")
+            mixture_logits = model_outputs.get("hypothesis_logits_lows")
+            if (
+                isinstance(hypotheses, list)
+                and hypotheses
+                and isinstance(mixture_logits, list)
+                and len(hypotheses) == len(mixture_logits)
+                and isinstance(matchabilities, list)
+                and len(hypotheses) == len(matchabilities)
+                and (
+                    self.mixture_supervision_weight > 0
+                    or self.mixture_matchability_weight > 0
+                )
+            ):
+                mixture_loss, mixture_matchability = (
+                    self._mixture_measurement_loss(
+                        hypotheses,
+                        mixture_logits,
+                        matchabilities,
+                        flow_gt,
+                        valid,
+                        occlusion,
+                        invalid,
+                        synthetic_occlusion,
+                    )
+                )
+                out["mixture_supervision"] = mixture_loss
+                out["mixture_matchability"] = mixture_matchability
+                total = (
+                    total
+                    + self.mixture_supervision_weight * mixture_loss
+                    + self.mixture_matchability_weight
+                    * mixture_matchability
                 )
 
         if self.occlusion_aware_enabled and isinstance(model_outputs, dict):

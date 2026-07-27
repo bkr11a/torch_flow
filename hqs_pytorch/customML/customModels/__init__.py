@@ -14,6 +14,7 @@ __all__ = [
     'HQSFlowModelTFPort',
     'HQSCore',
     'HQSLMOpticalFlow',
+    'HQSFieldOpticalFlow',
     'HQSLMSceneFlow',
 ]
 
@@ -24,6 +25,7 @@ def __getattr__(name: str):
         "HQSFlowModelTFPort",
         "HQSCore",
         "HQSLMOpticalFlow",
+        "HQSFieldOpticalFlow",
         "HQSLMSceneFlow",
     }:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

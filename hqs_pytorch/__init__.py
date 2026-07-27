@@ -19,6 +19,7 @@ __all__ = [
     "OpticalFlowPhysicsLoss",
     "HQSFlowModel",
     "HQSLMOpticalFlow",
+    "HQSFieldOpticalFlow",
     "HQSLMSceneFlow",
     "OpticalFlowFeatureEncoder",
     "OpticalFlowContextEncoder",
@@ -35,6 +36,9 @@ def __getattr__(name: str):
     module_by_name = {
         "HQSFlowModel": ".customML.customModels.HQSFlowModel",
         "HQSLMOpticalFlow": ".customML.customModels.HQSLMOpticalFlow",
+        "HQSFieldOpticalFlow": (
+            ".customML.customModels.HQSFieldOpticalFlow"
+        ),
         "HQSLMSceneFlow": ".customML.customModels.HQSLMSceneFlow",
     }
     if name not in module_by_name:

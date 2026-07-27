@@ -15,10 +15,10 @@ def test_public_and_leaf_imports_do_not_cycle():
         (
             "from hqs_pytorch.customML.customModels.occlusion_geometry import FlowGeometry",
             "from hqs_pytorch import HQSFlowModel",
-            "from hqs_pytorch.customML.customModels import HQSCore, HQSLMOpticalFlow, HQSLMSceneFlow",
+            "from hqs_pytorch.customML.customModels import HQSCore, HQSLMOpticalFlow, HQSFieldOpticalFlow, HQSLMSceneFlow",
             "from models import build_model",
             "from losses import HQSFlowLoss, HQSSceneFlowLoss",
-            "assert all(x is not None for x in (FlowGeometry, HQSFlowModel, HQSCore, HQSLMOpticalFlow, HQSLMSceneFlow, build_model, HQSFlowLoss, HQSSceneFlowLoss))",
+            "assert all(x is not None for x in (FlowGeometry, HQSFlowModel, HQSCore, HQSLMOpticalFlow, HQSFieldOpticalFlow, HQSLMSceneFlow, build_model, HQSFlowLoss, HQSSceneFlowLoss))",
         )
     )
     result = subprocess.run(

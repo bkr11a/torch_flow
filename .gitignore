@@ -34,3 +34,6 @@ results/
 
 # Windows metadata artifacts
 *:Zone.Identifier
+
+# Ensure no patch files are committed
+*.patch

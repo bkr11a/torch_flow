@@ -316,6 +316,121 @@ class AllPairsCorrelation:
         result = torch.cat(outputs, dim=-1)
         return result.transpose(1, 2).reshape(b, self.out_channels, h, w)
 
+    def global_topk_match(
+        self,
+        *,
+        num_hypotheses: int = 4,
+        temperature: float = 0.07,
+        query_chunk_size: int = 512,
+        reverse: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """Return global MAP correspondence modes without soft averaging.
+
+        ``reverse=False`` decodes source-to-target hypotheses.  ``reverse=True``
+        decodes target-to-source hypotheses from the transpose of the same
+        all-pairs matrix, so bidirectional cycle support requires no duplicate
+        correlation volume.
+        """
+        hypotheses = int(num_hypotheses)
+        temperature = max(float(temperature), 1e-4)
+        chunk = max(int(query_chunk_size), 1)
+        matrix = (
+            self.base_correlation.transpose(1, 2)
+            if bool(reverse)
+            else self.base_correlation
+        )
+        b, n, m = matrix.shape
+        if not 1 <= hypotheses <= m:
+            raise ValueError(
+                f"num_hypotheses must be in [1,{m}], got {hypotheses}"
+            )
+        key_coords = coords_grid(
+            1, self.height, self.width, matrix.device
+        ).to(torch.float32)
+        key_coords = key_coords.flatten(2).transpose(1, 2).squeeze(0)
+        query_coords = key_coords
+        log_m = math.log(max(m, 2))
+
+        flow_chunks: List[torch.Tensor] = []
+        logit_chunks: List[torch.Tensor] = []
+        probability_chunks: List[torch.Tensor] = []
+        confidence_chunks: List[torch.Tensor] = []
+        entropy_chunks: List[torch.Tensor] = []
+        margin_chunks: List[torch.Tensor] = []
+        peak_chunks: List[torch.Tensor] = []
+        retained_chunks: List[torch.Tensor] = []
+
+        for start in range(0, n, chunk):
+            stop = min(start + chunk, n)
+            scaled = matrix[:, start:stop].float() / temperature
+            probabilities = torch.softmax(scaled, dim=-1)
+            top_probabilities, top_indices = probabilities.topk(
+                k=hypotheses, dim=-1
+            )
+            top_logits = torch.gather(
+                scaled, dim=-1, index=top_indices
+            )
+            selected_coords = key_coords[top_indices]
+            query = query_coords[start:stop].view(
+                1, stop - start, 1, 2
+            )
+            flow_chunks.append(selected_coords - query)
+            logit_chunks.append(top_logits)
+            probability_chunks.append(top_probabilities)
+
+            entropy = -(
+                probabilities * probabilities.clamp_min(1e-9).log()
+            ).sum(dim=-1) / log_m
+            peak = top_probabilities[..., 0]
+            if m > 1:
+                two = probabilities.topk(k=2, dim=-1).values
+                margin = two[..., 0] - two[..., 1]
+            else:
+                margin = peak
+            retained = top_probabilities.sum(dim=-1)
+            confidence = (
+                0.35 * (1.0 - entropy)
+                + 0.35 * (margin / peak.clamp_min(1e-6))
+                + 0.30 * retained
+            ).clamp(0.0, 1.0)
+            confidence_chunks.append(confidence)
+            entropy_chunks.append(entropy)
+            margin_chunks.append(margin)
+            peak_chunks.append(peak)
+            retained_chunks.append(retained)
+
+        flow = torch.cat(flow_chunks, dim=1)
+        flow = flow.permute(0, 2, 3, 1).reshape(
+            b, hypotheses, 2, self.height, self.width
+        )
+        logits = torch.cat(logit_chunks, dim=1)
+        logits = logits.permute(0, 2, 1).reshape(
+            b, hypotheses, self.height, self.width
+        )
+        top_probabilities = torch.cat(probability_chunks, dim=1)
+        top_probabilities = top_probabilities.permute(0, 2, 1).reshape(
+            b, hypotheses, self.height, self.width
+        )
+
+        def scalar_map(chunks: List[torch.Tensor]) -> torch.Tensor:
+            return torch.cat(chunks, dim=1).reshape(
+                b, 1, self.height, self.width
+            )
+
+        dtype = self.base_correlation.dtype
+        return {
+            "hypotheses": flow.to(dtype=dtype),
+            "logits": logits.to(dtype=dtype),
+            "probabilities": top_probabilities.to(dtype=dtype),
+            "confidence": scalar_map(confidence_chunks).to(dtype=dtype),
+            "entropy": scalar_map(entropy_chunks).clamp(
+                0.0, 1.0
+            ).to(dtype=dtype),
+            "margin": scalar_map(margin_chunks).to(dtype=dtype),
+            "peak": scalar_map(peak_chunks).to(dtype=dtype),
+            "retained_mass": scalar_map(retained_chunks).to(dtype=dtype),
+        }
+
     def global_soft_match(
         self,
         *,

@@ -35,7 +35,9 @@ def build_model(cfg, model_type: str = "tfport"):
         model_type: "tfport" (default, faithful TensorFlow recreation),
                     "original" (multi-stage unrolled), ``hqs_core``,
                     ``hqs_lm_of`` (learned probabilistic correspondence and
-                    transformer attention fused inside LM), or ``hqs_lm_sf``
+                    transformer attention fused inside LM), ``hqs_field_of``
+                    (multi-hypothesis correlation data term with a
+                    source-conditioned graph-field proximal), or ``hqs_lm_sf``
                     (calibrated RGB-D scene-flow prototype).
     
     Returns:
@@ -60,6 +62,17 @@ def build_model(cfg, model_type: str = "tfport"):
         )
 
         return HQSLMOpticalFlow(cfg.model)
+    if model_type in {
+        "hqs_field_of",
+        "hqsfield_of",
+        "hqs-field-of",
+        "hqs_field",
+    }:
+        from hqs_pytorch.customML.customModels.HQSFieldOpticalFlow import (
+            HQSFieldOpticalFlow,
+        )
+
+        return HQSFieldOpticalFlow(cfg.model)
     if model_type in {"hqs_lm_sf", "hqslm_sf", "hqs-lm-sf"}:
         from hqs_pytorch.customML.customModels.HQSLMSceneFlow import (
             HQSLMSceneFlow,
@@ -70,5 +83,5 @@ def build_model(cfg, model_type: str = "tfport"):
     raise ValueError(
         f"Unknown model_type: {model_type}. "
         "Use one of: tfport | tf_faithful | tf_port | original | legacy | "
-        "hqs_core | hqscore | core | hqs_lm_of | hqs_lm_sf."
+        "hqs_core | hqscore | core | hqs_lm_of | hqs_field_of | hqs_lm_sf."
     )
