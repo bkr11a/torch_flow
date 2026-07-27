@@ -34,9 +34,9 @@ from .HQSOTOpticalFlow import HQSOTOpticalFlow
 
 
 class HQSFieldOpticalFlowV2(HQSOTOpticalFlow):
-    """Four-scale HQS solver with 1/4 initial and repeated 1/8 transport."""
+    """Four-scale HQS solver with 1/8 initial and repeated 1/8 transport."""
 
-    required_transport_scale = 4
+    required_transport_scale = 8
     global_matcher_parameter_prefixes = (
         *HQSOTOpticalFlow.global_matcher_parameter_prefixes,
         "retransport_matcher.",
