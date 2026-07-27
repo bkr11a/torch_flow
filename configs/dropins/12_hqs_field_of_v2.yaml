@@ -197,8 +197,4 @@ training:
   freeze_backbone_during_global_warmup: true
 
 data:
-  batch_size: 1
   detail_crop_prob: 0.10
-
-val_data:
-  batch_size: 1
