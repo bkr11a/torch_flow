@@ -46,7 +46,7 @@ model:
 
     # The initial measurement matches HQS-OTOF exactly at 1/4. Subsequent full
     # global transport is repeated at 1/8 for tractable alternating inference.
-    ot_scale: 8
+    ot_scale: 4
     ot_fusion_scales: [4, 8, 16]
     ot_feature_channels: 128
     ot_temperature: 0.07

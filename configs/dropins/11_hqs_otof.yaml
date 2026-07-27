@@ -48,7 +48,7 @@ model:
 
     # FlowIt-style measurement front end. The score/plan is evaluated in
     # blocks but includes every source-target pair on the 1/4 grid.
-    ot_scale: 8
+    ot_scale: 4
     ot_fusion_scales: [4, 8, 16]
     ot_feature_channels: 128
     ot_temperature: 0.07
