@@ -35,9 +35,9 @@ from .HQSFieldOpticalFlow import (
 
 
 class HQSOTOpticalFlow(HQSFieldOpticalFlow):
-    """Static 1/4 OT measurement followed by the ten-step HQS-Field solver."""
+    """Static 1/8 OT measurement followed by the ten-step HQS-Field solver."""
 
-    required_transport_scale = 4
+    required_transport_scale = 8
     global_matcher_parameter_prefixes = (
         "feature_encoder.stages.",
         "feature_encoder.match_projections.",
