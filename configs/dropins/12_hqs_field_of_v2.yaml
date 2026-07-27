@@ -1,0 +1,204 @@
+# HQS-Field-OFv2
+#
+# Publication-oriented model:
+#   hierarchical transformer-enhanced source/target features
+#     -> FlowIt-style dustbin optimal transport at 1/4
+#     -> closed-form transport/HQS data solve
+#     -> symmetric source-semantic graph proximal
+#     -> repeated state-conditioned global transport at 1/8
+#     -> local multi-hypothesis analytic updates at 1/4 and 1/2
+#
+# The first transport plan is state-independent. State consistency is introduced
+# gradually, preventing immediate self-confirmation of an incorrect flow.
+
+run_name: hqs_field_of_v2/retransport_semantic_field_2_4_2_2
+
+mlflow:
+  registered_model_name: HQSFieldOpticalFlowV2
+  tags:
+    architecture: hqs_field_of_v2
+    solver: alternating_transport_data_field
+    measurement_backbone: hierarchical_transformer_fusion
+    correspondence: quarter_initial_plus_repeated_eighth_sinkhorn
+    unmatched_model: learned_dustbin
+    data_operator: transport_moment_closed_form_hqs
+    proximal: symmetric_source_semantic_graph
+    transport_initial_state_bias: false
+    learned_post_solve_vector: false
+    target_evidence_in_proximal: false
+
+model:
+  model_type: hqs_field_of_v2
+
+  hqs_field_of_v2:
+    feature_channels: [32, 64, 96, 128]
+    match_channels: [64, 96, 128, 128]
+    context_channels: [64, 64, 96, 96]
+    blocks_per_scale: [1, 2, 2, 2]
+    groups: 8
+
+    feature_transformer_depth: [1, 1, 1, 0]
+    feature_transformer_heads: [4, 4, 4, 4]
+    feature_transformer_max_tokens: [4096, 4096, 2048, 1024]
+    feature_transformer_mlp_ratio: 2.0
+    feature_transformer_dropout: 0.0
+    feature_transformer_initial_blend: 0.10
+
+    # The initial measurement matches HQS-OTOF exactly at 1/4. Subsequent full
+    # global transport is repeated at 1/8 for tractable alternating inference.
+    ot_scale: 4
+    ot_fusion_scales: [4, 8, 16]
+    ot_feature_channels: 128
+    ot_temperature: 0.07
+    ot_sinkhorn_iterations: 8
+    ot_query_chunk_size: 256
+    ot_local_expectation_radius: 2
+    ot_num_hypotheses: 4
+    ot_initial_dustbin_score: 1.0
+    ot_state_sigma: 3.0
+    ot_state_cost_clip: 50.0
+    ot_covariance_floor: 0.05
+    ot_precision_maximum: 4.0
+    ot_maximum_tokens: 20000
+    ot_gradient_checkpointing: true
+    ot_cache_all_pairs_scores: true
+    ot_half_precision_score_cache: true
+
+    retransport_scale: 8
+    retransport_temperature: 0.07
+    retransport_sinkhorn_iterations: 6
+    retransport_query_chunk_size: 256
+    retransport_local_expectation_radius: 2
+    retransport_num_hypotheses: 8
+    retransport_state_sigma: 3.0
+    retransport_state_cost_clip: 50.0
+    retransport_maximum_tokens: 5000
+    retransport_cache_all_pairs_scores: true
+    retransport_half_precision_score_cache: true
+
+    # Alpha_0=0 is a hard methodological invariant. Later values gradually add
+    # consistency with the current proximal state to the global transport cost.
+    retransport_state_weights: [0.0, 0.20, 0.45, 0.70]
+
+    # Coarse semantic graph is source-only and symmetric, so its Laplacian is
+    # positive semidefinite. Fine scales retain the local source graph below.
+    transport_calibrator_hidden_channels: 64
+    maximum_transport_log_precision_adjustment: 2.0
+    maximum_transport_observability_logit_adjustment: 2.0
+    semantic_graph_embedding_channels: 32
+    semantic_graph_neighbours: [8, 8]
+    semantic_graph_maximum_tokens: [2048, 5000]
+    semantic_graph_feature_temperature: 0.10
+
+    # Four-scale schedule is unchanged: [1/16,1/8,1/4,1/2].
+    iterations: [2, 4, 2, 2]
+    graph_sweeps: [4, 4, 2, 2]
+    correlation_radii: [4, 4, 4, 3]
+    all_pairs_levels: [1, 4]
+    num_hypotheses: [4, 4, 4, 4]
+    mixture_temperatures: [0.07, 0.07, 0.10, 0.10]
+    local_corr_channel_chunk: 4
+    local_corr_checkpoint: true
+
+    # Used by the fine 1/4 and 1/2 local measurement cells.
+    proposal_embedding_channels: [64, 64, 64, 64]
+    proposal_hidden_channels: [96, 96, 64, 64]
+    correlation_attention_channels: [32, 32, 32, 32]
+    correlation_attention_heads: [4, 4, 4, 4]
+    correlation_attention_temperature: 1.0
+    maximum_attention_correlation_scale: 8.0
+    max_hypothesis_delta: [2.0, 2.0, 1.5, 1.0]
+    maximum_logit_adjustment: 2.0
+    precision_minimum: 0.0
+    precision_maximum: 1.0
+    precision_correlation_limit: 0.95
+    initial_precision: 0.20
+    initial_matchability: 0.90
+    confidence_floor: 0.02
+    cycle_support_floor: 0.02
+    responsibility_reference: proximal
+
+    cycle_scales: [16, 8]
+    cycle_sigma: 1.5
+    cycle_confidence_floor: 0.02
+
+    graph_embedding_channels: [32, 32, 32, 32]
+    graph_dilations:
+      - [1, 2, 4]
+      - [1, 2, 4]
+      - [1, 2]
+      - [1, 2]
+    graph_feature_temperature: 0.25
+    graph_edge_alpha: 10.0
+    graph_anchor_floor: 0.05
+
+    beta_initial: 0.10
+    beta_minimum: 0.01
+    damping_initial: 0.10
+    damping_minimum: 0.001
+    lambda_initial: 0.08
+    lambda_minimum: 0.001
+    proximal_inertia_initial: 0.05
+    proximal_inertia_minimum: 0.001
+    max_data_delta: [4.0, 3.0, 2.0, 1.0]
+
+    global_temperature: 0.07
+    global_query_chunk_size: 512
+    upsample_hidden_dim: 64
+    allow_external_validity_inputs: false
+
+loss:
+  num_stages: 10
+  stage_weight_mode: geometric
+  gamma: 0.85
+
+  global_init_weight: 0.10
+  global_confidence_weight: 0.02
+  global_confidence_tau: 1.0
+  global_large_motion_threshold: 40.0
+  global_large_motion_boost: 3.0
+  ot_mixture_supervision_weight: 0.05
+  ot_matchability_weight: 0.01
+  ot_observability_weight: 0.02
+
+  core_visibility_weight: 0.01
+  core_visibility_last_n: 6
+  proposal_supervision_weight: 0.01
+  proposal_matchability_weight: 0.002
+  proposal_confidence_tau: 1.0
+  proposal_supervision_last_n: 0
+  mixture_supervision_weight: 0.02
+  mixture_matchability_weight: 0.005
+  mixture_supervision_temperature: 1.0
+  mixture_supervision_last_n: 0
+
+  boundary_weight: 0.01
+  detail_weight: 0.02
+  detail_start_step: 10000
+  detail_ramp_steps: 10000
+  detail_boundary_threshold: 1.0
+  detail_boundary_boost: 2.0
+  detail_high_pass_factor: 2
+
+  smooth_weight: 0.0
+  inter_smooth_weight: 0.0
+  raw_final_weight: 0.0
+  iter_damp_weight: 0.0
+  photo_weight: 0.0
+  ofce_weight: 0.0
+  occlusion_aware:
+    enabled: false
+
+training:
+  amp: true
+  grad_clip: 1.0
+  fail_on_nonfinite: true
+  global_matcher_warmup_steps: 5000
+  freeze_backbone_during_global_warmup: true
+
+data:
+  batch_size: 1
+  detail_crop_prob: 0.10
+
+val_data:
+  batch_size: 1

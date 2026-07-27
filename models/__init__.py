@@ -17,7 +17,8 @@ from .warp import (
 
 __all__ = [
     "HQSFlow", "HQSCore", "HQSLMOpticalFlow", "HQSFieldOpticalFlow",
-    "HQSLMSceneFlow", "build_model",
+    "HQSOTOpticalFlow", "HQSFieldOpticalFlowV2", "HQSLMSceneFlow",
+    "build_model",
     "BasicEncoder", "SmallEncoder", "build_encoder",
     "CorrBlock", "LocalCorrBlock", "build_corr_block",
     "DataUpdateNet", "ConvGRUCell",
@@ -39,6 +40,12 @@ def __getattr__(name: str):
         ),
         "HQSFieldOpticalFlow": (
             "hqs_pytorch.customML.customModels.HQSFieldOpticalFlow"
+        ),
+        "HQSOTOpticalFlow": (
+            "hqs_pytorch.customML.customModels.HQSOTOpticalFlow"
+        ),
+        "HQSFieldOpticalFlowV2": (
+            "hqs_pytorch.customML.customModels.HQSFieldOpticalFlowV2"
         ),
         "HQSLMSceneFlow": (
             "hqs_pytorch.customML.customModels.HQSLMSceneFlow"

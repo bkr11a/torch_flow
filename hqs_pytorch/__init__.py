@@ -20,6 +20,8 @@ __all__ = [
     "HQSFlowModel",
     "HQSLMOpticalFlow",
     "HQSFieldOpticalFlow",
+    "HQSOTOpticalFlow",
+    "HQSFieldOpticalFlowV2",
     "HQSLMSceneFlow",
     "OpticalFlowFeatureEncoder",
     "OpticalFlowContextEncoder",
@@ -38,6 +40,12 @@ def __getattr__(name: str):
         "HQSLMOpticalFlow": ".customML.customModels.HQSLMOpticalFlow",
         "HQSFieldOpticalFlow": (
             ".customML.customModels.HQSFieldOpticalFlow"
+        ),
+        "HQSOTOpticalFlow": (
+            ".customML.customModels.HQSOTOpticalFlow"
+        ),
+        "HQSFieldOpticalFlowV2": (
+            ".customML.customModels.HQSFieldOpticalFlowV2"
         ),
         "HQSLMSceneFlow": ".customML.customModels.HQSLMSceneFlow",
     }

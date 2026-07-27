@@ -443,6 +443,18 @@ class HQSFlowLoss(nn.Module):
         self.mixture_supervision_last_n = int(
             cfg.get("mixture_supervision_last_n", 0)
         )
+        # FlowIt-style transport is supervised as a measurement operator:
+        # local-expectation flow, retained correspondence modes and real-mass
+        # observability. Labels remain loss-only and never enter model.forward.
+        self.ot_mixture_supervision_weight = float(
+            cfg.get("ot_mixture_supervision_weight", 0.0)
+        )
+        self.ot_matchability_weight = float(
+            cfg.get("ot_matchability_weight", 0.0)
+        )
+        self.ot_observability_weight = float(
+            cfg.get("ot_observability_weight", 0.0)
+        )
 
         occ_cfg = cfg.get("occlusion_aware", {})
         self.occlusion_aware_enabled = bool(occ_cfg.get("enabled", False))
@@ -1317,6 +1329,58 @@ class HQSFlowLoss(nn.Module):
                     + self.mixture_supervision_weight * mixture_loss
                     + self.mixture_matchability_weight
                     * mixture_matchability
+                )
+
+            ot_hypotheses = model_outputs.get("ot_hypothesis_flows")
+            ot_logits = model_outputs.get("ot_hypothesis_logits")
+            ot_observability = model_outputs.get("ot_observability")
+            ot_confidence = model_outputs.get("ot_confidence")
+            if (
+                isinstance(ot_hypotheses, torch.Tensor)
+                and isinstance(ot_logits, torch.Tensor)
+                and isinstance(ot_observability, torch.Tensor)
+                and (
+                    self.ot_mixture_supervision_weight > 0
+                    or self.ot_matchability_weight > 0
+                    or self.ot_observability_weight > 0
+                )
+            ):
+                if isinstance(ot_confidence, torch.Tensor):
+                    ot_matchability = (
+                        ot_observability * ot_confidence
+                    ).clamp(0.0, 1.0)
+                else:
+                    ot_matchability = ot_observability
+                ot_mixture, ot_matchability_loss = (
+                    self._mixture_measurement_loss(
+                        [ot_hypotheses],
+                        [ot_logits],
+                        [ot_matchability],
+                        flow_gt,
+                        valid,
+                        occlusion,
+                        invalid,
+                        synthetic_occlusion,
+                    )
+                )
+                ot_observability_loss = self._core_visibility_loss(
+                    [ot_observability],
+                    flow_gt,
+                    valid,
+                    occlusion,
+                    invalid,
+                    synthetic_occlusion,
+                )
+                out["ot_mixture_supervision"] = ot_mixture
+                out["ot_matchability"] = ot_matchability_loss
+                out["ot_observability"] = ot_observability_loss
+                total = (
+                    total
+                    + self.ot_mixture_supervision_weight * ot_mixture
+                    + self.ot_matchability_weight
+                    * ot_matchability_loss
+                    + self.ot_observability_weight
+                    * ot_observability_loss
                 )
 
         if self.occlusion_aware_enabled and isinstance(model_outputs, dict):

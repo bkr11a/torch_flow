@@ -755,13 +755,25 @@ class Trainer:
         )
         if active == self._global_warmup_active:
             return
+        prefixes = getattr(
+            self.model,
+            "global_matcher_parameter_prefixes",
+            ("pgma.",),
+        )
+        prefixes = tuple(str(value) for value in prefixes)
         for name, parameter in self.model.named_parameters():
-            parameter.requires_grad_(not active or name.startswith("pgma."))
+            is_measurement_parameter = any(
+                name.startswith(prefix) for prefix in prefixes
+            )
+            parameter.requires_grad_(
+                not active or is_measurement_parameter
+            )
         self._global_warmup_active = active
         if active:
             logger.info(
-                "Global-matcher warmup active: only model.pgma parameters "
-                f"train until step {self._global_matcher_warmup_steps}."
+                "Global-matcher warmup active: only declared measurement "
+                "parameters train until step "
+                f"{self._global_matcher_warmup_steps}. Prefixes={prefixes}."
             )
         else:
             logger.info("Joint model optimisation active.")
@@ -862,6 +874,114 @@ class Trainer:
                         batch_metrics[k].append(v)
             for k, vals in batch_metrics.items():
                 scalar_dict[k] = float(np.mean(vals)) if vals else float("nan")
+
+            # Structured-operator diagnostics for HQS-Field/HQS-OT models.
+            for output_key, metric_key in {
+                "ot_confidence": "ot/confidence_mean",
+                "ot_observability": "ot/observability_mean",
+                "ot_dustbin_probability": "ot/dustbin_mean",
+                "ot_entropy": "ot/entropy_mean",
+            }.items():
+                value = out.get(output_key)
+                if isinstance(value, torch.Tensor):
+                    scalar_dict[metric_key] = float(
+                        value.detach().float().mean().item()
+                    )
+
+            low_fields = out.get("flow_low")
+            data_fields = out.get("data_flow_low")
+            total_deltas = out.get("delta_low")
+            if (
+                isinstance(low_fields, list)
+                and isinstance(data_fields, list)
+                and isinstance(total_deltas, list)
+                and len(low_fields) == len(data_fields) == len(total_deltas)
+                and low_fields
+            ):
+                data_gains = []
+                proximal_gains = []
+                data_gains_fast = []
+                proximal_gains_unmatched = []
+                valid_field = valid.float()
+                if valid_field.ndim == 4:
+                    valid_field = valid_field[:, 0]
+                occlusion_field = None
+                if occ_batch is not None:
+                    occlusion_field = occ_batch.float()
+                    if occlusion_field.ndim == 4:
+                        occlusion_field = occlusion_field[:, 0]
+                magnitude_full = flow.square().sum(
+                    dim=1, keepdim=True
+                ).sqrt()
+                for low, data_low, total_delta in zip(
+                    low_fields, data_fields, total_deltas
+                ):
+                    size = low.shape[-2:]
+                    gt_low = F.interpolate(
+                        flow,
+                        size=size,
+                        mode="bilinear",
+                        align_corners=True,
+                    ).clone()
+                    gt_low[:, 0] *= float(size[1]) / float(flow.shape[-1])
+                    gt_low[:, 1] *= float(size[0]) / float(flow.shape[-2])
+                    valid_low = F.interpolate(
+                        valid_field.unsqueeze(1),
+                        size=size,
+                        mode="nearest",
+                    ).bool()
+                    previous_low = low - total_delta
+                    previous_epe = (
+                        previous_low - gt_low
+                    ).square().sum(dim=1, keepdim=True).sqrt()
+                    data_epe = (
+                        data_low - gt_low
+                    ).square().sum(dim=1, keepdim=True).sqrt()
+                    proximal_epe = (
+                        low - gt_low
+                    ).square().sum(dim=1, keepdim=True).sqrt()
+                    data_gain = previous_epe - data_epe
+                    proximal_gain = data_epe - proximal_epe
+                    if valid_low.any():
+                        data_gains.append(data_gain[valid_low].mean())
+                        proximal_gains.append(
+                            proximal_gain[valid_low].mean()
+                        )
+                    fast = F.interpolate(
+                        (magnitude_full >= 40.0).float(),
+                        size=size,
+                        mode="nearest",
+                    ).bool() & valid_low
+                    if fast.any():
+                        data_gains_fast.append(data_gain[fast].mean())
+                    if occlusion_field is not None:
+                        unmatched = F.interpolate(
+                            occlusion_field.unsqueeze(1),
+                            size=size,
+                            mode="nearest",
+                        ).bool() & valid_low
+                        if unmatched.any():
+                            proximal_gains_unmatched.append(
+                                proximal_gain[unmatched].mean()
+                            )
+                if data_gains:
+                    scalar_dict["operator/data_epe_gain"] = float(
+                        torch.stack(data_gains).mean().item()
+                    )
+                if proximal_gains:
+                    scalar_dict["operator/proximal_epe_gain"] = float(
+                        torch.stack(proximal_gains).mean().item()
+                    )
+                if data_gains_fast:
+                    scalar_dict["operator/data_epe_gain_s40_plus"] = float(
+                        torch.stack(data_gains_fast).mean().item()
+                    )
+                if proximal_gains_unmatched:
+                    scalar_dict[
+                        "operator/proximal_epe_gain_unmatched"
+                    ] = float(
+                        torch.stack(proximal_gains_unmatched).mean().item()
+                    )
 
         return scalar_dict
 

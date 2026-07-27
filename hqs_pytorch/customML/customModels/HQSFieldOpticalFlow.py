@@ -515,6 +515,44 @@ class HQSFieldOpticalFlow(nn.Module):
     def _normalise(self, image: torch.Tensor) -> torch.Tensor:
         return (image - self.image_mean.to(image)) / self.image_std.to(image)
 
+    def _encode_pair_features(
+        self,
+        image1: torch.Tensor,
+        image2: torch.Tensor,
+    ) -> Tuple[
+        Dict[int, torch.Tensor],
+        Dict[int, torch.Tensor],
+        Dict[int, torch.Tensor],
+        Dict[int, torch.Tensor],
+    ]:
+        """Encode a frame pair, allowing structured wrappers to reuse it."""
+        cached = getattr(self, "_active_feature_cache", None)
+        if cached is not None:
+            return cached
+        source_backbone = self.feature_encoder.backbone(
+            self._normalise(image1)
+        )
+        target_backbone = self.feature_encoder.backbone(
+            self._normalise(image2)
+        )
+        source_match_raw = self.feature_encoder.project_matching(
+            source_backbone
+        )
+        target_match_raw = self.feature_encoder.project_matching(
+            target_backbone
+        )
+        source_match_raw, target_match_raw = (
+            self._enhance_matching_features(
+                source_match_raw, target_match_raw
+            )
+        )
+        return (
+            source_backbone,
+            target_backbone,
+            source_match_raw,
+            target_match_raw,
+        )
+
     @staticmethod
     def _to_yx(flow_xy: torch.Tensor) -> torch.Tensor:
         return torch.stack((flow_xy[:, 1], flow_xy[:, 0]), dim=1)
@@ -662,22 +700,14 @@ class HQSFieldOpticalFlow(nn.Module):
         image1 = image1.float()
         image2 = image2.float()
         _, _, full_height, full_width = image1.shape
-        source_backbone = self.feature_encoder.backbone(
-            self._normalise(image1)
-        )
-        target_backbone = self.feature_encoder.backbone(
-            self._normalise(image2)
-        )
-        source_match_raw = self.feature_encoder.project_matching(
-            source_backbone
-        )
-        target_match_raw = self.feature_encoder.project_matching(
-            target_backbone
-        )
-        source_match_raw, target_match_raw = (
-            self._enhance_matching_features(
-                source_match_raw, target_match_raw
-            )
+        (
+            source_backbone,
+            target_backbone,
+            source_match_raw,
+            target_match_raw,
+        ) = self._encode_pair_features(
+            image1,
+            image2,
         )
         source_match = {
             scale: F.normalize(value.float(), dim=1, eps=1e-6)
