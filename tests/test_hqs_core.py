@@ -21,6 +21,11 @@ from models.hqs_core_components import (
     spatial_gradients,
     weighted_analytic_data_delta,
 )
+from models.hqs_deep_match_components import (
+    HQSCoreDeepMatchingPyramid,
+    PairFeatureInteraction,
+    decode_cycle_consistent_topk,
+)
 from models.warp import resize_flow
 
 
@@ -45,6 +50,34 @@ def _tiny_core_config(iterations=(1, 1, 1, 1)):
     }
 
 
+def _tiny_deep_match_config(iterations=(1, 1, 1, 1)):
+    config = _tiny_core_config(iterations=iterations)
+    config.update(
+        {
+            "matching_pyramid": "deep_bidirectional",
+            "matching_fusion_depth": 1,
+            "matching_transformer_depth": [0, 0, 1, 1],
+            "matching_transformer_heads": [4, 4, 4, 4],
+            "matching_transformer_windows": [0, 0, 2, 0],
+            "matching_transformer_maximum_global_tokens": 128,
+            "matching_transformer_fallback_window": 2,
+            "matching_transformer_mlp_ratio": 2.0,
+            "matching_transformer_initial_blend": 0.25,
+            "matching_transformer_gradient_checkpointing": False,
+            "global_decoder": "multimodal_cycle",
+            "global_num_hypotheses": 2,
+            "global_local_expectation_radius": 1,
+            "global_nms_radius": 1,
+            "global_cycle_sigma": 1.5,
+            "global_cycle_score_weight": 1.0,
+            "global_cycle_confidence_floor": 0.02,
+            "global_minimum_initialisation_confidence": 0.05,
+            "global_gate_temperature": 0.05,
+        }
+    )
+    return config
+
+
 def test_hqs_core_overlay_is_a_complete_ten_stage_switch():
     root = Path(__file__).resolve().parents[1]
     cfg = OmegaConf.merge(
@@ -55,6 +88,23 @@ def test_hqs_core_overlay_is_a_complete_ten_stage_switch():
     assert list(cfg.model.hqs_core.iterations) == [2, 4, 2, 2]
     assert cfg.loss.num_stages == 10
     assert cfg.loss.occlusion_aware.enabled is False
+
+
+def test_deep_match_overlay_is_a_complete_hqs_core_switch():
+    root = Path(__file__).resolve().parents[1]
+    cfg = OmegaConf.merge(
+        OmegaConf.load(root / "configs/default.yaml"),
+        OmegaConf.load(
+            root / "configs/dropins/13_hqs_core_deep_match.yaml"
+        ),
+    )
+    assert cfg.model.model_type == "hqs_core"
+    assert cfg.model.hqs_core.matching_pyramid == "deep_bidirectional"
+    assert cfg.model.hqs_core.global_decoder == "multimodal_cycle"
+    assert list(cfg.model.hqs_core.blocks_per_scale) == [2, 3, 4, 4]
+    assert list(cfg.model.hqs_core.iterations) == [2, 4, 2, 2]
+    assert cfg.model.hqs_core.analytic_validity_mode == "weighted_solve"
+    assert cfg.loss.num_stages == 10
 
 
 def test_weighted_analytic_overlay_selects_corrected_operator():
@@ -319,6 +369,127 @@ def test_all_pairs_global_match_and_lookup_are_finite_on_tiny_grids():
     lookup = corr.lookup(torch.zeros(1, 2, 2, 2))
     assert lookup.shape == (1, 4 * 9, 2, 2)
     assert torch.isfinite(lookup).all()
+
+
+def test_multimodal_global_decoder_retains_spatially_distinct_modes():
+    fmap = torch.eye(6).reshape(1, 6, 2, 3)
+    correlation = AllPairsCorrelation(
+        fmap,
+        fmap,
+        num_levels=1,
+        radius=1,
+    )
+    controlled = torch.full((1, 6, 6), -10.0)
+    for query in range(6):
+        controlled[0, query, query] = 10.0
+        controlled[0, query, 5 - query] = 9.0
+    correlation.base_correlation = controlled
+
+    decoded = correlation.global_multimodal_match(
+        num_hypotheses=2,
+        temperature=1.0,
+        query_chunk_size=3,
+        local_expectation_radius=0,
+        nms_radius=1,
+    )
+    assert decoded["hypotheses"].shape == (1, 2, 2, 2, 3)
+    first = decoded["map_hypotheses"][0, 0, :, 0, 0]
+    second = decoded["map_hypotheses"][0, 1, :, 0, 0]
+    assert torch.equal(first, torch.tensor([0.0, 0.0]))
+    assert torch.equal(second, torch.tensor([2.0, 1.0]))
+    assert not torch.equal(first, second)
+    assert torch.isfinite(decoded["confidence"]).all()
+
+
+def test_cycle_decoder_reranks_modes_and_preserves_flow_magnitude():
+    hypotheses = torch.zeros(1, 2, 2, 2, 4)
+    hypotheses[:, 0, 0] = 3.0
+    hypotheses[:, 1, 0] = 1.0
+    probabilities = torch.empty(1, 2, 2, 4)
+    probabilities[:, 0] = 0.6
+    probabilities[:, 1] = 0.4
+    confidence = torch.ones(1, 1, 2, 4)
+    forward = {
+        "hypotheses": hypotheses,
+        "probabilities": probabilities,
+        "confidence": confidence,
+    }
+    reverse_hypotheses = torch.zeros(1, 1, 2, 2, 4)
+    reverse_hypotheses[:, 0, 0, :, 1] = -1.0
+    reverse = {
+        "hypotheses": reverse_hypotheses,
+        "confidence": torch.ones(1, 1, 2, 4),
+    }
+
+    decoded = decode_cycle_consistent_topk(
+        forward,
+        reverse,
+        cycle_sigma=1.0,
+        cycle_score_weight=2.0,
+        minimum_initialisation_confidence=0.5,
+        gate_temperature=0.05,
+    )
+    assert decoded["selected_index"][0, 0, 0, 0].item() == 1
+    assert decoded["hard_acceptance"][0, 0, 0, 0].item() == 1
+    # Confidence routes the vector; it does not turn +1 into a smaller flow.
+    assert decoded["selected_flow"][0, 0, 0, 0].item() == 1.0
+    assert decoded["initial_flow"][0, 0, 0, 0].item() == 1.0
+
+
+def test_pair_feature_interaction_keeps_native_shape_and_gradients():
+    module = PairFeatureInteraction(
+        16,
+        depth=2,
+        num_heads=4,
+        window_size=3,
+        maximum_global_tokens=1,
+        gradient_checkpointing=False,
+    )
+    source = torch.randn(2, 16, 5, 7, requires_grad=True)
+    target = torch.randn_like(source, requires_grad=True)
+    enhanced_source, enhanced_target = module(source, target)
+    assert enhanced_source.shape == source.shape
+    assert enhanced_target.shape == target.shape
+    loss = enhanced_source.square().mean() + enhanced_target.square().mean()
+    loss.backward()
+    assert source.grad is not None and torch.isfinite(source.grad).all()
+    assert target.grad is not None and torch.isfinite(target.grad).all()
+
+
+def test_deep_match_hqs_core_forward_contract_and_gradient():
+    model = HQSCore({"hqs_core": _tiny_deep_match_config()})
+    assert isinstance(
+        model.feature_encoder,
+        HQSCoreDeepMatchingPyramid,
+    )
+    image1 = torch.rand(1, 3, 32, 48)
+    image2 = torch.rand(1, 3, 32, 48)
+    output = model(image1, image2)
+    assert output["matching_pyramid"] == "deep_bidirectional"
+    assert output["global_decoder"] == "multimodal_cycle"
+    assert output["global_topk_flow_xy"].shape == (1, 2, 2, 2, 3)
+    assert output["global_topk_cycle_support"].shape == (1, 2, 1, 2, 3)
+    assert output["gmflow_reverse_flow_yx"].shape == (1, 2, 32, 48)
+    assert set(output["matching_transformer_blends"]) == {8, 16}
+    assert len(output["flow_preds"]) == 4
+    assert output["flow_preds"][-1].shape == (1, 2, 32, 48)
+    assert all(
+        torch.isfinite(value).all()
+        for value in output["flow_preds"]
+    )
+
+    loss = output["flow_preds"][-1].abs().mean()
+    loss.backward()
+    interaction_gradients = [
+        parameter.grad
+        for parameter in model.feature_encoder.pair_interactions.parameters()
+        if parameter.requires_grad and parameter.grad is not None
+    ]
+    assert interaction_gradients
+    assert all(
+        torch.isfinite(gradient).all()
+        for gradient in interaction_gradients
+    )
 
 
 def test_resize_flow_rescales_xy_components_for_odd_shapes():

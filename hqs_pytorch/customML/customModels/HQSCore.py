@@ -28,6 +28,10 @@ from models.hqs_core_components import (
     StructuredHQSCell,
     spatial_gradients,
 )
+from models.hqs_deep_match_components import (
+    HQSCoreDeepMatchingPyramid,
+    decode_cycle_consistent_topk,
+)
 from models.warp import resize_flow
 
 
@@ -153,13 +157,89 @@ class HQSCore(nn.Module):
             _cfg_get(core_cfg, "correlation_embedding_dim", 64)
         )
 
-        self.feature_encoder = HQSCorePyramidEncoder(
-            feature_channels=feature_channels,
-            match_channels=match_channels,
-            context_channels=context_channels,
-            blocks_per_scale=blocks_per_scale,
-            groups=groups,
-        )
+        self.matching_pyramid = str(
+            _cfg_get(core_cfg, "matching_pyramid", "standard")
+        ).lower()
+        if self.matching_pyramid in {
+            "deep_bidirectional",
+            "deep_match",
+            "strong",
+        }:
+            self.feature_encoder = HQSCoreDeepMatchingPyramid(
+                feature_channels=feature_channels,
+                match_channels=match_channels,
+                context_channels=context_channels,
+                blocks_per_scale=blocks_per_scale,
+                groups=groups,
+                fusion_depth=int(
+                    _cfg_get(core_cfg, "matching_fusion_depth", 2)
+                ),
+                transformer_depth=_int_list(
+                    core_cfg,
+                    "matching_transformer_depth",
+                    (0, 0, 2, 4),
+                ),
+                transformer_heads=_int_list(
+                    core_cfg,
+                    "matching_transformer_heads",
+                    (4, 4, 8, 8),
+                ),
+                transformer_windows=_int_list(
+                    core_cfg,
+                    "matching_transformer_windows",
+                    (0, 0, 8, 0),
+                ),
+                transformer_maximum_global_tokens=int(
+                    _cfg_get(
+                        core_cfg,
+                        "matching_transformer_maximum_global_tokens",
+                        4096,
+                    )
+                ),
+                transformer_fallback_window=int(
+                    _cfg_get(
+                        core_cfg,
+                        "matching_transformer_fallback_window",
+                        16,
+                    )
+                ),
+                transformer_mlp_ratio=float(
+                    _cfg_get(
+                        core_cfg,
+                        "matching_transformer_mlp_ratio",
+                        4.0,
+                    )
+                ),
+                transformer_initial_blend=float(
+                    _cfg_get(
+                        core_cfg,
+                        "matching_transformer_initial_blend",
+                        0.25,
+                    )
+                ),
+                transformer_gradient_checkpointing=bool(
+                    _cfg_get(
+                        core_cfg,
+                        "matching_transformer_gradient_checkpointing",
+                        True,
+                    )
+                ),
+            )
+        elif self.matching_pyramid == "standard":
+            self.feature_encoder = HQSCorePyramidEncoder(
+                feature_channels=feature_channels,
+                match_channels=match_channels,
+                context_channels=context_channels,
+                blocks_per_scale=blocks_per_scale,
+                groups=groups,
+            )
+        else:
+            raise ValueError(
+                "hqs_core.matching_pyramid must be standard or "
+                f"deep_bidirectional, got {self.matching_pyramid!r}"
+            )
+        # Used only when Trainer's optional matcher warm-up is enabled.
+        self.global_matcher_parameter_prefixes = ("feature_encoder.",)
 
         raw_corr_channels = {
             16: all_pairs_levels[16] * (2 * correlation_radii[16] + 1) ** 2,
@@ -270,6 +350,45 @@ class HQSCore(nn.Module):
         self.global_confidence_floor = float(
             _cfg_get(core_cfg, "global_confidence_floor", 0.05)
         )
+        self.global_decoder = str(
+            _cfg_get(core_cfg, "global_decoder", "soft_expectation")
+        ).lower()
+        if self.global_decoder not in {
+            "soft_expectation",
+            "multimodal_cycle",
+        }:
+            raise ValueError(
+                "hqs_core.global_decoder must be soft_expectation or "
+                f"multimodal_cycle, got {self.global_decoder!r}"
+            )
+        self.global_num_hypotheses = int(
+            _cfg_get(core_cfg, "global_num_hypotheses", 4)
+        )
+        self.global_local_expectation_radius = int(
+            _cfg_get(core_cfg, "global_local_expectation_radius", 2)
+        )
+        self.global_nms_radius = int(
+            _cfg_get(core_cfg, "global_nms_radius", 3)
+        )
+        self.global_cycle_sigma = float(
+            _cfg_get(core_cfg, "global_cycle_sigma", 1.5)
+        )
+        self.global_cycle_score_weight = float(
+            _cfg_get(core_cfg, "global_cycle_score_weight", 1.0)
+        )
+        self.global_cycle_confidence_floor = float(
+            _cfg_get(core_cfg, "global_cycle_confidence_floor", 0.02)
+        )
+        self.global_minimum_initialisation_confidence = float(
+            _cfg_get(
+                core_cfg,
+                "global_minimum_initialisation_confidence",
+                0.12,
+            )
+        )
+        self.global_gate_temperature = float(
+            _cfg_get(core_cfg, "global_gate_temperature", 0.05)
+        )
         self.allow_external_validity_inputs = bool(
             _cfg_get(core_cfg, "allow_external_validity_inputs", False)
         )
@@ -318,6 +437,106 @@ class HQSCore(nn.Module):
             )
         return self.correlation_adapters[str(scale)](raw)
 
+    def _encode_matching_pair(
+        self,
+        source_backbone: Dict[int, torch.Tensor],
+        target_backbone: Dict[int, torch.Tensor],
+    ) -> Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor]]:
+        source_match = self.feature_encoder.project_matching(
+            source_backbone
+        )
+        target_match = self.feature_encoder.project_matching(
+            target_backbone
+        )
+        if isinstance(
+            self.feature_encoder,
+            HQSCoreDeepMatchingPyramid,
+        ):
+            source_match, target_match = (
+                self.feature_encoder.enhance_pair(
+                    source_match,
+                    target_match,
+                )
+            )
+        return source_match, target_match
+
+    def _decode_global_match(
+        self,
+        correlation: AllPairsCorrelation,
+    ) -> Dict[str, object]:
+        if self.global_decoder == "soft_expectation":
+            soft = correlation.global_soft_match(
+                temperature=self.global_temperature,
+                query_chunk_size=self.global_query_chunk_size,
+            )
+            ones = torch.ones_like(soft["confidence"])
+            zeros = torch.zeros_like(soft["confidence"])
+            return {
+                "initial_flow": soft["flow_xy"],
+                "selected_flow": soft["flow_xy"],
+                "selected_index": torch.zeros_like(
+                    soft["confidence"],
+                    dtype=torch.long,
+                ),
+                "selected_probability": ones,
+                "selected_confidence": soft["confidence"],
+                "selected_cycle_support": ones,
+                "selected_cycle_error": zeros,
+                "acceptance": ones,
+                "hard_acceptance": ones,
+                "soft_acceptance": ones,
+                "cycle_support": ones.unsqueeze(1),
+                "cycle_error": zeros.unsqueeze(1),
+                "reverse_flow": torch.zeros_like(soft["flow_xy"]),
+                "reverse_confidence": zeros,
+                "forward": {
+                    "hypotheses": soft["flow_xy"].unsqueeze(1),
+                    "map_hypotheses": soft["flow_xy"].unsqueeze(1),
+                    "probabilities": ones,
+                    "confidence": soft["confidence"],
+                    "entropy": soft["entropy"],
+                    "margin": soft["margin"],
+                    "peak": soft["confidence"],
+                    "retained_mass": ones,
+                },
+                "reverse": None,
+            }
+
+        forward = correlation.global_multimodal_match(
+            num_hypotheses=self.global_num_hypotheses,
+            temperature=self.global_temperature,
+            query_chunk_size=self.global_query_chunk_size,
+            local_expectation_radius=(
+                self.global_local_expectation_radius
+            ),
+            nms_radius=self.global_nms_radius,
+            reverse=False,
+        )
+        reverse = correlation.global_multimodal_match(
+            num_hypotheses=self.global_num_hypotheses,
+            temperature=self.global_temperature,
+            query_chunk_size=self.global_query_chunk_size,
+            local_expectation_radius=(
+                self.global_local_expectation_radius
+            ),
+            nms_radius=self.global_nms_radius,
+            reverse=True,
+        )
+        decoded: Dict[str, object] = decode_cycle_consistent_topk(
+            forward,
+            reverse,
+            cycle_sigma=self.global_cycle_sigma,
+            cycle_score_weight=self.global_cycle_score_weight,
+            cycle_confidence_floor=self.global_cycle_confidence_floor,
+            minimum_initialisation_confidence=(
+                self.global_minimum_initialisation_confidence
+            ),
+            gate_temperature=self.global_gate_temperature,
+        )
+        decoded["forward"] = forward
+        decoded["reverse"] = reverse
+        return decoded
+
     def forward(
         self,
         image1: torch.Tensor,
@@ -355,8 +574,10 @@ class HQSCore(nn.Module):
 
         source_backbone = self.feature_encoder.backbone(normalised1)
         target_backbone = self.feature_encoder.backbone(normalised2)
-        source_match = self.feature_encoder.project_matching(source_backbone)
-        target_match = self.feature_encoder.project_matching(target_backbone)
+        source_match, target_match = self._encode_matching_pair(
+            source_backbone,
+            target_backbone,
+        )
         # This is the only context/prior feature pyramid in the model and it
         # is computed exclusively from the source image.
         source_context = self.feature_encoder.project_context(source_backbone)
@@ -384,10 +605,10 @@ class HQSCore(nn.Module):
             num_levels=self.all_pairs_levels[16],
             radius=self.correlation_radii[16],
         )
-        global_match = corr16.global_soft_match(
-            temperature=self.global_temperature,
-            query_chunk_size=self.global_query_chunk_size,
-        )
+        global_match = self._decode_global_match(corr16)
+        matcher_candidate = global_match["selected_flow"]
+        if not isinstance(matcher_candidate, torch.Tensor):
+            raise RuntimeError("Global decoder returned an invalid candidate")
         if flow_init is not None:
             if flow_init.ndim != 4 or flow_init.shape[1] != 2:
                 raise ValueError(
@@ -398,10 +619,23 @@ class HQSCore(nn.Module):
                 source_match[16].shape[-2:],
             )
         else:
-            q_initial = global_match["flow_xy"]
-            if self.global_confidence_gated:
+            decoded_initial = global_match["initial_flow"]
+            if not isinstance(decoded_initial, torch.Tensor):
+                raise RuntimeError("Global decoder returned an invalid flow")
+            q_initial = decoded_initial
+            if (
+                self.global_decoder == "soft_expectation"
+                and self.global_confidence_gated
+            ):
                 floor = min(max(self.global_confidence_floor, 0.0), 1.0)
-                gate = floor + (1.0 - floor) * global_match["confidence"]
+                selected_confidence = global_match[
+                    "selected_confidence"
+                ]
+                if not isinstance(selected_confidence, torch.Tensor):
+                    raise RuntimeError(
+                        "Global decoder returned invalid confidence"
+                    )
+                gate = floor + (1.0 - floor) * selected_confidence
                 q_initial = gate * q_initial
 
         state: Optional[HQSState] = None
@@ -506,6 +740,33 @@ class HQSCore(nn.Module):
         flow_predictions[-1] = final_flow
 
         actual_global_init = q_initial
+        forward_match = global_match["forward"]
+        if not isinstance(forward_match, dict):
+            raise RuntimeError("Global decoder omitted forward diagnostics")
+        global_confidence = global_match["selected_confidence"]
+        reverse_flow = global_match["reverse_flow"]
+        if not isinstance(global_confidence, torch.Tensor) or not isinstance(
+            reverse_flow,
+            torch.Tensor,
+        ):
+            raise RuntimeError("Global decoder diagnostics are invalid")
+        reverse_full = resize_flow(
+            reverse_flow,
+            (full_h, full_w),
+        )
+        matcher_supervision_flow = (
+            actual_global_init
+            if self.global_decoder == "soft_expectation"
+            else matcher_candidate
+        )
+        interaction_blends: Dict[int, torch.Tensor] = {}
+        if isinstance(
+            self.feature_encoder,
+            HQSCoreDeepMatchingPyramid,
+        ):
+            interaction_blends = (
+                self.feature_encoder.interaction_blends()
+            )
         return {
             "flow_preds": flow_predictions,
             "flow_preds_raw": raw_flow_predictions,
@@ -537,15 +798,54 @@ class HQSCore(nn.Module):
             "flow_final_raw": raw_flow_predictions[-1],
             "flow_final_refined": final_flow,
             "global_init_flow_xy": actual_global_init,
-            "global_init_confidence": global_match["confidence"],
-            "global_init_entropy": global_match["entropy"],
-            "global_init_margin": global_match["margin"],
-            # Existing loss/evaluation aliases.  The tensor is native 1/16
-            # flow, converted to the TF-port internal (y,x) convention.
-            "gmflow_init_flow_yx": self._to_yx(actual_global_init),
-            "gmflow_init_conf": global_match["confidence"],
-            "gmflow_init_entropy": global_match["entropy"],
-            "gmflow_init_margin": global_match["margin"],
+            "global_init_candidate_flow_xy": matcher_candidate,
+            "global_init_confidence": global_confidence,
+            "global_init_entropy": forward_match["entropy"],
+            "global_init_margin": forward_match["margin"],
+            "global_init_acceptance": global_match["hard_acceptance"],
+            "global_init_soft_acceptance": global_match[
+                "soft_acceptance"
+            ],
+            "global_init_selected_index": global_match[
+                "selected_index"
+            ],
+            "global_init_cycle_support": global_match[
+                "selected_cycle_support"
+            ],
+            "global_init_cycle_error": global_match[
+                "selected_cycle_error"
+            ],
+            "global_topk_flow_xy": forward_match["hypotheses"],
+            "global_topk_map_flow_xy": forward_match[
+                "map_hypotheses"
+            ],
+            "global_topk_probabilities": forward_match[
+                "probabilities"
+            ],
+            "global_topk_cycle_support": global_match[
+                "cycle_support"
+            ],
+            "global_topk_cycle_error": global_match["cycle_error"],
+            "global_reverse_flow_xy": reverse_flow,
+            "global_reverse_confidence": global_match[
+                "reverse_confidence"
+            ],
+            "matching_transformer_blends": interaction_blends,
+            "matching_pyramid": self.matching_pyramid,
+            "global_decoder": self.global_decoder,
+            # The matcher candidate, rather than a rejected zero solver state,
+            # receives direct global correspondence supervision.
+            "gmflow_init_flow_yx": self._to_yx(
+                matcher_supervision_flow
+            ),
+            "gmflow_init_conf": global_confidence,
+            "gmflow_init_entropy": forward_match["entropy"],
+            "gmflow_init_margin": forward_match["margin"],
+            "gmflow_reverse_flow_yx": (
+                self._to_yx(reverse_full)
+                if self.global_decoder == "multimodal_cycle"
+                else None
+            ),
             "occupancy_masks": [],
             "reliability_states": [],
             "reliability_geometries": [],
@@ -561,10 +861,7 @@ class HQSCore(nn.Module):
             return sum(parameter.numel() for parameter in module.parameters())
 
         context_count = count(self.feature_encoder.context_projections)
-        feature_count = (
-            count(self.feature_encoder.stages)
-            + count(self.feature_encoder.match_projections)
-        )
+        feature_count = count(self.feature_encoder) - context_count
         stage_count = (
             count(self.coarse_cell)
             + count(self.fine_cell)

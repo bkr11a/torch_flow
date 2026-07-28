@@ -1,0 +1,144 @@
+# HQSCore with a stronger matching pyramid and correspondence decoder.
+#
+# The HQS data operator, source-only proximal and 2+4+2+2 schedule are retained.
+# The controlled changes are:
+#
+#   * deeper shared Siamese feature extraction;
+#   * bidirectional fine/coarse matching-feature fusion;
+#   * global symmetric self/cross-attention at 1/16;
+#   * alternating shifted-window self/cross-attention at 1/8;
+#   * spatially distinct top-K global modes;
+#   * dominant-mode local expectation;
+#   * reverse matching and cycle-based mode reranking;
+#   * hard accept/reject initialisation with a straight-through gradient.
+#
+# Curriculum:
+#   python train_curriculum.py \
+#     --config configs/default.yaml \
+#     --override configs/dropins/13_hqs_core_deep_match.yaml \
+#     --curriculum configs/curriculum/universal_replay_curriculum.yaml \
+#     --base-run-name hqs_core_deep_match
+
+run_name: hqs_core/deep_match_2_4_2_2
+
+mlflow:
+  registered_model_name: HQSCoreDeepMatch
+  tags:
+    architecture: hqs_core_deep_match
+    operator_structure: warp_validity_weighted_data_prox
+    matching_pyramid: deep_bidirectional
+    correspondence_decoder: multimodal_cycle
+    global_match_scale: 16
+    global_hypotheses: 4
+
+model:
+  model_type: hqs_core
+
+  hqs_core:
+    # Encoder lists are fine-to-coarse: [1/2, 1/4, 1/8, 1/16].
+    # Context dimensions are unchanged so the HQS cells and proximal retain
+    # their existing capacity and interfaces.
+    feature_channels: [48, 96, 144, 192]
+    match_channels: [96, 128, 160, 192]
+    context_channels: [64, 64, 96, 96]
+    blocks_per_scale: [2, 3, 4, 4]
+    groups: 8
+
+    matching_pyramid: deep_bidirectional
+    matching_fusion_depth: 2
+
+    # Pair-feature interaction is fine-to-coarse. High-resolution matching
+    # stays convolutional; 1/8 uses shifted 8x8 windows and 1/16 is global.
+    matching_transformer_depth: [0, 0, 2, 4]
+    matching_transformer_heads: [4, 4, 8, 8]
+    matching_transformer_windows: [0, 0, 8, 0]
+    matching_transformer_maximum_global_tokens: 4096
+    matching_transformer_fallback_window: 16
+    matching_transformer_mlp_ratio: 4.0
+    matching_transformer_initial_blend: 0.25
+    matching_transformer_gradient_checkpointing: true
+
+    # Operator lists are coarse-to-fine: [1/16, 1/8, 1/4, 1/2].
+    iterations: [2, 4, 2, 2]
+    jacobi_sweeps: [2, 2, 1, 1]
+    correlation_radii: [4, 4, 4, 3]
+    all_pairs_levels: [1, 4]
+    correlation_embedding_dim: 64
+    local_corr_channel_chunk: 4
+    local_corr_checkpoint: true
+
+    coarse_hidden_dim: 96
+    fine_hidden_dim: 64
+    prior_hidden_channels: 64
+    validity_hidden_dim: 32
+    upsample_hidden_dim: 64
+
+    max_data_delta: [2.0, 2.0, 1.5, 1.0]
+    max_prox_delta: [0.5, 0.5, 0.5, 0.25]
+
+    beta_initial: 0.10
+    beta_minimum: 0.01
+    lambda_initial: 0.08
+    lambda_minimum: 0.001
+    edge_alpha: 10.0
+    analytic_weight: 1.0
+    learned_data_weight: 1.0
+    analytic_validity_mode: weighted_solve
+
+    initial_reliability: 0.90
+    allow_external_validity_inputs: false
+
+    # Global decoder. The full-distribution expectation is deliberately not
+    # used: it can average distinct motion modes into a false displacement.
+    global_decoder: multimodal_cycle
+    global_temperature: 0.07
+    global_query_chunk_size: 256
+    global_num_hypotheses: 4
+    global_local_expectation_radius: 2
+    global_nms_radius: 3
+    global_cycle_sigma: 1.5
+    global_cycle_score_weight: 1.0
+    global_cycle_confidence_floor: 0.02
+    global_minimum_initialisation_confidence: 0.12
+    global_gate_temperature: 0.05
+
+    # These legacy soft-expectation options are inert for multimodal_cycle.
+    global_confidence_gated: false
+    global_confidence_floor: 0.0
+
+loss:
+  num_stages: 10
+  stage_weight_mode: geometric
+  gamma: 0.85
+
+  # The raw selected correspondence receives supervision even when the
+  # confidence router rejects it as the solver initial state.
+  global_init_weight: 0.10
+  global_confidence_weight: 0.01
+  global_confidence_tau: 1.0
+  global_large_motion_threshold: 40.0
+  global_large_motion_boost: 3.0
+
+  core_visibility_weight: 0.01
+  core_visibility_last_n: 4
+
+  smooth_weight: 0.0
+  inter_smooth_weight: 0.0
+  boundary_weight: 0.0
+  raw_final_weight: 0.0
+  iter_damp_weight: 0.0
+  photo_weight: 0.0
+  ofce_weight: 0.0
+  detail_weight: 0.0
+  occlusion_aware:
+    enabled: false
+
+training:
+  # Keep the first comparison end-to-end. Matcher-only warm-up can be tested
+  # later as a separate optimisation ablation.
+  global_matcher_warmup_steps: 0
+  freeze_backbone_during_global_warmup: false
+  grad_clip: 1.0
+
+data:
+  detail_crop_prob: 0.0

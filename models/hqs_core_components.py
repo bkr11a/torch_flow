@@ -316,6 +316,282 @@ class AllPairsCorrelation:
         result = torch.cat(outputs, dim=-1)
         return result.transpose(1, 2).reshape(b, self.out_channels, h, w)
 
+    def global_multimodal_match(
+        self,
+        *,
+        num_hypotheses: int = 4,
+        temperature: float = 0.07,
+        query_chunk_size: int = 512,
+        local_expectation_radius: int = 2,
+        nms_radius: int = 3,
+        reverse: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """Decode distinct global modes with local sub-pixel expectations.
+
+        A full soft expectation can fall between spatially separated modes,
+        while a raw ``topk`` commonly spends all hypotheses on adjacent pixels
+        from the same peak.  This decoder instead:
+
+        1. selects one peak at a time;
+        2. suppresses its spatial neighbourhood;
+        3. evaluates a soft expectation only inside the selected mode.
+
+        The exact peak displacement is returned separately as
+        ``map_hypotheses``.  ``hypotheses`` contains the locally averaged
+        sub-pixel displacement used by the cycle-consistent decoder.
+        """
+        hypotheses = int(num_hypotheses)
+        temperature = max(float(temperature), 1e-4)
+        chunk = max(int(query_chunk_size), 1)
+        local_radius = max(int(local_expectation_radius), 0)
+        suppression_radius = max(int(nms_radius), local_radius)
+        matrix = (
+            self.base_correlation.transpose(1, 2)
+            if bool(reverse)
+            else self.base_correlation
+        )
+        batch, queries, keys = matrix.shape
+        if not 1 <= hypotheses <= keys:
+            raise ValueError(
+                f"num_hypotheses must be in [1,{keys}], got {hypotheses}"
+            )
+
+        coordinates = coords_grid(
+            1,
+            self.height,
+            self.width,
+            matrix.device,
+        ).to(torch.float32)
+        coordinates = coordinates.flatten(2).transpose(1, 2).squeeze(0)
+        log_keys = math.log(max(keys, 2))
+
+        local_y, local_x = torch.meshgrid(
+            torch.arange(
+                -local_radius,
+                local_radius + 1,
+                device=matrix.device,
+            ),
+            torch.arange(
+                -local_radius,
+                local_radius + 1,
+                device=matrix.device,
+            ),
+            indexing="ij",
+        )
+        local_x = local_x.reshape(1, 1, -1)
+        local_y = local_y.reshape(1, 1, -1)
+        suppress_y, suppress_x = torch.meshgrid(
+            torch.arange(
+                -suppression_radius,
+                suppression_radius + 1,
+                device=matrix.device,
+            ),
+            torch.arange(
+                -suppression_radius,
+                suppression_radius + 1,
+                device=matrix.device,
+            ),
+            indexing="ij",
+        )
+        suppress_x = suppress_x.reshape(1, 1, -1)
+        suppress_y = suppress_y.reshape(1, 1, -1)
+
+        hypothesis_chunks: List[torch.Tensor] = []
+        map_chunks: List[torch.Tensor] = []
+        probability_chunks: List[torch.Tensor] = []
+        entropy_chunks: List[torch.Tensor] = []
+        margin_chunks: List[torch.Tensor] = []
+        peak_chunks: List[torch.Tensor] = []
+        retained_chunks: List[torch.Tensor] = []
+
+        for start in range(0, queries, chunk):
+            stop = min(start + chunk, queries)
+            scaled = matrix[:, start:stop].float() / temperature
+            probabilities = torch.softmax(scaled, dim=-1)
+            working = scaled.clone()
+            negative = torch.finfo(working.dtype).min
+
+            selected_flows: List[torch.Tensor] = []
+            selected_maps: List[torch.Tensor] = []
+            selected_masses: List[torch.Tensor] = []
+            fallback_indices = scaled.topk(
+                k=hypotheses,
+                dim=-1,
+            ).indices
+            query_coordinates = coordinates[start:stop].view(
+                1,
+                stop - start,
+                2,
+            )
+
+            for mode_index in range(hypotheses):
+                peak_indices = working.argmax(dim=-1)
+                peak_scores = working.gather(
+                    -1,
+                    peak_indices.unsqueeze(-1),
+                ).squeeze(-1)
+                exhausted = peak_scores <= negative / 2.0
+                peak_indices = torch.where(
+                    exhausted,
+                    fallback_indices[..., mode_index],
+                    peak_indices,
+                )
+                peak_x = peak_indices.remainder(self.width)
+                peak_y = torch.div(
+                    peak_indices,
+                    self.width,
+                    rounding_mode="floor",
+                )
+
+                neighbour_x = peak_x.unsqueeze(-1) + local_x
+                neighbour_y = peak_y.unsqueeze(-1) + local_y
+                neighbour_valid = (
+                    (neighbour_x >= 0)
+                    & (neighbour_x < self.width)
+                    & (neighbour_y >= 0)
+                    & (neighbour_y < self.height)
+                )
+                neighbour_indices = (
+                    neighbour_y.clamp(0, self.height - 1) * self.width
+                    + neighbour_x.clamp(0, self.width - 1)
+                ).long()
+                local_logits = scaled.gather(-1, neighbour_indices)
+                local_logits = local_logits.masked_fill(
+                    ~neighbour_valid,
+                    negative,
+                )
+                local_weights = torch.softmax(local_logits, dim=-1)
+                local_coordinates = torch.stack(
+                    (neighbour_x, neighbour_y),
+                    dim=-1,
+                ).to(local_weights.dtype)
+                expected_coordinate = (
+                    local_weights.unsqueeze(-1) * local_coordinates
+                ).sum(dim=-2)
+                map_coordinate = coordinates[peak_indices]
+                selected_flows.append(
+                    expected_coordinate - query_coordinates
+                )
+                selected_maps.append(
+                    map_coordinate - query_coordinates
+                )
+                local_mass = (
+                    probabilities.gather(-1, neighbour_indices)
+                    * neighbour_valid.to(probabilities.dtype)
+                ).sum(dim=-1)
+                selected_masses.append(local_mass)
+
+                suppress_neighbour_x = (
+                    peak_x.unsqueeze(-1) + suppress_x
+                )
+                suppress_neighbour_y = (
+                    peak_y.unsqueeze(-1) + suppress_y
+                )
+                suppress_valid = (
+                    (suppress_neighbour_x >= 0)
+                    & (suppress_neighbour_x < self.width)
+                    & (suppress_neighbour_y >= 0)
+                    & (suppress_neighbour_y < self.height)
+                )
+                suppress_indices = (
+                    suppress_neighbour_y.clamp(0, self.height - 1)
+                    * self.width
+                    + suppress_neighbour_x.clamp(0, self.width - 1)
+                ).long()
+                # Invalid padded offsets are redirected to the already
+                # selected peak, avoiding accidental suppression of index 0.
+                suppress_indices = torch.where(
+                    suppress_valid,
+                    suppress_indices,
+                    peak_indices.unsqueeze(-1),
+                )
+                working.scatter_(
+                    -1,
+                    suppress_indices,
+                    negative,
+                )
+
+            flows = torch.stack(selected_flows, dim=2)
+            maps = torch.stack(selected_maps, dim=2)
+            mode_masses = torch.stack(selected_masses, dim=2).clamp(
+                0.0,
+                1.0,
+            )
+            entropy = -(
+                probabilities * probabilities.clamp_min(1e-9).log()
+            ).sum(dim=-1) / log_keys
+            peak = probabilities.max(dim=-1).values
+            if hypotheses > 1:
+                margin = mode_masses[..., 0] - mode_masses[..., 1]
+            else:
+                margin = mode_masses[..., 0]
+            retained = mode_masses.sum(dim=-1).clamp(0.0, 1.0)
+
+            hypothesis_chunks.append(flows)
+            map_chunks.append(maps)
+            probability_chunks.append(mode_masses)
+            entropy_chunks.append(entropy)
+            margin_chunks.append(margin)
+            peak_chunks.append(peak)
+            retained_chunks.append(retained)
+
+        flow = torch.cat(hypothesis_chunks, dim=1)
+        flow = flow.permute(0, 2, 3, 1).reshape(
+            batch,
+            hypotheses,
+            2,
+            self.height,
+            self.width,
+        )
+        map_flow = torch.cat(map_chunks, dim=1)
+        map_flow = map_flow.permute(0, 2, 3, 1).reshape(
+            batch,
+            hypotheses,
+            2,
+            self.height,
+            self.width,
+        )
+        mode_probabilities = torch.cat(probability_chunks, dim=1)
+        mode_probabilities = mode_probabilities.permute(0, 2, 1).reshape(
+            batch,
+            hypotheses,
+            self.height,
+            self.width,
+        )
+
+        def scalar_map(chunks: List[torch.Tensor]) -> torch.Tensor:
+            return torch.cat(chunks, dim=1).reshape(
+                batch,
+                1,
+                self.height,
+                self.width,
+            )
+
+        entropy = scalar_map(entropy_chunks).clamp(0.0, 1.0)
+        margin = scalar_map(margin_chunks)
+        peak = scalar_map(peak_chunks)
+        retained = scalar_map(retained_chunks)
+        margin_ratio = margin / peak.clamp_min(1e-6)
+        confidence = (
+            0.35 * (1.0 - entropy)
+            + 0.35 * margin_ratio.clamp(0.0, 1.0)
+            + 0.30 * retained
+        ).clamp(0.0, 1.0)
+        dtype = self.base_correlation.dtype
+        return {
+            "hypotheses": flow.to(dtype=dtype),
+            "map_hypotheses": map_flow.to(dtype=dtype),
+            "logits": mode_probabilities.clamp_min(1e-9).log().to(
+                dtype=dtype
+            ),
+            "probabilities": mode_probabilities.to(dtype=dtype),
+            "confidence": confidence.to(dtype=dtype),
+            "entropy": entropy.to(dtype=dtype),
+            "margin": margin.to(dtype=dtype),
+            "peak": peak.to(dtype=dtype),
+            "retained_mass": retained.to(dtype=dtype),
+        }
+
     def global_topk_match(
         self,
         *,
