@@ -107,8 +107,10 @@ class HQSCore(nn.Module):
 
         # Iteration/operator lists are coarse-to-fine: [1/16,1/8,1/4,1/2].
         iterations = _int_list(core_cfg, "iterations", (2, 4, 2, 2))
-        if any(v < 1 for v in iterations):
-            raise ValueError(f"All HQSCore iteration counts must be positive: {iterations}")
+        if any(v < 0 for v in iterations):
+            raise ValueError(f"All HQSCore iteration counts must be non-negative: {iterations}")
+        if sum(iterations) == 0:
+            raise ValueError(f"HQSCore must have at least one iteration: {iterations}")
         self.iterations_by_scale = dict(zip(self.scale_order, iterations))
         self.num_hqs_iterations = sum(iterations)
         self.jacobi_sweeps = dict(
