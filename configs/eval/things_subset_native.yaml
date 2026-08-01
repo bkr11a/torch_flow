@@ -1,0 +1,24 @@
+# Native-resolution standalone evaluation config derived from
+# u04_universal_balanced_final.val_data.
+data:
+  mode: single
+  label: things_subset
+  name: things
+  root: "/mnt/a/benchmark_data/optical_flow/FlyingThings3D/FlyingThings3D_subset"
+  dstype: clean
+  side: both
+  direction: forward
+  deterministic: true
+  seed: 941004
+  include_dataset_id: true
+  batch_size: 1
+  num_workers: 2
+
+evaluation:
+  native_resolution: true
+  crop: false
+  resize: false
+  pad_to_stride: 8
+  pad_mode: replicate
+  write_scene_video: false
+
