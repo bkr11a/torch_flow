@@ -86,6 +86,7 @@ def test_hqs_core_overlay_is_a_complete_ten_stage_switch():
     )
     assert cfg.model.model_type == "hqs_core"
     assert list(cfg.model.hqs_core.iterations) == [2, 4, 2, 2]
+    assert cfg.model.hqs_core.global_match_scale == 8
     assert cfg.loss.num_stages == 10
     assert cfg.loss.occlusion_aware.enabled is False
 
@@ -369,6 +370,123 @@ def test_all_pairs_global_match_and_lookup_are_finite_on_tiny_grids():
     lookup = corr.lookup(torch.zeros(1, 2, 2, 2))
     assert lookup.shape == (1, 4 * 9, 2, 2)
     assert torch.isfinite(lookup).all()
+
+
+def test_one_eighth_global_match_decodes_nonzero_translation():
+    """A known 1/8-grid translation must retain sign and (x,y) order."""
+    height, width = 4, 6
+    channels = height * width
+    source = torch.eye(channels).reshape(1, channels, height, width)
+    target = torch.zeros_like(source)
+    dx, dy = 1, 1
+    for source_y in range(height - dy):
+        for source_x in range(width - dx):
+            target[
+                :,
+                :,
+                source_y + dy,
+                source_x + dx,
+            ] = source[:, :, source_y, source_x]
+
+    correlation = AllPairsCorrelation(
+        source,
+        target,
+        num_levels=2,
+        radius=1,
+    )
+    decoded = correlation.global_soft_match(
+        temperature=0.01,
+        query_chunk_size=8,
+    )
+    valid_flow = decoded["flow_xy"][
+        :, :, : height - dy, : width - dx
+    ]
+    expected = torch.empty_like(valid_flow)
+    expected[:, 0].fill_(float(dx))
+    expected[:, 1].fill_(float(dy))
+    assert torch.allclose(valid_flow, expected, atol=1e-3, rtol=1e-3)
+    assert decoded["confidence"][
+        :, :, : height - dy, : width - dx
+    ].min() > 0.9
+
+
+def test_one_eighth_candidate_is_rescaled_for_one_sixteenth_solver_and_is_supervised_raw():
+    """Candidate learning remains native while solver admission changes grid."""
+    torch.manual_seed(17)
+    config = _tiny_core_config()
+    config.update(
+        {
+            "global_match_scale": 8,
+            "global_decoder": "soft_expectation",
+            "global_confidence_gated": True,
+            "global_confidence_floor": 0.0,
+        }
+    )
+    model = HQSCore({"hqs_core": config})
+    output = model(
+        torch.rand(1, 3, 32, 48),
+        torch.rand(1, 3, 32, 48),
+    )
+
+    candidate = output["global_init_candidate_flow_xy"]
+    confidence = output["global_init_confidence"]
+    supervision_yx = output["gmflow_init_flow_yx"]
+    supervision_xy = torch.stack(
+        (supervision_yx[:, 1], supervision_yx[:, 0]),
+        dim=1,
+    )
+
+    assert output["global_match_scale"] == 8
+    assert output["global_solver_init_scale"] == 16
+    assert candidate.shape[-2:] == (4, 6)
+    assert output["global_init_flow_xy"].shape[-2:] == (2, 3)
+    # This assertion fails if supervision is accidentally taken from the
+    # confidence-gated 1/16 solver state.
+    assert torch.allclose(supervision_xy, candidate)
+
+    expected_solver_initial = resize_flow(
+        confidence * candidate,
+        (2, 3),
+    )
+    assert torch.allclose(
+        output["global_init_flow_xy"],
+        expected_solver_initial,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+    candidate.retain_grad()
+    supervision_yx.square().mean().backward()
+    assert candidate.grad is not None
+    assert torch.isfinite(candidate.grad).all()
+    assert torch.count_nonzero(candidate.grad) > 0
+    scale_eight_projection_gradients = [
+        parameter.grad
+        for parameter in model.feature_encoder.match_projections[
+            "8"
+        ].parameters()
+        if parameter.requires_grad and parameter.grad is not None
+    ]
+    assert scale_eight_projection_gradients
+    assert all(
+        torch.isfinite(gradient).all()
+        for gradient in scale_eight_projection_gradients
+    )
+    assert any(
+        torch.count_nonzero(gradient) > 0
+        for gradient in scale_eight_projection_gradients
+    )
+
+
+def test_global_match_scale_rejects_unsupported_grids():
+    config = _tiny_core_config()
+    config["global_match_scale"] = 4
+    try:
+        HQSCore({"hqs_core": config})
+    except ValueError as error:
+        assert "global_match_scale" in str(error)
+    else:
+        raise AssertionError("Unsupported global matching scale was accepted")
 
 
 def test_multimodal_global_decoder_retains_spatially_distinct_modes():

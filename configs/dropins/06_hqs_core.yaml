@@ -66,8 +66,10 @@ model:
     initial_reliability: 0.90
     allow_external_validity_inputs: false
 
-    # Fixed global all-pairs soft feature matching at 1/16. Matching features
-    # remain learned end-to-end through the shared encoder.
+    # Decode the global initialisation from the existing 1/8 all-pairs volume.
+    # The admitted flow is resized with vector scaling before initialising the
+    # first 1/16 HQS state. Matching features remain learned end-to-end.
+    global_match_scale: 8
     global_temperature: 0.07
     global_query_chunk_size: 512
     global_confidence_gated: true

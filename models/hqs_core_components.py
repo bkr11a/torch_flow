@@ -189,8 +189,8 @@ class AllPairsCorrelation:
     """Reusable all-pairs correlation with global match and RAFT lookup.
 
     It computes the expensive all-pairs matrix once.  The same matrix supports
-    both a chunked global soft correspondence at 1/16 and recurrent local
-    indexing at 1/16 or 1/8.
+    both a chunked global correspondence at its native feature scale and
+    recurrent local indexing at 1/16 or 1/8.
     """
 
     def __init__(

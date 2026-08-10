@@ -346,6 +346,14 @@ class HQSCore(nn.Module):
         self.global_query_chunk_size = int(
             _cfg_get(core_cfg, "global_query_chunk_size", 512)
         )
+        self.global_match_scale = int(
+            _cfg_get(core_cfg, "global_match_scale", 16)
+        )
+        if self.global_match_scale not in (16, 8):
+            raise ValueError(
+                "hqs_core.global_match_scale must be 16 or 8, got "
+                f"{self.global_match_scale}"
+            )
         self.global_confidence_gated = bool(
             _cfg_get(core_cfg, "global_confidence_gated", True)
         )
@@ -599,15 +607,27 @@ class HQSCore(nn.Module):
             )
             target_gradients[scale] = spatial_gradients(target_gray[scale])
 
-        # One 1/16 all-pairs matrix serves both global initialisation and the
-        # two coarse data iterations.
-        corr16 = AllPairsCorrelation(
-            source_match[16],
-            target_match[16],
-            num_levels=self.all_pairs_levels[16],
-            radius=self.correlation_radii[16],
-        )
-        global_match = self._decode_global_match(corr16)
+        # The recurrent solver uses all-pairs lookup at both coarse scales.
+        # Global matching may be decoded at 1/16 (legacy) or 1/8.  Construct
+        # the selected global volume once and reuse it when the solver reaches
+        # that scale.
+        all_pairs_by_scale: Dict[int, AllPairsCorrelation] = {
+            16: AllPairsCorrelation(
+                source_match[16],
+                target_match[16],
+                num_levels=self.all_pairs_levels[16],
+                radius=self.correlation_radii[16],
+            )
+        }
+        if self.global_match_scale == 8:
+            all_pairs_by_scale[8] = AllPairsCorrelation(
+                source_match[8],
+                target_match[8],
+                num_levels=self.all_pairs_levels[8],
+                radius=self.correlation_radii[8],
+            )
+        global_correlation = all_pairs_by_scale[self.global_match_scale]
+        global_match = self._decode_global_match(global_correlation)
         matcher_candidate = global_match["selected_flow"]
         if not isinstance(matcher_candidate, torch.Tensor):
             raise RuntimeError("Global decoder returned an invalid candidate")
@@ -624,7 +644,7 @@ class HQSCore(nn.Module):
             decoded_initial = global_match["initial_flow"]
             if not isinstance(decoded_initial, torch.Tensor):
                 raise RuntimeError("Global decoder returned an invalid flow")
-            q_initial = decoded_initial
+            admitted_initial = decoded_initial
             if (
                 self.global_decoder == "soft_expectation"
                 and self.global_confidence_gated
@@ -638,7 +658,14 @@ class HQSCore(nn.Module):
                         "Global decoder returned invalid confidence"
                     )
                 gate = floor + (1.0 - floor) * selected_confidence
-                q_initial = gate * q_initial
+                admitted_initial = gate * admitted_initial
+            # The global decoder returns flow in pixels of its native matching
+            # grid.  The first HQS state is always 1/16, so a 1/8 candidate
+            # must be spatially resized and have its vector components scaled.
+            q_initial = resize_flow(
+                admitted_initial,
+                source_match[16].shape[-2:],
+            )
 
         state: Optional[HQSState] = None
         flow_predictions: List[torch.Tensor] = []
@@ -661,7 +688,9 @@ class HQSCore(nn.Module):
             cell = self._cell_for_scale(scale)
             if scale_index == 0:
                 state = cell.initialise_state(source_context[scale], q_initial)
-                all_pairs: Optional[AllPairsCorrelation] = corr16
+                all_pairs: Optional[AllPairsCorrelation] = (
+                    all_pairs_by_scale[16]
+                )
             else:
                 assert state is not None
                 transitioned_q = resize_flow(
@@ -673,12 +702,14 @@ class HQSCore(nn.Module):
                     source_context[scale], transitioned_q
                 )
                 if scale == 8:
-                    all_pairs = AllPairsCorrelation(
-                        source_match[8],
-                        target_match[8],
-                        num_levels=self.all_pairs_levels[8],
-                        radius=self.correlation_radii[8],
-                    )
+                    if 8 not in all_pairs_by_scale:
+                        all_pairs_by_scale[8] = AllPairsCorrelation(
+                            source_match[8],
+                            target_match[8],
+                            num_levels=self.all_pairs_levels[8],
+                            radius=self.correlation_radii[8],
+                        )
+                    all_pairs = all_pairs_by_scale[8]
                 else:
                     all_pairs = None
 
@@ -756,11 +787,10 @@ class HQSCore(nn.Module):
             reverse_flow,
             (full_h, full_w),
         )
-        matcher_supervision_flow = (
-            actual_global_init
-            if self.global_decoder == "soft_expectation"
-            else matcher_candidate
-        )
+        # Supervise the raw correspondence candidate, never the confidence-
+        # gated/rejected solver state.  This keeps candidate accuracy and
+        # solver admission as separate learning problems.
+        matcher_supervision_flow = matcher_candidate
         interaction_blends: Dict[int, torch.Tensor] = {}
         if isinstance(
             self.feature_encoder,
@@ -835,6 +865,8 @@ class HQSCore(nn.Module):
             "matching_transformer_blends": interaction_blends,
             "matching_pyramid": self.matching_pyramid,
             "global_decoder": self.global_decoder,
+            "global_match_scale": self.global_match_scale,
+            "global_solver_init_scale": 16,
             # The matcher candidate, rather than a rejected zero solver state,
             # receives direct global correspondence supervision.
             "gmflow_init_flow_yx": self._to_yx(
