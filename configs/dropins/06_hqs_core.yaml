@@ -67,9 +67,12 @@ model:
     allow_external_validity_inputs: false
 
     # Decode the global initialisation from the existing 1/8 all-pairs volume.
-    # The admitted flow is resized with vector scaling before initialising the
-    # first 1/16 HQS state. Matching features remain learned end-to-end.
+    # A resized view initialises the two 1/16 iterations. When the solver enters
+    # 1/8, native_residual restores the retained native-grid candidate and adds
+    # only the correction learned at 1/16. This preserves 1/8 spatial detail
+    # without discarding the work performed by the 1/16 iterations.
     global_match_scale: 8
+    global_match_transition_mode: native_residual
     global_temperature: 0.07
     global_query_chunk_size: 512
     global_confidence_gated: true

@@ -87,6 +87,10 @@ def test_hqs_core_overlay_is_a_complete_ten_stage_switch():
     assert cfg.model.model_type == "hqs_core"
     assert list(cfg.model.hqs_core.iterations) == [2, 4, 2, 2]
     assert cfg.model.hqs_core.global_match_scale == 8
+    assert (
+        cfg.model.hqs_core.global_match_transition_mode
+        == "native_residual"
+    )
     assert cfg.loss.num_stages == 10
     assert cfg.loss.occlusion_aware.enabled is False
 
@@ -410,8 +414,8 @@ def test_one_eighth_global_match_decodes_nonzero_translation():
     ].min() > 0.9
 
 
-def test_one_eighth_candidate_is_rescaled_for_one_sixteenth_solver_and_is_supervised_raw():
-    """Candidate learning remains native while solver admission changes grid."""
+def test_one_eighth_candidate_is_reused_natively_and_is_supervised_raw():
+    """Candidate learning and the 1/8 solver entry retain the native grid."""
     torch.manual_seed(17)
     config = _tiny_core_config()
     config.update(
@@ -420,6 +424,7 @@ def test_one_eighth_candidate_is_rescaled_for_one_sixteenth_solver_and_is_superv
             "global_decoder": "soft_expectation",
             "global_confidence_gated": True,
             "global_confidence_floor": 0.0,
+            "global_match_transition_mode": "native_residual",
         }
     )
     model = HQSCore({"hqs_core": config})
@@ -440,6 +445,19 @@ def test_one_eighth_candidate_is_rescaled_for_one_sixteenth_solver_and_is_superv
     assert output["global_solver_init_scale"] == 16
     assert candidate.shape[-2:] == (4, 6)
     assert output["global_init_flow_xy"].shape[-2:] == (2, 3)
+    native_admitted = output[
+        "global_init_native_admitted_flow_xy"
+    ]
+    match_scale_entry = output[
+        "global_init_match_scale_entry_flow_xy"
+    ]
+    coarse_correction = output[
+        "global_init_match_scale_coarse_correction_xy"
+    ]
+    assert native_admitted.shape[-2:] == (4, 6)
+    assert match_scale_entry.shape[-2:] == (4, 6)
+    assert coarse_correction.shape[-2:] == (4, 6)
+    assert output["global_match_transition_mode"] == "native_residual"
     # This assertion fails if supervision is accidentally taken from the
     # confidence-gated 1/16 solver state.
     assert torch.allclose(supervision_xy, candidate)
@@ -449,8 +467,22 @@ def test_one_eighth_candidate_is_rescaled_for_one_sixteenth_solver_and_is_superv
         (2, 3),
     )
     assert torch.allclose(
+        native_admitted,
+        confidence * candidate,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert torch.allclose(
         output["global_init_flow_xy"],
         expected_solver_initial,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    # The first 1/8 state is based on the retained native candidate, with only
+    # the correction made by the 1/16 iterations transferred across scales.
+    assert torch.allclose(
+        match_scale_entry,
+        native_admitted + coarse_correction,
         atol=1e-5,
         rtol=1e-5,
     )
@@ -478,6 +510,37 @@ def test_one_eighth_candidate_is_rescaled_for_one_sixteenth_solver_and_is_superv
     )
 
 
+def test_native_residual_transition_preserves_one_eighth_detail():
+    """The 1/16 round trip must not replace native 1/8 structure."""
+    native = torch.zeros(1, 2, 4, 6)
+    checkerboard = (
+        torch.arange(4).view(4, 1)
+        + torch.arange(6).view(1, 6)
+    ) % 2
+    native[:, 0] = 2.0 * checkerboard.float() - 1.0
+
+    coarse_initial = resize_flow(native, (2, 3))
+    coarse_update = torch.zeros_like(coarse_initial)
+    coarse_update[:, 0].fill_(0.25)
+    coarse_update[:, 1].fill_(-0.50)
+    coarse_solution = coarse_initial + coarse_update
+
+    entry, correction = HQSCore._compose_native_match_scale_entry(
+        coarse_solution=coarse_solution,
+        coarse_initial=coarse_initial,
+        native_initial=native,
+        mode="native_residual",
+    )
+    expected_correction = resize_flow(coarse_update, native.shape[-2:])
+
+    assert torch.allclose(correction, expected_correction)
+    assert torch.allclose(entry, native + expected_correction)
+    assert torch.allclose(entry - correction, native)
+    # The legacy path loses the checkerboard through the 1/16 bottleneck.
+    legacy_entry = resize_flow(coarse_solution, native.shape[-2:])
+    assert not torch.allclose(entry, legacy_entry)
+
+
 def test_global_match_scale_rejects_unsupported_grids():
     config = _tiny_core_config()
     config["global_match_scale"] = 4
@@ -487,6 +550,17 @@ def test_global_match_scale_rejects_unsupported_grids():
         assert "global_match_scale" in str(error)
     else:
         raise AssertionError("Unsupported global matching scale was accepted")
+
+
+def test_global_match_transition_rejects_unknown_mode():
+    config = _tiny_core_config()
+    config["global_match_transition_mode"] = "unknown"
+    try:
+        HQSCore({"hqs_core": config})
+    except ValueError as error:
+        assert "global_match_transition_mode" in str(error)
+    else:
+        raise AssertionError("Unknown global transition mode was accepted")
 
 
 def test_multimodal_global_decoder_retains_spatially_distinct_modes():

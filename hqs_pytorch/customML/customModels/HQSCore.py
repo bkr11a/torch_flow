@@ -354,6 +354,23 @@ class HQSCore(nn.Module):
                 "hqs_core.global_match_scale must be 16 or 8, got "
                 f"{self.global_match_scale}"
             )
+        self.global_match_transition_mode = str(
+            _cfg_get(
+                core_cfg,
+                "global_match_transition_mode",
+                "legacy_resize",
+            )
+        ).lower()
+        if self.global_match_transition_mode not in {
+            "legacy_resize",
+            "native_replace",
+            "native_residual",
+        }:
+            raise ValueError(
+                "hqs_core.global_match_transition_mode must be "
+                "legacy_resize, native_replace or native_residual, got "
+                f"{self.global_match_transition_mode!r}"
+            )
         self.global_confidence_gated = bool(
             _cfg_get(core_cfg, "global_confidence_gated", True)
         )
@@ -428,6 +445,42 @@ class HQSCore(nn.Module):
 
     def _cell_for_scale(self, scale: int) -> StructuredHQSCell:
         return self.coarse_cell if scale in (16, 8) else self.fine_cell
+
+    @staticmethod
+    def _compose_native_match_scale_entry(
+        *,
+        coarse_solution: torch.Tensor,
+        coarse_initial: torch.Tensor,
+        native_initial: torch.Tensor,
+        mode: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compose the state used to enter a native global-match scale.
+
+        ``native_initial`` retains the spatial detail of the global candidate
+        on its decoded grid.  ``coarse_solution - coarse_initial`` isolates
+        the correction made by the preceding coarse HQS iterations, so that
+        correction can be transferred without replacing the native candidate
+        by a downsample-then-upsampled copy.
+
+        Returns the composed entry state and the resized coarse correction.
+        """
+        native_size = native_initial.shape[-2:]
+        coarse_correction = resize_flow(
+            coarse_solution - coarse_initial,
+            native_size,
+        )
+        if mode == "legacy_resize":
+            entry = resize_flow(coarse_solution, native_size)
+        elif mode == "native_replace":
+            entry = native_initial
+        elif mode == "native_residual":
+            entry = native_initial + coarse_correction
+        else:
+            raise ValueError(
+                "Unknown global match transition mode: "
+                f"{mode!r}"
+            )
+        return entry, coarse_correction
 
     def _correlation_features(
         self,
@@ -636,8 +689,16 @@ class HQSCore(nn.Module):
                 raise ValueError(
                     f"flow_init must be [B,2,H,W] in (x,y) order, got {tuple(flow_init.shape)}"
                 )
+            external_initial = flow_init.to(
+                device=image1.device,
+                dtype=image1.dtype,
+            )
+            native_solver_initial = resize_flow(
+                external_initial,
+                source_match[self.global_match_scale].shape[-2:],
+            )
             q_initial = resize_flow(
-                flow_init.to(device=image1.device, dtype=image1.dtype),
+                native_solver_initial,
                 source_match[16].shape[-2:],
             )
         else:
@@ -659,6 +720,10 @@ class HQSCore(nn.Module):
                     )
                 gate = floor + (1.0 - floor) * selected_confidence
                 admitted_initial = gate * admitted_initial
+            # Retain the admitted candidate on the native matching grid.  It
+            # is used directly when the recurrent solver reaches that scale;
+            # q_initial is only the coarse view required by the 1/16 stage.
+            native_solver_initial = admitted_initial
             # The global decoder returns flow in pixels of its native matching
             # grid.  The first HQS state is always 1/16, so a 1/8 candidate
             # must be spatially resized and have its vector components scaled.
@@ -683,11 +748,18 @@ class HQSCore(nn.Module):
         beta_values: List[torch.Tensor] = []
         lambda_values: List[torch.Tensor] = []
         prediction_scales: List[int] = []
+        match_scale_entry_flow: Optional[torch.Tensor] = None
+        match_scale_coarse_correction: Optional[torch.Tensor] = None
 
         for scale_index, scale in enumerate(self.scale_order):
             cell = self._cell_for_scale(scale)
             if scale_index == 0:
                 state = cell.initialise_state(source_context[scale], q_initial)
+                if self.global_match_scale == scale:
+                    match_scale_entry_flow = q_initial
+                    match_scale_coarse_correction = torch.zeros_like(
+                        q_initial
+                    )
                 all_pairs: Optional[AllPairsCorrelation] = (
                     all_pairs_by_scale[16]
                 )
@@ -696,6 +768,17 @@ class HQSCore(nn.Module):
                 transitioned_q = resize_flow(
                     state.q, source_match[scale].shape[-2:]
                 )
+                if scale == self.global_match_scale:
+                    (
+                        transitioned_q,
+                        match_scale_coarse_correction,
+                    ) = self._compose_native_match_scale_entry(
+                        coarse_solution=state.q,
+                        coarse_initial=q_initial,
+                        native_initial=native_solver_initial,
+                        mode=self.global_match_transition_mode,
+                    )
+                    match_scale_entry_flow = transitioned_q
                 # HQS scale transition: q is the transferred solution, w is
                 # reset to q, and hidden is reset from source context.
                 state = cell.initialise_state(
@@ -773,6 +856,13 @@ class HQSCore(nn.Module):
         flow_predictions[-1] = final_flow
 
         actual_global_init = q_initial
+        if (
+            match_scale_entry_flow is None
+            or match_scale_coarse_correction is None
+        ):
+            raise RuntimeError(
+                "The global-match scale was not visited by the HQS solver"
+            )
         forward_match = global_match["forward"]
         if not isinstance(forward_match, dict):
             raise RuntimeError("Global decoder omitted forward diagnostics")
@@ -831,6 +921,13 @@ class HQSCore(nn.Module):
             "flow_final_refined": final_flow,
             "global_init_flow_xy": actual_global_init,
             "global_init_candidate_flow_xy": matcher_candidate,
+            "global_init_native_admitted_flow_xy": native_solver_initial,
+            "global_init_match_scale_entry_flow_xy": (
+                match_scale_entry_flow
+            ),
+            "global_init_match_scale_coarse_correction_xy": (
+                match_scale_coarse_correction
+            ),
             "global_init_confidence": global_confidence,
             "global_init_entropy": forward_match["entropy"],
             "global_init_margin": forward_match["margin"],
@@ -866,6 +963,9 @@ class HQSCore(nn.Module):
             "matching_pyramid": self.matching_pyramid,
             "global_decoder": self.global_decoder,
             "global_match_scale": self.global_match_scale,
+            "global_match_transition_mode": (
+                self.global_match_transition_mode
+            ),
             "global_solver_init_scale": 16,
             # The matcher candidate, rather than a rejected zero solver state,
             # receives direct global correspondence supervision.
