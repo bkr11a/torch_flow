@@ -200,6 +200,7 @@ class AllPairsCorrelation:
         *,
         num_levels: int,
         radius: int,
+        correlation_mode: str = "cosine",
     ) -> None:
         if fmap1.shape != fmap2.shape:
             raise ValueError(
@@ -212,12 +213,23 @@ class AllPairsCorrelation:
         self.batch, self.channels, self.height, self.width = fmap1.shape
         self.num_levels = int(num_levels)
         self.radius = int(radius)
-
-        f1 = F.normalize(fmap1.float(), dim=1, eps=1e-6)
-        f2 = F.normalize(fmap2.float(), dim=1, eps=1e-6)
+        self.correlation_mode = str(correlation_mode).lower()
+        if self.correlation_mode == "cosine":
+            f1 = F.normalize(fmap1.float(), dim=1, eps=1e-6)
+            f2 = F.normalize(fmap2.float(), dim=1, eps=1e-6)
+            scale = 1.0
+        elif self.correlation_mode in {"sqrt_dim", "scaled_dot"}:
+            f1 = fmap1.float()
+            f2 = fmap2.float()
+            scale = 1.0 / math.sqrt(max(self.channels, 1))
+        else:
+            raise ValueError(
+                "correlation_mode must be 'cosine' or 'sqrt_dim', got "
+                f"{correlation_mode!r}"
+            )
         f1_flat = f1.flatten(2).transpose(1, 2)
         f2_flat = f2.flatten(2)
-        base = torch.bmm(f1_flat, f2_flat)
+        base = torch.bmm(f1_flat, f2_flat) * scale
         # Preserve the feature dtype for the recurrent lookup.  The global
         # softmax below is explicitly evaluated in float32.
         self.base_correlation = base.to(dtype=fmap1.dtype)
@@ -712,11 +724,23 @@ class AllPairsCorrelation:
         *,
         temperature: float = 0.07,
         query_chunk_size: int = 512,
+        reverse: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        """Return expected global displacement and confidence at this grid."""
+        """Return expected global displacement and confidence at this grid.
+
+        ``reverse=True`` decodes target-to-source flow from the transpose of
+        the same all-pairs matrix.  This is GMFlow's inexpensive bidirectional
+        matching construction: feature extraction and correlation are not
+        repeated.
+        """
         temperature = max(float(temperature), 1e-4)
         chunk = max(int(query_chunk_size), 1)
-        b, n, m = self.base_correlation.shape
+        matrix = (
+            self.base_correlation.transpose(1, 2)
+            if bool(reverse)
+            else self.base_correlation
+        )
+        b, n, m = matrix.shape
         target_coords = coords_grid(
             1, self.height, self.width, self.base_correlation.device
         ).to(torch.float32)
@@ -731,7 +755,7 @@ class AllPairsCorrelation:
 
         for start in range(0, n, chunk):
             stop = min(start + chunk, n)
-            logits = self.base_correlation[:, start:stop].float()
+            logits = matrix[:, start:stop].float()
             probabilities = torch.softmax(logits / temperature, dim=-1)
             expected_chunks.append(torch.matmul(probabilities, target_coords))
 
@@ -1294,6 +1318,7 @@ class StructuredHQSCell(nn.Module):
         jacobi_sweeps: int,
         max_data_delta: float,
         max_prox_delta: float,
+        measurement_reliability: torch.Tensor | None = None,
     ) -> HQSIterationOutput:
         beta = self.beta_schedule(iteration).to(
             device=state.q.device, dtype=state.q.dtype
@@ -1316,6 +1341,17 @@ class StructuredHQSCell(nn.Module):
         reliability = validity_head(
             correlation, linearisation, state.w, state.q
         )
+        if measurement_reliability is not None:
+            if measurement_reliability.shape != reliability.shape:
+                raise ValueError(
+                    "measurement_reliability must match the cell grid: "
+                    f"{tuple(measurement_reliability.shape)} versus "
+                    f"{tuple(reliability.shape)}"
+                )
+            reliability = reliability * measurement_reliability.to(
+                device=reliability.device,
+                dtype=reliability.dtype,
+            ).clamp(0.0, 1.0)
         validity = linearisation.in_bounds * reliability
         if self.analytic_validity_mode == "weighted_solve":
             analytic_delta = weighted_analytic_data_delta(

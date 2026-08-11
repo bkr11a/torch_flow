@@ -393,6 +393,12 @@ class HQSFlowLoss(nn.Module):
             cfg.get("detail_high_pass_factor", 2)
         )
         self.global_init_weight = float(cfg.get("global_init_weight", 0.0))
+        self.global_propagated_weight = float(
+            cfg.get("global_propagated_weight", 0.0)
+        )
+        self.global_fb_visibility_weight = float(
+            cfg.get("global_fb_visibility_weight", 0.0)
+        )
         self.global_confidence_weight = float(
             cfg.get("global_confidence_weight", 0.0)
         )
@@ -1247,6 +1253,72 @@ class HQSFlowLoss(nn.Module):
                             total
                             + self.global_confidence_weight * confidence_loss
                         )
+
+            propagated_yx = model_outputs.get("gmflow_propagated_flow_yx")
+            if isinstance(propagated_yx, torch.Tensor):
+                propagated_xy = torch.stack(
+                    (propagated_yx[:, 1], propagated_yx[:, 0]),
+                    dim=1,
+                )
+                gt_propagated = self._resize_flow_gt(
+                    flow_gt,
+                    propagated_xy.shape[-2:],
+                )
+                _, reliable_full = self._visibility_targets(
+                    flow_gt,
+                    valid,
+                    occlusion,
+                    invalid,
+                    synthetic_occlusion,
+                )
+                propagated_valid = F.interpolate(
+                    reliable_full,
+                    size=propagated_xy.shape[-2:],
+                    mode="nearest",
+                )
+                magnitude_full = flow_gt.square().sum(1, keepdim=True).sqrt()
+                propagated_large_motion = F.interpolate(
+                    (
+                        magnitude_full >= self.global_large_motion_threshold
+                    ).to(flow_gt.dtype),
+                    size=propagated_xy.shape[-2:],
+                    mode="nearest",
+                )
+                propagated_weight = propagated_valid * (
+                    1.0
+                    + self.global_large_motion_boost
+                    * propagated_large_motion
+                )
+                propagated_point = charbonnier(
+                    propagated_xy - gt_propagated
+                ).mean(dim=1, keepdim=True)
+                propagated_loss = (
+                    (propagated_point * propagated_weight).sum()
+                    / propagated_weight.sum().clamp_min(1.0)
+                )
+                out["global_propagated"] = propagated_loss
+                if self.global_propagated_weight > 0:
+                    total = (
+                        total
+                        + self.global_propagated_weight * propagated_loss
+                    )
+
+            fb_reliability = model_outputs.get("global_fb_reliability")
+            if isinstance(fb_reliability, torch.Tensor):
+                fb_visibility = self._core_visibility_loss(
+                    [fb_reliability],
+                    flow_gt,
+                    valid,
+                    occlusion,
+                    invalid,
+                    synthetic_occlusion,
+                )
+                out["global_fb_visibility"] = fb_visibility
+                if self.global_fb_visibility_weight > 0:
+                    total = (
+                        total
+                        + self.global_fb_visibility_weight * fb_visibility
+                    )
 
             core_reliability = model_outputs.get("core_reliability_lows")
             if isinstance(core_reliability, list) and core_reliability:

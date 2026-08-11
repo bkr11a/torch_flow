@@ -32,6 +32,10 @@ from models.hqs_deep_match_components import (
     HQSCoreDeepMatchingPyramid,
     decode_cycle_consistent_topk,
 )
+from models.hqs_gmflow_components import (
+    GMFlowMatchingFrontEnd,
+    gmflow_forward_backward_consistency,
+)
 from models.warp import resize_flow
 
 
@@ -162,6 +166,7 @@ class HQSCore(nn.Module):
         self.matching_pyramid = str(
             _cfg_get(core_cfg, "matching_pyramid", "standard")
         ).lower()
+        self.gmflow_matcher: Optional[GMFlowMatchingFrontEnd] = None
         if self.matching_pyramid in {
             "deep_bidirectional",
             "deep_match",
@@ -227,7 +232,7 @@ class HQSCore(nn.Module):
                     )
                 ),
             )
-        elif self.matching_pyramid == "standard":
+        elif self.matching_pyramid in {"standard", "gmflow"}:
             self.feature_encoder = HQSCorePyramidEncoder(
                 feature_channels=feature_channels,
                 match_channels=match_channels,
@@ -235,13 +240,46 @@ class HQSCore(nn.Module):
                 blocks_per_scale=blocks_per_scale,
                 groups=groups,
             )
+            if self.matching_pyramid == "gmflow":
+                self.gmflow_matcher = GMFlowMatchingFrontEnd(
+                    channels=int(
+                        _cfg_get(core_cfg, "gmflow_feature_channels", 128)
+                    ),
+                    transformer_depth=int(
+                        _cfg_get(core_cfg, "gmflow_transformer_depth", 6)
+                    ),
+                    ffn_expansion=int(
+                        _cfg_get(core_cfg, "gmflow_ffn_expansion", 4)
+                    ),
+                    attention_splits=int(
+                        _cfg_get(core_cfg, "gmflow_attention_splits", 2)
+                    ),
+                    gradient_checkpointing=bool(
+                        _cfg_get(
+                            core_cfg,
+                            "gmflow_gradient_checkpointing",
+                            True,
+                        )
+                    ),
+                    propagation_query_chunk_size=int(
+                        _cfg_get(
+                            core_cfg,
+                            "gmflow_propagation_query_chunk_size",
+                            512,
+                        )
+                    ),
+                )
         else:
             raise ValueError(
-                "hqs_core.matching_pyramid must be standard or "
-                f"deep_bidirectional, got {self.matching_pyramid!r}"
+                "hqs_core.matching_pyramid must be standard, gmflow or "
+                f"deep_bidirectional; got {self.matching_pyramid!r}"
             )
         # Used only when Trainer's optional matcher warm-up is enabled.
-        self.global_matcher_parameter_prefixes = ("feature_encoder.",)
+        self.global_matcher_parameter_prefixes = (
+            ("gmflow_matcher.",)
+            if self.matching_pyramid == "gmflow"
+            else ("feature_encoder.",)
+        )
 
         raw_corr_channels = {
             16: all_pairs_levels[16] * (2 * correlation_radii[16] + 1) ** 2,
@@ -343,6 +381,18 @@ class HQSCore(nn.Module):
         self.global_temperature = float(
             _cfg_get(core_cfg, "global_temperature", 0.07)
         )
+        self.global_correlation_mode = str(
+            _cfg_get(core_cfg, "global_correlation_mode", "cosine")
+        ).lower()
+        if self.global_correlation_mode not in {
+            "cosine",
+            "sqrt_dim",
+            "scaled_dot",
+        }:
+            raise ValueError(
+                "hqs_core.global_correlation_mode must be cosine or "
+                f"sqrt_dim, got {self.global_correlation_mode!r}"
+            )
         self.global_query_chunk_size = int(
             _cfg_get(core_cfg, "global_query_chunk_size", 512)
         )
@@ -416,6 +466,87 @@ class HQSCore(nn.Module):
         self.global_gate_temperature = float(
             _cfg_get(core_cfg, "global_gate_temperature", 0.05)
         )
+        self.global_bidirectional = bool(
+            _cfg_get(core_cfg, "global_bidirectional", False)
+        )
+        self.global_use_flow_propagation = bool(
+            _cfg_get(core_cfg, "global_use_flow_propagation", False)
+        )
+        self.global_propagation_routing = str(
+            _cfg_get(core_cfg, "global_propagation_routing", "fb_blend")
+        ).lower()
+        if self.global_propagation_routing not in {
+            "raw",
+            "propagated",
+            "fb_blend",
+        }:
+            raise ValueError(
+                "hqs_core.global_propagation_routing must be raw, propagated "
+                f"or fb_blend, got {self.global_propagation_routing!r}"
+            )
+        self.global_fb_data_gate = bool(
+            _cfg_get(core_cfg, "global_fb_data_gate", False)
+        )
+        self.global_fb_data_gate_scales = tuple(
+            int(value)
+            for value in _cfg_get(
+                core_cfg,
+                "global_fb_data_gate_scales",
+                (16, 8),
+            )
+        )
+        if any(scale not in self.scale_order for scale in self.global_fb_data_gate_scales):
+            raise ValueError(
+                "global_fb_data_gate_scales must contain only 16, 8, 4 or 2"
+            )
+        self.global_fb_gate_source = str(
+            _cfg_get(core_cfg, "global_fb_gate_source", "raw")
+        ).lower()
+        if self.global_fb_gate_source not in {"raw", "propagated"}:
+            raise ValueError(
+                "global_fb_gate_source must be raw or propagated"
+            )
+        self.global_fb_alpha = float(
+            _cfg_get(core_cfg, "global_fb_alpha", 0.01)
+        )
+        self.global_fb_beta = float(
+            _cfg_get(core_cfg, "global_fb_beta", 0.5)
+        )
+        self.global_fb_softness = float(
+            _cfg_get(core_cfg, "global_fb_softness", 0.1)
+        )
+        self.global_fb_threshold_mode = str(
+            _cfg_get(core_cfg, "global_fb_threshold_mode", "gmflow")
+        ).lower()
+        if self.matching_pyramid == "gmflow":
+            if self.global_match_scale != 8:
+                raise ValueError(
+                    "The single-scale GMFlow front end must decode at 1/8"
+                )
+            if self.global_decoder != "soft_expectation":
+                raise ValueError(
+                    "The GMFlow front end requires differentiable "
+                    "soft_expectation decoding"
+                )
+            if self.global_correlation_mode not in {
+                "sqrt_dim",
+                "scaled_dot",
+            }:
+                raise ValueError(
+                    "The GMFlow front end requires sqrt_dim correlation"
+                )
+        if (
+            self.global_fb_data_gate
+            or self.global_use_flow_propagation
+        ) and not self.global_bidirectional:
+            raise ValueError(
+                "Bidirectional decoding is required for consistency-aware "
+                "routing and data gating"
+            )
+        if self.global_use_flow_propagation and self.gmflow_matcher is None:
+            raise ValueError(
+                "global_use_flow_propagation requires matching_pyramid=gmflow"
+            )
         self.allow_external_validity_inputs = bool(
             _cfg_get(core_cfg, "allow_external_validity_inputs", False)
         )
@@ -531,6 +662,16 @@ class HQSCore(nn.Module):
             soft = correlation.global_soft_match(
                 temperature=self.global_temperature,
                 query_chunk_size=self.global_query_chunk_size,
+                reverse=False,
+            )
+            reverse_soft = (
+                correlation.global_soft_match(
+                    temperature=self.global_temperature,
+                    query_chunk_size=self.global_query_chunk_size,
+                    reverse=True,
+                )
+                if self.global_bidirectional
+                else None
             )
             ones = torch.ones_like(soft["confidence"])
             zeros = torch.zeros_like(soft["confidence"])
@@ -550,8 +691,16 @@ class HQSCore(nn.Module):
                 "soft_acceptance": ones,
                 "cycle_support": ones.unsqueeze(1),
                 "cycle_error": zeros.unsqueeze(1),
-                "reverse_flow": torch.zeros_like(soft["flow_xy"]),
-                "reverse_confidence": zeros,
+                "reverse_flow": (
+                    reverse_soft["flow_xy"]
+                    if reverse_soft is not None
+                    else torch.zeros_like(soft["flow_xy"])
+                ),
+                "reverse_confidence": (
+                    reverse_soft["confidence"]
+                    if reverse_soft is not None
+                    else zeros
+                ),
                 "forward": {
                     "hypotheses": soft["flow_xy"].unsqueeze(1),
                     "map_hypotheses": soft["flow_xy"].unsqueeze(1),
@@ -562,7 +711,7 @@ class HQSCore(nn.Module):
                     "peak": soft["confidence"],
                     "retained_mass": ones,
                 },
-                "reverse": None,
+                "reverse": reverse_soft,
             }
 
         forward = correlation.global_multimodal_match(
@@ -641,6 +790,13 @@ class HQSCore(nn.Module):
             source_backbone,
             target_backbone,
         )
+        if self.gmflow_matcher is not None:
+            gmflow_source, gmflow_target = self.gmflow_matcher(
+                normalised1,
+                normalised2,
+            )
+            source_match[8] = gmflow_source
+            target_match[8] = gmflow_target
         # This is the only context/prior feature pyramid in the model and it
         # is computed exclusively from the source image.
         source_context = self.feature_encoder.project_context(source_backbone)
@@ -670,6 +826,11 @@ class HQSCore(nn.Module):
                 target_match[16],
                 num_levels=self.all_pairs_levels[16],
                 radius=self.correlation_radii[16],
+                correlation_mode=(
+                    self.global_correlation_mode
+                    if self.global_match_scale == 16
+                    else "cosine"
+                ),
             )
         }
         if self.global_match_scale == 8:
@@ -678,12 +839,81 @@ class HQSCore(nn.Module):
                 target_match[8],
                 num_levels=self.all_pairs_levels[8],
                 radius=self.correlation_radii[8],
+                correlation_mode=self.global_correlation_mode,
             )
         global_correlation = all_pairs_by_scale[self.global_match_scale]
         global_match = self._decode_global_match(global_correlation)
         matcher_candidate = global_match["selected_flow"]
         if not isinstance(matcher_candidate, torch.Tensor):
             raise RuntimeError("Global decoder returned an invalid candidate")
+        reverse_candidate = global_match["reverse_flow"]
+        if not isinstance(reverse_candidate, torch.Tensor):
+            raise RuntimeError("Global decoder returned an invalid reverse flow")
+
+        propagated_candidate = matcher_candidate
+        propagated_reverse = reverse_candidate
+        if self.global_use_flow_propagation:
+            assert self.gmflow_matcher is not None
+            propagated_candidate = self.gmflow_matcher.propagate(
+                source_match[self.global_match_scale],
+                matcher_candidate.detach(),
+            )
+            propagated_reverse = self.gmflow_matcher.propagate(
+                target_match[self.global_match_scale],
+                reverse_candidate.detach(),
+            )
+
+        if self.global_bidirectional:
+            raw_fb = gmflow_forward_backward_consistency(
+                matcher_candidate,
+                reverse_candidate,
+                feature_scale=self.global_match_scale,
+                alpha=self.global_fb_alpha,
+                beta_full_resolution=self.global_fb_beta,
+                softness_full_resolution=self.global_fb_softness,
+                threshold_mode=self.global_fb_threshold_mode,
+            )
+            propagated_fb = gmflow_forward_backward_consistency(
+                propagated_candidate,
+                propagated_reverse,
+                feature_scale=self.global_match_scale,
+                alpha=self.global_fb_alpha,
+                beta_full_resolution=self.global_fb_beta,
+                softness_full_resolution=self.global_fb_softness,
+                threshold_mode=self.global_fb_threshold_mode,
+            )
+        else:
+            ones = torch.ones_like(global_match["selected_confidence"])
+            zeros = torch.zeros_like(ones)
+            zero_flow = torch.zeros_like(matcher_candidate)
+            raw_fb = {
+                "warped_backward_xy": zero_flow,
+                "residual_xy": zero_flow,
+                "error": zeros,
+                "threshold": zeros,
+                "in_bounds": ones,
+                "reliability": ones,
+                "occlusion": zeros,
+            }
+            propagated_fb = raw_fb
+
+        fb_geometry = (
+            propagated_fb
+            if self.global_fb_gate_source == "propagated"
+            else raw_fb
+        )
+        solver_candidate = matcher_candidate
+        if self.global_use_flow_propagation:
+            if self.global_propagation_routing == "propagated":
+                solver_candidate = propagated_candidate
+            elif self.global_propagation_routing == "fb_blend":
+                measurement_gate = fb_geometry["reliability"].to(
+                    matcher_candidate
+                )
+                solver_candidate = (
+                    measurement_gate * matcher_candidate
+                    + (1.0 - measurement_gate) * propagated_candidate
+                )
         if flow_init is not None:
             if flow_init.ndim != 4 or flow_init.shape[1] != 2:
                 raise ValueError(
@@ -702,10 +932,7 @@ class HQSCore(nn.Module):
                 source_match[16].shape[-2:],
             )
         else:
-            decoded_initial = global_match["initial_flow"]
-            if not isinstance(decoded_initial, torch.Tensor):
-                raise RuntimeError("Global decoder returned an invalid flow")
-            admitted_initial = decoded_initial
+            admitted_initial = solver_candidate
             if (
                 self.global_decoder == "soft_expectation"
                 and self.global_confidence_gated
@@ -741,6 +968,7 @@ class HQSCore(nn.Module):
         hidden_states: List[torch.Tensor] = []
         reliability_lows: List[torch.Tensor] = []
         validity_lows: List[torch.Tensor] = []
+        fb_measurement_reliability_lows: List[torch.Tensor] = []
         analytic_delta_lows: List[torch.Tensor] = []
         learned_delta_lows: List[torch.Tensor] = []
         data_delta_lows: List[torch.Tensor] = []
@@ -791,6 +1019,11 @@ class HQSCore(nn.Module):
                             target_match[8],
                             num_levels=self.all_pairs_levels[8],
                             radius=self.correlation_radii[8],
+                            correlation_mode=(
+                                self.global_correlation_mode
+                                if self.global_match_scale == 8
+                                else "cosine"
+                            ),
                         )
                     all_pairs = all_pairs_by_scale[8]
                 else:
@@ -799,6 +1032,17 @@ class HQSCore(nn.Module):
             for iteration in range(self.iterations_by_scale[scale]):
                 assert state is not None
                 q_previous = state.q
+                measurement_reliability: Optional[torch.Tensor] = None
+                if (
+                    self.global_fb_data_gate
+                    and scale in self.global_fb_data_gate_scales
+                ):
+                    measurement_reliability = F.interpolate(
+                        fb_geometry["reliability"].to(state.q),
+                        size=state.q.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    ).clamp(0.0, 1.0)
                 corr_features = self._correlation_features(
                     scale,
                     state.q,
@@ -820,6 +1064,7 @@ class HQSCore(nn.Module):
                     jacobi_sweeps=self.jacobi_sweeps[scale],
                     max_data_delta=self.max_data_delta[scale],
                     max_prox_delta=self.max_prox_delta[scale],
+                    measurement_reliability=measurement_reliability,
                 )
                 state = update.state
 
@@ -830,6 +1075,11 @@ class HQSCore(nn.Module):
                 hidden_states.append(state.hidden)
                 reliability_lows.append(update.reliability)
                 validity_lows.append(update.validity)
+                fb_measurement_reliability_lows.append(
+                    measurement_reliability
+                    if measurement_reliability is not None
+                    else torch.ones_like(update.reliability)
+                )
                 analytic_delta_lows.append(update.analytic_delta)
                 learned_delta_lows.append(update.learned_delta)
                 data_delta_lows.append(update.data_delta)
@@ -877,6 +1127,49 @@ class HQSCore(nn.Module):
             reverse_flow,
             (full_h, full_w),
         )
+        matcher_candidate_full = resize_flow(
+            matcher_candidate,
+            (full_h, full_w),
+        )
+        propagated_full = resize_flow(
+            propagated_candidate,
+            (full_h, full_w),
+        )
+        propagated_reverse_full = resize_flow(
+            propagated_reverse,
+            (full_h, full_w),
+        )
+        if self.global_bidirectional:
+            raw_fb_full = gmflow_forward_backward_consistency(
+                matcher_candidate_full,
+                reverse_full,
+                feature_scale=1,
+                alpha=self.global_fb_alpha,
+                beta_full_resolution=self.global_fb_beta,
+                softness_full_resolution=self.global_fb_softness,
+                threshold_mode=self.global_fb_threshold_mode,
+            )
+            propagated_fb_full = gmflow_forward_backward_consistency(
+                propagated_full,
+                propagated_reverse_full,
+                feature_scale=1,
+                alpha=self.global_fb_alpha,
+                beta_full_resolution=self.global_fb_beta,
+                softness_full_resolution=self.global_fb_softness,
+                threshold_mode=self.global_fb_threshold_mode,
+            )
+            fb_geometry_full = (
+                propagated_fb_full
+                if self.global_fb_gate_source == "propagated"
+                else raw_fb_full
+            )
+            fb_reliability_full = fb_geometry_full["reliability"]
+            fb_occlusion_full = fb_geometry_full["occlusion"]
+        else:
+            fb_reliability_full = torch.ones_like(
+                matcher_candidate_full[:, :1]
+            )
+            fb_occlusion_full = torch.zeros_like(fb_reliability_full)
         # Supervise the raw correspondence candidate, never the confidence-
         # gated/rejected solver state.  This keeps candidate accuracy and
         # solver admission as separate learning problems.
@@ -909,6 +1202,9 @@ class HQSCore(nn.Module):
             "data_valid_lows": validity_lows,
             "core_validity_lows": validity_lows,
             "data_weight_lows": validity_lows,
+            "global_fb_measurement_reliability_lows": (
+                fb_measurement_reliability_lows
+            ),
             "analytic_delta_lows": analytic_delta_lows,
             "learned_data_delta_lows": learned_delta_lows,
             "data_delta_lows": data_delta_lows,
@@ -921,6 +1217,8 @@ class HQSCore(nn.Module):
             "flow_final_refined": final_flow,
             "global_init_flow_xy": actual_global_init,
             "global_init_candidate_flow_xy": matcher_candidate,
+            "global_init_propagated_flow_xy": propagated_candidate,
+            "global_init_solver_candidate_flow_xy": solver_candidate,
             "global_init_native_admitted_flow_xy": native_solver_initial,
             "global_init_match_scale_entry_flow_xy": (
                 match_scale_entry_flow
@@ -959,10 +1257,44 @@ class HQSCore(nn.Module):
             "global_reverse_confidence": global_match[
                 "reverse_confidence"
             ],
+            "global_propagated_reverse_flow_xy": propagated_reverse,
+            "global_fb_raw_reliability": raw_fb["reliability"],
+            "global_fb_raw_occlusion": raw_fb["occlusion"],
+            "global_fb_raw_error": raw_fb["error"],
+            "global_fb_raw_threshold": raw_fb["threshold"],
+            "global_fb_propagated_reliability": propagated_fb[
+                "reliability"
+            ],
+            "global_fb_propagated_occlusion": propagated_fb[
+                "occlusion"
+            ],
+            "global_fb_propagated_error": propagated_fb["error"],
+            "global_fb_propagated_threshold": propagated_fb[
+                "threshold"
+            ],
+            "global_fb_reliability": fb_geometry["reliability"],
+            "global_fb_occlusion": fb_geometry["occlusion"],
+            "global_fb_error": fb_geometry["error"],
+            "global_fb_threshold": fb_geometry["threshold"],
+            "global_fb_residual_xy": fb_geometry["residual_xy"],
+            "global_fb_in_bounds": fb_geometry["in_bounds"],
+            "global_fb_reliability_full": fb_reliability_full,
+            "global_fb_occlusion_full": fb_occlusion_full,
+            "global_propagated_flow_full_xy": propagated_full,
+            "global_propagated_reverse_flow_full_xy": (
+                propagated_reverse_full
+            ),
             "matching_transformer_blends": interaction_blends,
             "matching_pyramid": self.matching_pyramid,
             "global_decoder": self.global_decoder,
             "global_match_scale": self.global_match_scale,
+            "global_correlation_mode": self.global_correlation_mode,
+            "global_bidirectional": self.global_bidirectional,
+            "global_use_flow_propagation": (
+                self.global_use_flow_propagation
+            ),
+            "global_propagation_routing": self.global_propagation_routing,
+            "global_fb_gate_source": self.global_fb_gate_source,
             "global_match_transition_mode": (
                 self.global_match_transition_mode
             ),
@@ -972,12 +1304,16 @@ class HQSCore(nn.Module):
             "gmflow_init_flow_yx": self._to_yx(
                 matcher_supervision_flow
             ),
+            "gmflow_propagated_flow_yx": self._to_yx(
+                propagated_candidate
+            ),
             "gmflow_init_conf": global_confidence,
             "gmflow_init_entropy": forward_match["entropy"],
             "gmflow_init_margin": forward_match["margin"],
             "gmflow_reverse_flow_yx": (
                 self._to_yx(reverse_full)
-                if self.global_decoder == "multimodal_cycle"
+                if self.global_bidirectional
+                or self.global_decoder == "multimodal_cycle"
                 else None
             ),
             "occupancy_masks": [],
@@ -995,7 +1331,14 @@ class HQSCore(nn.Module):
             return sum(parameter.numel() for parameter in module.parameters())
 
         context_count = count(self.feature_encoder.context_projections)
-        feature_count = count(self.feature_encoder) - context_count
+        gmflow_count = (
+            count(self.gmflow_matcher)
+            if self.gmflow_matcher is not None
+            else 0
+        )
+        feature_count = (
+            count(self.feature_encoder) - context_count + gmflow_count
+        )
         stage_count = (
             count(self.coarse_cell)
             + count(self.fine_cell)
@@ -1004,6 +1347,7 @@ class HQSCore(nn.Module):
         )
         return {
             "feature_encoder": feature_count,
+            "gmflow_matcher": gmflow_count,
             "context_encoder": context_count,
             "correlation_adapters": count(self.correlation_adapters),
             "coarse_cell": count(self.coarse_cell),

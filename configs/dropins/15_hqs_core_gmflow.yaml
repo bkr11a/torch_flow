@@ -1,0 +1,134 @@
+# HQSCore with a dedicated GMFlow correspondence front end and geometric
+# forward/backward reliability.  This is a new parameterisation and must be
+# trained from a new run, not strictly resumed from a standard HQSCore model.
+#
+# Curriculum:
+#   python train_curriculum.py --config configs/default.yaml \
+#     --override configs/dropins/15_hqs_core_gmflow.yaml \
+#     --curriculum configs/curriculum/universal_replay_curriculum.yaml \
+#     --base-run-name hqs_core_gmflow_fb_2_4_2_2
+
+run_name: hqs_core/gmflow_fb_2_4_2_2
+
+mlflow:
+  registered_model_name: HQSCoreGMFlow
+  tags:
+    architecture: hqs_core_gmflow
+    correspondence: gmflow_1_8_six_transformers
+    validity: forward_backward_consistency
+    operator_structure: warp_validity_data_prox
+
+model:
+  model_type: hqs_core
+
+  hqs_core:
+    # The compact pyramid remains the source-context/fine-correlation encoder.
+    # Matching at 1/8 is replaced by the dedicated GMFlow front end.
+    feature_channels: [32, 64, 96, 128]
+    match_channels: [64, 96, 128, 128]
+    context_channels: [64, 64, 96, 96]
+    blocks_per_scale: [1, 2, 2, 2]
+    groups: 8
+    matching_pyramid: gmflow
+
+    # GMFlow single-scale matching architecture.
+    gmflow_feature_channels: 128
+    gmflow_transformer_depth: 6
+    gmflow_ffn_expansion: 4
+    gmflow_attention_splits: 2
+    gmflow_gradient_checkpointing: true
+    gmflow_propagation_query_chunk_size: 256
+
+    # HQS solver is unchanged: coarse-to-fine [1/16, 1/8, 1/4, 1/2].
+    iterations: [2, 4, 2, 2]
+    jacobi_sweeps: [2, 2, 1, 1]
+    correlation_radii: [4, 4, 4, 3]
+    all_pairs_levels: [1, 4]
+    correlation_embedding_dim: 64
+    local_corr_channel_chunk: 4
+    local_corr_checkpoint: true
+
+    coarse_hidden_dim: 96
+    fine_hidden_dim: 64
+    prior_hidden_channels: 64
+    validity_hidden_dim: 32
+    upsample_hidden_dim: 64
+
+    max_data_delta: [2.0, 2.0, 1.5, 1.0]
+    max_prox_delta: [0.5, 0.5, 0.5, 0.25]
+
+    beta_initial: 0.10
+    beta_minimum: 0.01
+    lambda_initial: 0.08
+    lambda_minimum: 0.001
+    edge_alpha: 10.0
+    analytic_weight: 1.0
+    learned_data_weight: 1.0
+
+    initial_reliability: 0.90
+    allow_external_validity_inputs: false
+
+    # Exact GMFlow global readout: dot product / sqrt(C), then softmax with no
+    # additional sharpening temperature, then expected target minus source.
+    global_match_scale: 8
+    global_match_transition_mode: native_residual
+    global_decoder: soft_expectation
+    global_correlation_mode: sqrt_dim
+    global_temperature: 1.0
+    global_query_chunk_size: 256
+    global_confidence_gated: false
+    global_confidence_floor: 0.0
+
+    # Decode forward and reverse flow from C and C^T without a second feature
+    # pass.  Source self-attention propagates flow where raw matching is invalid.
+    global_bidirectional: true
+    global_use_flow_propagation: true
+    global_propagation_routing: fb_blend
+
+    # GMFlow/UnFlow forward-backward consistency.  beta and softness are stated
+    # in full-resolution pixels and are scaled internally to the 1/8 grid.
+    global_fb_alpha: 0.01
+    global_fb_beta: 0.5
+    global_fb_softness: 0.1
+    global_fb_threshold_mode: gmflow
+    global_fb_gate_source: raw
+    global_fb_data_gate: true
+    global_fb_data_gate_scales: [16, 8]
+
+loss:
+  num_stages: 10
+  stage_weight_mode: geometric
+  gamma: 0.85
+
+  # GMFlow supervises the global prediction before and after feature-flow
+  # propagation.  These are primary matcher losses, not the former 0.05
+  # auxiliary signal.
+  global_init_weight: 1.0
+  global_propagated_weight: 1.0
+  global_large_motion_threshold: 40.0
+  global_large_motion_boost: 2.0
+  global_confidence_weight: 0.0
+  global_fb_visibility_weight: 0.01
+  core_visibility_weight: 0.01
+  core_visibility_last_n: 4
+
+  smooth_weight: 0.0
+  inter_smooth_weight: 0.0
+  boundary_weight: 0.0
+  raw_final_weight: 0.0
+  iter_damp_weight: 0.0
+  photo_weight: 0.0
+  ofce_weight: 0.0
+  detail_weight: 0.0
+  occlusion_aware:
+    enabled: false
+
+training:
+  # For the first 10k steps of each curriculum stage, train only the dedicated
+  # GMFlow measurement front end.  Joint HQS optimisation begins afterwards.
+  global_matcher_warmup_steps: 10000
+  freeze_backbone_during_global_warmup: true
+  grad_clip: 1.0
+
+data:
+  detail_crop_prob: 0.0
