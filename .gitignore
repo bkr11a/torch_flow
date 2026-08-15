@@ -13,6 +13,7 @@ data/raw/
 
 # Checkpoints — large binary files
 checkpoints/
+pretrained/
 
 # Logs
 logs/

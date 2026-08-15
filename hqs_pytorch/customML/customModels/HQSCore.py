@@ -11,6 +11,7 @@ separate interfaces so target-derived evidence cannot bypass the HQS split.
 """
 from __future__ import annotations
 
+import logging
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
@@ -37,6 +38,9 @@ from models.hqs_gmflow_components import (
     gmflow_forward_backward_consistency,
 )
 from models.warp import resize_flow
+
+
+logger = logging.getLogger(__name__)
 
 
 def _cfg_get(cfg, key: str, default):
@@ -167,6 +171,8 @@ class HQSCore(nn.Module):
             _cfg_get(core_cfg, "matching_pyramid", "standard")
         ).lower()
         self.gmflow_matcher: Optional[GMFlowMatchingFrontEnd] = None
+        self.gmflow_pretrained_report = None
+        self.permanently_frozen_parameter_prefixes: Tuple[str, ...] = ()
         if self.matching_pyramid in {
             "deep_bidirectional",
             "deep_match",
@@ -241,6 +247,18 @@ class HQSCore(nn.Module):
                 groups=groups,
             )
             if self.matching_pyramid == "gmflow":
+                gmflow_checkpoint = _cfg_get(
+                    core_cfg,
+                    "gmflow_pretrained_checkpoint",
+                    None,
+                )
+                gmflow_released_compatible = bool(
+                    _cfg_get(
+                        core_cfg,
+                        "gmflow_released_weights_compatible",
+                        bool(gmflow_checkpoint),
+                    )
+                )
                 self.gmflow_matcher = GMFlowMatchingFrontEnd(
                     channels=int(
                         _cfg_get(core_cfg, "gmflow_feature_channels", 128)
@@ -268,7 +286,45 @@ class HQSCore(nn.Module):
                             512,
                         )
                     ),
+                    released_weights_compatible=(
+                        gmflow_released_compatible
+                    ),
                 )
+                freeze_pretrained = bool(
+                    _cfg_get(
+                        core_cfg,
+                        "gmflow_freeze_pretrained",
+                        False,
+                    )
+                )
+                if freeze_pretrained and not gmflow_checkpoint:
+                    raise ValueError(
+                        "gmflow_freeze_pretrained=true requires "
+                        "hqs_core.gmflow_pretrained_checkpoint"
+                    )
+                if gmflow_checkpoint:
+                    self.gmflow_pretrained_report = (
+                        self.gmflow_matcher.load_official_checkpoint(
+                            str(gmflow_checkpoint),
+                            strict=bool(
+                                _cfg_get(
+                                    core_cfg,
+                                    "gmflow_pretrained_strict",
+                                    True,
+                                )
+                            ),
+                        )
+                    )
+                    logger.info(
+                        "Official GMFlow correspondence front end: %s (%s)",
+                        self.gmflow_pretrained_report.path,
+                        self.gmflow_pretrained_report.summary(),
+                    )
+                    if freeze_pretrained:
+                        self.gmflow_matcher.set_trainable(False)
+                        self.permanently_frozen_parameter_prefixes = (
+                            "gmflow_matcher.",
+                        )
         else:
             raise ValueError(
                 "hqs_core.matching_pyramid must be standard, gmflow or "

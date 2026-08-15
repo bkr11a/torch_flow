@@ -306,7 +306,48 @@ class Trainer:
         # ── Optimiser ────────────────────────────────────────────────────────
         # Include learnable loss parameters (e.g. adaptive stage weights from
         # SequenceLoss when stage_weight_mode="learnable").
-        _opt_params = list(self.model.parameters()) + list(self.criterion.parameters())
+        matcher_lr_cfg = cfg.training.get("global_matcher_lr", None)
+        matcher_prefixes = tuple(
+            str(value)
+            for value in getattr(
+                self.model,
+                "global_matcher_parameter_prefixes",
+                (),
+            )
+        )
+        base_parameters = []
+        matcher_parameters = []
+        for name, parameter in self.model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            is_matcher = any(
+                name.startswith(prefix) for prefix in matcher_prefixes
+            )
+            if matcher_lr_cfg is not None and is_matcher:
+                matcher_parameters.append(parameter)
+            else:
+                base_parameters.append(parameter)
+        base_parameters.extend(
+            parameter
+            for parameter in self.criterion.parameters()
+            if parameter.requires_grad
+        )
+
+        optimizer_max_lr = cfg.training.lr
+        if matcher_lr_cfg is not None and matcher_parameters:
+            matcher_lr = float(matcher_lr_cfg)
+            _opt_params = [
+                {"params": base_parameters, "lr": cfg.training.lr},
+                {"params": matcher_parameters, "lr": matcher_lr},
+            ]
+            optimizer_max_lr = [cfg.training.lr, matcher_lr]
+            logger.info(
+                "Separate global-matcher LR enabled: solver=%g matcher=%g",
+                cfg.training.lr,
+                matcher_lr,
+            )
+        else:
+            _opt_params = base_parameters
         self.optimizer = optim.AdamW(
             _opt_params,
             lr=cfg.training.lr,
@@ -318,7 +359,7 @@ class Trainer:
         train_steps = cfg.training.num_steps
         self.scheduler = optim.lr_scheduler.OneCycleLR(
             self.optimizer,
-            max_lr=cfg.training.lr,
+            max_lr=optimizer_max_lr,
             total_steps=train_steps + 1,
             pct_start=cfg.training.get("warmup_pct", 0.05),
             cycle_momentum=False,
@@ -761,12 +802,25 @@ class Trainer:
             ("pgma.",),
         )
         prefixes = tuple(str(value) for value in prefixes)
+        permanently_frozen = tuple(
+            str(value)
+            for value in getattr(
+                self.model,
+                "permanently_frozen_parameter_prefixes",
+                (),
+            )
+        )
         for name, parameter in self.model.named_parameters():
             is_measurement_parameter = any(
                 name.startswith(prefix) for prefix in prefixes
             )
+            is_permanently_frozen = any(
+                name.startswith(prefix) for prefix in permanently_frozen
+            )
             parameter.requires_grad_(
-                not active or is_measurement_parameter
+                False
+                if is_permanently_frozen
+                else (not active or is_measurement_parameter)
             )
         self._global_warmup_active = active
         if active:

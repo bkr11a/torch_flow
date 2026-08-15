@@ -10,8 +10,64 @@ from hqs_pytorch.customML.customModels.HQSCore import HQSCore
 from models.hqs_core_components import AllPairsCorrelation
 from models.hqs_gmflow_components import (
     GMFlowMatchingFrontEnd,
+    GMFlowResidualBlock,
     gmflow_forward_backward_consistency,
 )
+
+
+def _local_key_to_official_gmflow(key: str) -> str:
+    if key.startswith("backbone."):
+        suffix = key[len("backbone.") :]
+        prefixes = {
+            "stem.0.": "conv1.",
+            "stage2.": "layer1.",
+            "stage4.": "layer2.",
+            "stage8.": "layer3.",
+            "projection.": "conv2.",
+        }
+        for local, official in prefixes.items():
+            if suffix.startswith(local):
+                return "backbone." + official + suffix[len(local) :]
+    if key.startswith("transformer.blocks."):
+        suffix = key[len("transformer.blocks.") :]
+        suffix = suffix.replace(".self_attention.", ".self_attn.")
+        suffix = suffix.replace(
+            ".cross_attention.",
+            ".cross_attn_ffn.",
+        )
+        suffix = suffix.replace(".query.", ".q_proj.")
+        suffix = suffix.replace(".key.", ".k_proj.")
+        suffix = suffix.replace(".value.", ".v_proj.")
+        suffix = suffix.replace(".ffn.", ".mlp.")
+        return "transformer.layers." + suffix
+    if key.startswith("flow_propagation."):
+        suffix = key[len("flow_propagation.") :]
+        suffix = suffix.replace("query.", "q_proj.")
+        suffix = suffix.replace("key.", "k_proj.")
+        return "feature_flow_attn." + suffix
+    raise AssertionError(f"No official GMFlow mapping for {key}")
+
+
+def _write_synthetic_official_checkpoint(
+    matcher: GMFlowMatchingFrontEnd,
+    path: Path,
+    *,
+    omit_local_key: str | None = None,
+) -> dict[str, torch.Tensor]:
+    official = {}
+    expected = {}
+    torch.manual_seed(2608)
+    for local_key, value in matcher.state_dict().items():
+        if local_key == omit_local_key:
+            continue
+        replacement = torch.randn_like(value)
+        expected[local_key] = replacement
+        official[_local_key_to_official_gmflow(local_key)] = replacement
+    # The official full model contains this unrelated head. The importer must
+    # ignore it deliberately rather than treating it as a partial-load error.
+    official["upsampler.0.weight"] = torch.randn(1)
+    torch.save({"model": official}, path)
+    return expected
 
 
 def _tiny_gmflow_core_config():
@@ -75,6 +131,142 @@ def test_gmflow_overlay_selects_exact_matching_path():
     assert cfg.loss.num_stages == 10
     assert cfg.loss.global_init_weight == 1.0
     assert cfg.loss.global_propagated_weight == 1.0
+
+
+def test_pretrained_gmflow_overlay_uses_frozen_raw_routing():
+    root = Path(__file__).resolve().parents[1]
+    cfg = OmegaConf.merge(
+        OmegaConf.load(root / "configs/default.yaml"),
+        OmegaConf.load(
+            root / "configs/dropins/16_hqs_core_pretrained_gmflow.yaml"
+        ),
+    )
+    core = cfg.model.hqs_core
+    assert core.gmflow_released_weights_compatible is True
+    assert core.gmflow_pretrained_strict is True
+    assert core.gmflow_freeze_pretrained is True
+    assert core.global_propagation_routing == "raw"
+    assert core.global_use_flow_propagation is False
+    assert core.global_fb_data_gate is False
+    assert cfg.loss.global_init_weight == 0.0
+    assert cfg.loss.global_fb_visibility_weight == 0.0
+    assert cfg.training.global_matcher_warmup_steps == 0
+    assert cfg.training.amp is False
+
+
+def test_released_backbone_graph_has_second_pre_addition_relu():
+    torch.manual_seed(19)
+    block = GMFlowResidualBlock(
+        4,
+        4,
+        stride=1,
+        released_weights_compatible=True,
+    )
+    value = torch.randn(2, 4, 5, 7)
+    first = torch.relu(block.norm1(block.conv1(value)))
+    second = torch.relu(block.norm2(block.conv2(first)))
+    expected = torch.relu(value + second)
+    assert torch.allclose(block(value), expected, atol=1e-6)
+
+
+def test_official_checkpoint_import_is_complete_and_value_preserving(tmp_path):
+    source = GMFlowMatchingFrontEnd(
+        channels=32,
+        transformer_depth=1,
+        ffn_expansion=2,
+        attention_splits=2,
+        gradient_checkpointing=False,
+        propagation_query_chunk_size=8,
+        released_weights_compatible=True,
+    )
+    checkpoint = tmp_path / "gmflow_official.pth"
+    expected = _write_synthetic_official_checkpoint(source, checkpoint)
+    target = GMFlowMatchingFrontEnd(
+        channels=32,
+        transformer_depth=1,
+        ffn_expansion=2,
+        attention_splits=2,
+        gradient_checkpointing=False,
+        propagation_query_chunk_size=8,
+        released_weights_compatible=True,
+    )
+    report = target.load_official_checkpoint(checkpoint, strict=True)
+    assert report.loaded_tensor_count == len(expected)
+    assert report.loaded_parameter_count == sum(
+        value.numel() for value in expected.values()
+    )
+    assert report.ignored_checkpoint_keys == ("upsampler.0.weight",)
+    for key, value in target.state_dict().items():
+        assert torch.equal(value, expected[key]), key
+
+
+def test_official_checkpoint_import_rejects_missing_frontend_tensor(tmp_path):
+    matcher = GMFlowMatchingFrontEnd(
+        channels=32,
+        transformer_depth=1,
+        ffn_expansion=2,
+        attention_splits=2,
+        gradient_checkpointing=False,
+        propagation_query_chunk_size=8,
+        released_weights_compatible=True,
+    )
+    checkpoint = tmp_path / "gmflow_incomplete.pth"
+    omitted = "transformer.blocks.0.self_attention.query.weight"
+    _write_synthetic_official_checkpoint(
+        matcher,
+        checkpoint,
+        omit_local_key=omitted,
+    )
+    target = GMFlowMatchingFrontEnd(
+        channels=32,
+        transformer_depth=1,
+        ffn_expansion=2,
+        attention_splits=2,
+        gradient_checkpointing=False,
+        propagation_query_chunk_size=8,
+        released_weights_compatible=True,
+    )
+    try:
+        target.load_official_checkpoint(checkpoint, strict=True)
+    except RuntimeError as error:
+        assert omitted in str(error)
+    else:
+        raise AssertionError("Strict import accepted an incomplete checkpoint")
+
+
+def test_hqscore_loads_and_permanently_freezes_official_frontend(tmp_path):
+    source = GMFlowMatchingFrontEnd(
+        channels=32,
+        transformer_depth=1,
+        ffn_expansion=2,
+        attention_splits=2,
+        gradient_checkpointing=False,
+        propagation_query_chunk_size=8,
+        released_weights_compatible=True,
+    )
+    checkpoint = tmp_path / "gmflow_tiny.pth"
+    _write_synthetic_official_checkpoint(source, checkpoint)
+    config = _tiny_gmflow_core_config()
+    config.update(
+        {
+            "gmflow_released_weights_compatible": True,
+            "gmflow_pretrained_checkpoint": str(checkpoint),
+            "gmflow_pretrained_strict": True,
+            "gmflow_freeze_pretrained": True,
+            "global_use_flow_propagation": False,
+            "global_propagation_routing": "raw",
+            "global_fb_data_gate": False,
+        }
+    )
+    model = HQSCore({"hqs_core": config})
+    assert model.gmflow_pretrained_report is not None
+    assert model.permanently_frozen_parameter_prefixes == (
+        "gmflow_matcher.",
+    )
+    assert all(
+        not parameter.requires_grad
+        for parameter in model.gmflow_matcher.parameters()
+    )
 
 
 def test_scaled_dot_all_pairs_matches_gmflow_equation():

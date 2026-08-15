@@ -1,0 +1,141 @@
+# HQSCore using the released single-scale GMFlow correspondence front end.
+#
+# Download the official checkpoint first:
+#   python tools/download_gmflow_pretrained.py
+#
+# Then run the first controlled solver experiment:
+#   python train_curriculum.py --config configs/default.yaml \
+#     --override configs/dropins/16_hqs_core_pretrained_gmflow.yaml \
+#     --curriculum configs/curriculum/universal_replay_curriculum.yaml \
+#     --base-run-name hqs_core_pretrained_gmflow_raw_2_4_2_2 \
+#     --stop-after-stage u01_chairs_baseline \
+#     training.num_steps=50000 training.val_every=5000 \
+#     training.save_every=10000 mlflow.enabled=false
+
+run_name: hqs_core/pretrained_gmflow_raw_2_4_2_2
+
+mlflow:
+  registered_model_name: HQSCorePretrainedGMFlow
+  tags:
+    architecture: hqs_core_pretrained_gmflow
+    correspondence: official_gmflow_things_single_scale
+    correspondence_training: frozen
+    routing: raw_no_fb_gate
+    operator_structure: warp_validity_data_prox
+
+model:
+  model_type: hqs_core
+
+  hqs_core:
+    # The compact pyramid remains the source-context and fine-correlation
+    # encoder.  Only its 1/8 matching features are replaced by GMFlow.
+    feature_channels: [32, 64, 96, 128]
+    match_channels: [64, 96, 128, 128]
+    context_channels: [64, 64, 96, 96]
+    blocks_per_scale: [1, 2, 2, 2]
+    groups: 8
+    matching_pyramid: gmflow
+
+    # Exact architecture of the released basic (single-scale) GMFlow model.
+    gmflow_feature_channels: 128
+    gmflow_transformer_depth: 6
+    gmflow_ffn_expansion: 4
+    gmflow_attention_splits: 2
+    gmflow_gradient_checkpointing: false
+    gmflow_propagation_query_chunk_size: 256
+    gmflow_released_weights_compatible: true
+
+    # Override with the GMFLOW_CHECKPOINT environment variable if desired.
+    gmflow_pretrained_checkpoint: ${oc.env:GMFLOW_CHECKPOINT,pretrained/gmflow_things-e9887eda.pth}
+    gmflow_pretrained_strict: true
+    gmflow_freeze_pretrained: true
+
+    # HQS solver: coarse-to-fine [1/16, 1/8, 1/4, 1/2].
+    iterations: [2, 4, 2, 2]
+    jacobi_sweeps: [2, 2, 1, 1]
+    correlation_radii: [4, 4, 4, 3]
+    all_pairs_levels: [1, 4]
+    correlation_embedding_dim: 64
+    local_corr_channel_chunk: 4
+    local_corr_checkpoint: true
+
+    coarse_hidden_dim: 96
+    fine_hidden_dim: 64
+    prior_hidden_channels: 64
+    validity_hidden_dim: 32
+    upsample_hidden_dim: 64
+
+    max_data_delta: [2.0, 2.0, 1.5, 1.0]
+    max_prox_delta: [0.5, 0.5, 0.5, 0.25]
+
+    beta_initial: 0.10
+    beta_minimum: 0.01
+    lambda_initial: 0.08
+    lambda_minimum: 0.001
+    edge_alpha: 10.0
+    analytic_weight: 1.0
+    learned_data_weight: 1.0
+    initial_reliability: 0.90
+    allow_external_validity_inputs: false
+
+    # Released GMFlow readout: dot-product / sqrt(C), softmax, expectation.
+    global_match_scale: 8
+    global_match_transition_mode: native_residual
+    global_decoder: soft_expectation
+    global_correlation_mode: sqrt_dim
+    global_temperature: 1.0
+    global_query_chunk_size: 256
+    global_confidence_gated: false
+    global_confidence_floor: 0.0
+
+    # First causal experiment: feed the raw pretrained match to HQS.  Keep the
+    # learned propagation and the currently miscalibrated FB gate out of the
+    # solver path.  Bidirectional decoding remains enabled for diagnostics.
+    global_bidirectional: true
+    global_use_flow_propagation: false
+    global_propagation_routing: raw
+    global_fb_data_gate: false
+    global_fb_gate_source: raw
+    global_fb_data_gate_scales: [16, 8]
+    global_fb_alpha: 0.01
+    global_fb_beta: 0.5
+    global_fb_softness: 0.1
+    global_fb_threshold_mode: gmflow
+
+loss:
+  num_stages: 10
+  stage_weight_mode: geometric
+  gamma: 0.85
+
+  # The matcher is frozen.  These diagnostics are still logged by the model,
+  # but they do not contribute constant, non-optimisable terms to the loss.
+  global_init_weight: 0.0
+  global_propagated_weight: 0.0
+  global_confidence_weight: 0.0
+  global_fb_visibility_weight: 0.0
+  core_visibility_weight: 0.01
+  core_visibility_last_n: 4
+
+  smooth_weight: 0.0
+  inter_smooth_weight: 0.0
+  boundary_weight: 0.0
+  raw_final_weight: 0.0
+  iter_damp_weight: 0.0
+  photo_weight: 0.0
+  ofce_weight: 0.0
+  detail_weight: 0.0
+  occlusion_aware:
+    enabled: false
+
+training:
+  # FP32 is deliberate until the full solver path is numerically stable.
+  amp: false
+  lr: 1.0e-4
+  warmup_pct: 0.05
+  global_matcher_warmup_steps: 0
+  freeze_backbone_during_global_warmup: false
+  grad_clip: 1.0
+  fail_on_nonfinite: true
+
+data:
+  detail_crop_prob: 0.0

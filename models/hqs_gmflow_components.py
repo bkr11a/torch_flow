@@ -13,8 +13,10 @@ must not be passed to the source-only proximal operator.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
-from typing import Dict, Optional, Tuple
+from pathlib import Path
+from typing import Dict, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -27,8 +29,18 @@ from .warp import backward_warp, flow_in_bounds_mask
 class GMFlowResidualBlock(nn.Module):
     """Two-convolution residual block used by the GMFlow feature encoder."""
 
-    def __init__(self, in_channels: int, out_channels: int, stride: int) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int,
+        *,
+        released_weights_compatible: bool = False,
+    ) -> None:
         super().__init__()
+        self.released_weights_compatible = bool(
+            released_weights_compatible
+        )
         self.conv1 = nn.Conv2d(
             in_channels,
             out_channels,
@@ -64,31 +76,75 @@ class GMFlowResidualBlock(nn.Module):
         residual = value if self.downsample is None else self.downsample(value)
         value = F.relu(self.norm1(self.conv1(value)), inplace=True)
         value = self.norm2(self.conv2(value))
+        # The released GMFlow backbone applies ReLU both before and after the
+        # residual addition.  Keep the historical local implementation as the
+        # default so existing scratch-trained checkpoints retain their exact
+        # graph, while enabling the released graph for official weights.
+        if self.released_weights_compatible:
+            value = F.relu(value, inplace=True)
         return F.relu(residual + value, inplace=True)
 
 
 class GMFlowMatchingBackbone(nn.Module):
     """Dedicated single-scale GMFlow CNN producing 128-D features at 1/8."""
 
-    def __init__(self, output_channels: int = 128) -> None:
+    def __init__(
+        self,
+        output_channels: int = 128,
+        *,
+        released_weights_compatible: bool = False,
+    ) -> None:
         super().__init__()
         self.output_channels = int(output_channels)
+        self.released_weights_compatible = bool(
+            released_weights_compatible
+        )
         self.stem = nn.Sequential(
             nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
             nn.InstanceNorm2d(64),
             nn.ReLU(inplace=True),
         )
         self.stage2 = nn.Sequential(
-            GMFlowResidualBlock(64, 64, stride=1),
-            GMFlowResidualBlock(64, 64, stride=1),
+            GMFlowResidualBlock(
+                64,
+                64,
+                stride=1,
+                released_weights_compatible=self.released_weights_compatible,
+            ),
+            GMFlowResidualBlock(
+                64,
+                64,
+                stride=1,
+                released_weights_compatible=self.released_weights_compatible,
+            ),
         )
         self.stage4 = nn.Sequential(
-            GMFlowResidualBlock(64, 96, stride=2),
-            GMFlowResidualBlock(96, 96, stride=1),
+            GMFlowResidualBlock(
+                64,
+                96,
+                stride=2,
+                released_weights_compatible=self.released_weights_compatible,
+            ),
+            GMFlowResidualBlock(
+                96,
+                96,
+                stride=1,
+                released_weights_compatible=self.released_weights_compatible,
+            ),
         )
         self.stage8 = nn.Sequential(
-            GMFlowResidualBlock(96, 128, stride=2),
-            GMFlowResidualBlock(128, 128, stride=1),
+            GMFlowResidualBlock(
+                96,
+                128,
+                stride=2,
+                released_weights_compatible=self.released_weights_compatible,
+            ),
+            GMFlowResidualBlock(
+                128,
+                128,
+                stride=1,
+                released_weights_compatible=self.released_weights_compatible,
+            ),
         )
         self.projection = nn.Conv2d(128, self.output_channels, kernel_size=1)
         self._initialise()
@@ -598,6 +654,102 @@ class GMFlowFeatureFlowAttention(nn.Module):
         return propagated.transpose(1, 2).reshape(batch, 2, height, width)
 
 
+@dataclass(frozen=True)
+class GMFlowCheckpointLoadReport:
+    """Auditable result of importing an official single-scale checkpoint."""
+
+    path: str
+    loaded_tensor_count: int
+    loaded_parameter_count: int
+    ignored_checkpoint_keys: Tuple[str, ...]
+
+    def summary(self) -> str:
+        ignored = len(self.ignored_checkpoint_keys)
+        return (
+            f"loaded {self.loaded_tensor_count} tensors / "
+            f"{self.loaded_parameter_count:,} values; "
+            f"ignored {ignored} official full-model tensors"
+        )
+
+
+def _strip_data_parallel_prefix(key: str) -> str:
+    return key[7:] if key.startswith("module.") else key
+
+
+def _official_gmflow_key_to_local(key: str) -> Optional[str]:
+    """Translate one released GMFlow state-dict key to this front end."""
+
+    key = _strip_data_parallel_prefix(str(key))
+    if key.startswith("backbone."):
+        suffix = key[len("backbone.") :]
+        backbone_prefixes = {
+            "conv1.": "stem.0.",
+            "layer1.": "stage2.",
+            "layer2.": "stage4.",
+            "layer3.": "stage8.",
+            "conv2.": "projection.",
+        }
+        for official, local in backbone_prefixes.items():
+            if suffix.startswith(official):
+                return "backbone." + local + suffix[len(official) :]
+        return None
+
+    if key.startswith("transformer.layers."):
+        suffix = key[len("transformer.layers.") :]
+        suffix = suffix.replace(".self_attn.", ".self_attention.")
+        suffix = suffix.replace(
+            ".cross_attn_ffn.",
+            ".cross_attention.",
+        )
+        suffix = suffix.replace(".q_proj.", ".query.")
+        suffix = suffix.replace(".k_proj.", ".key.")
+        suffix = suffix.replace(".v_proj.", ".value.")
+        suffix = suffix.replace(".mlp.", ".ffn.")
+        return "transformer.blocks." + suffix
+
+    if key.startswith("feature_flow_attn."):
+        suffix = key[len("feature_flow_attn.") :]
+        suffix = suffix.replace("q_proj.", "query.")
+        suffix = suffix.replace("k_proj.", "key.")
+        return "flow_propagation." + suffix
+
+    return None
+
+
+def _official_checkpoint_state_dict(
+    path: str | Path,
+) -> Mapping[str, torch.Tensor]:
+    checkpoint_path = Path(path).expanduser()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            "Official GMFlow checkpoint not found: "
+            f"{checkpoint_path}. Run tools/download_gmflow_pretrained.py "
+            "or set hqs_core.gmflow_pretrained_checkpoint to the downloaded "
+            "gmflow_things-e9887eda.pth file."
+        )
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+    if not isinstance(checkpoint, Mapping):
+        raise TypeError(
+            f"GMFlow checkpoint must contain a mapping, got {type(checkpoint)!r}"
+        )
+    state = checkpoint.get("model", checkpoint.get("state_dict", checkpoint))
+    if not isinstance(state, Mapping):
+        raise TypeError("GMFlow checkpoint 'model' entry is not a state dictionary")
+    non_tensors = [
+        key for key, value in state.items() if not torch.is_tensor(value)
+    ]
+    if non_tensors:
+        preview = ", ".join(str(key) for key in non_tensors[:5])
+        raise TypeError(
+            "GMFlow model state contains non-tensor entries: " + preview
+        )
+    return state
+
+
 class GMFlowMatchingFrontEnd(nn.Module):
     """Dedicated GMFlow backbone, Transformer and flow-propagation module."""
 
@@ -609,10 +761,17 @@ class GMFlowMatchingFrontEnd(nn.Module):
         attention_splits: int = 2,
         gradient_checkpointing: bool = True,
         propagation_query_chunk_size: int = 512,
+        released_weights_compatible: bool = False,
     ) -> None:
         super().__init__()
         self.channels = int(channels)
-        self.backbone = GMFlowMatchingBackbone(self.channels)
+        self.released_weights_compatible = bool(
+            released_weights_compatible
+        )
+        self.backbone = GMFlowMatchingBackbone(
+            self.channels,
+            released_weights_compatible=self.released_weights_compatible,
+        )
         self.transformer = GMFlowFeatureTransformer(
             channels=self.channels,
             depth=int(transformer_depth),
@@ -624,6 +783,104 @@ class GMFlowMatchingFrontEnd(nn.Module):
             channels=self.channels,
             query_chunk_size=int(propagation_query_chunk_size),
         )
+
+    def load_official_checkpoint(
+        self,
+        path: str | Path,
+        *,
+        strict: bool = True,
+    ) -> GMFlowCheckpointLoadReport:
+        """Load the released GMFlow backbone/Transformer/propagation weights.
+
+        The official checkpoint also contains a convex full-resolution
+        upsampler.  HQSCore deliberately does not import it because its own
+        source-conditioned upsampler remains part of the inverse solver.
+        Everything in the correspondence front end is required in strict
+        mode; silently partial loading is never permitted.
+        """
+
+        if not self.released_weights_compatible:
+            raise RuntimeError(
+                "Official GMFlow weights require "
+                "released_weights_compatible=True so the backbone graph "
+                "matches the released implementation."
+            )
+        if not strict:
+            raise ValueError(
+                "Non-strict official GMFlow imports are disabled. The "
+                "correspondence front end must load completely."
+            )
+
+        official_state = _official_checkpoint_state_dict(path)
+        expected_state = self.state_dict()
+        converted: Dict[str, torch.Tensor] = {}
+        ignored = []
+        unsupported_checkpoint = []
+
+        for original_key, value in official_state.items():
+            stripped = _strip_data_parallel_prefix(str(original_key))
+            local_key = _official_gmflow_key_to_local(stripped)
+            if local_key is None:
+                if stripped.startswith("upsampler."):
+                    ignored.append(str(original_key))
+                else:
+                    unsupported_checkpoint.append(str(original_key))
+                continue
+            if local_key in converted:
+                raise RuntimeError(
+                    f"Multiple official GMFlow keys map to {local_key!r}"
+                )
+            converted[local_key] = value
+
+        missing = sorted(set(expected_state) - set(converted))
+        unexpected = sorted(set(converted) - set(expected_state))
+        shape_mismatches = sorted(
+            key
+            for key in set(expected_state).intersection(converted)
+            if tuple(expected_state[key].shape) != tuple(converted[key].shape)
+        )
+        if missing or unexpected or shape_mismatches or unsupported_checkpoint:
+            details = []
+            if missing:
+                details.append("missing=" + ", ".join(missing[:8]))
+            if unexpected:
+                details.append("unexpected=" + ", ".join(unexpected[:8]))
+            if shape_mismatches:
+                shape_details = [
+                    f"{key}: expected {tuple(expected_state[key].shape)}, "
+                    f"got {tuple(converted[key].shape)}"
+                    for key in shape_mismatches[:8]
+                ]
+                details.append("shape_mismatch=" + "; ".join(shape_details))
+            if unsupported_checkpoint:
+                details.append(
+                    "unsupported_official_keys="
+                    + ", ".join(unsupported_checkpoint[:8])
+                )
+            raise RuntimeError(
+                "Official GMFlow checkpoint is not a strict single-scale "
+                "front-end match: " + " | ".join(details)
+            )
+
+        loadable = {
+            key: value
+            for key, value in converted.items()
+            if key in expected_state
+            and tuple(value.shape) == tuple(expected_state[key].shape)
+        }
+        self.load_state_dict(loadable, strict=True)
+
+        loaded_parameter_count = sum(value.numel() for value in loadable.values())
+        return GMFlowCheckpointLoadReport(
+            path=str(Path(path).expanduser()),
+            loaded_tensor_count=len(loadable),
+            loaded_parameter_count=loaded_parameter_count,
+            ignored_checkpoint_keys=tuple(sorted(ignored)),
+        )
+
+    def set_trainable(self, trainable: bool) -> None:
+        for parameter in self.parameters():
+            parameter.requires_grad_(bool(trainable))
 
     def forward(
         self,
@@ -701,6 +958,7 @@ def gmflow_forward_backward_consistency(
 
 
 __all__ = [
+    "GMFlowCheckpointLoadReport",
     "GMFlowMatchingBackbone",
     "GMFlowFeatureTransformer",
     "GMFlowFeatureFlowAttention",
