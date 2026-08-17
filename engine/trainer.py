@@ -279,6 +279,8 @@ class Trainer:
 
     def __init__(self, cfg) -> None:
         self.cfg = cfg
+        self._nonfinite_skip_total = 0
+        self._nonfinite_skip_consecutive = 0
 
         # ── Device ──────────────────────────────────────────────────────────
         self.device = get_device(cfg.get("device", None))
@@ -528,6 +530,16 @@ class Trainer:
 
                 batch      = next(loader_iter)
                 loss_dict  = self._train_step(batch)
+                if loss_dict is None:
+                    # The dataloader advanced, but no optimiser or scheduler
+                    # update occurred. Keep global_step unchanged so
+                    # num_steps continues to mean successful updates.
+                    if batch_bar is not None:
+                        batch_bar.set_postfix(
+                            skipped_nf=str(self._nonfinite_skip_total),
+                            lr=f"{self.optimizer.param_groups[0]['lr']:.2e}",
+                        )
+                    continue
 
                 running.update(loss_dict)
 
@@ -832,7 +844,39 @@ class Trainer:
         else:
             logger.info("Joint model optimisation active.")
 
-    def _train_step(self, batch: Dict) -> Dict[str, float]:
+    def _skip_nonfinite_batch(self, reason: str) -> None:
+        """Discard one batch without touching parameters or scheduler state."""
+        self.optimizer.zero_grad(set_to_none=True)
+        self._nonfinite_skip_total += 1
+        self._nonfinite_skip_consecutive += 1
+        logger.warning(
+            "Skipped non-finite batch before optimizer.step at global "
+            "step %d (total=%d, consecutive=%d): %s",
+            self.global_step,
+            self._nonfinite_skip_total,
+            self._nonfinite_skip_consecutive,
+            reason,
+        )
+
+        max_total = int(
+            self.cfg.training.get("max_nonfinite_skips", 50)
+        )
+        max_consecutive = int(
+            self.cfg.training.get("max_consecutive_nonfinite_skips", 10)
+        )
+        if (
+            self._nonfinite_skip_total > max_total
+            or self._nonfinite_skip_consecutive > max_consecutive
+        ):
+            raise FloatingPointError(
+                "Exceeded the configured non-finite batch skip limit: "
+                f"total={self._nonfinite_skip_total}/{max_total}, "
+                "consecutive="
+                f"{self._nonfinite_skip_consecutive}/{max_consecutive}. "
+                f"Last failure: {reason}"
+            )
+
+    def _train_step(self, batch: Dict) -> Optional[Dict[str, float]]:
         self._configure_global_matcher_warmup()
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -869,15 +913,36 @@ class Trainer:
                 synthetic_occlusion=synthetic_occ_batch,
             )
 
-        if (
-            bool(self.cfg.training.get("fail_on_nonfinite", False))
-            and not bool(torch.isfinite(loss_dict["loss"]).all().item())
+        loss_is_finite = bool(torch.isfinite(loss_dict["loss"]).all().item())
+        skip_nonfinite = bool(
+            self.cfg.training.get("skip_nonfinite_batches", False)
+        )
+        if not loss_is_finite and (
+            skip_nonfinite
+            or bool(self.cfg.training.get("fail_on_nonfinite", False))
         ):
             paths = _nonfinite_tensor_paths(out, prefix="model")
             paths.extend(
                 _nonfinite_tensor_paths(loss_dict, prefix="loss")
             )
+            paths.extend(
+                _nonfinite_tensor_paths(
+                    {
+                        "image1": img1,
+                        "image2": img2,
+                        "flow": flow,
+                        "valid": valid,
+                        "occlusion": occ_batch,
+                        "invalid": inv_batch,
+                        "synthetic_occlusion": synthetic_occ_batch,
+                    },
+                    prefix="batch",
+                )
+            )
             detail = "; ".join(paths) if paths else "source not localised"
+            if skip_nonfinite:
+                self._skip_nonfinite_batch(detail)
+                return None
             raise FloatingPointError(
                 "Non-finite training loss at global step "
                 f"{self.global_step}. First affected tensors: {detail}"
@@ -885,10 +950,33 @@ class Trainer:
 
         self.scaler.scale(loss_dict["loss"]).backward()
         self.scaler.unscale_(self.optimizer)
-        nn.utils.clip_grad_norm_(
-            self.model.parameters(),
-            self.cfg.training.get("grad_clip", 1.0),
-        )
+        gradient_parameters = [
+            parameter
+            for group in self.optimizer.param_groups
+            for parameter in group["params"]
+            if parameter.grad is not None
+        ]
+        try:
+            nn.utils.clip_grad_norm_(
+                gradient_parameters,
+                self.cfg.training.get("grad_clip", 1.0),
+                error_if_nonfinite=True,
+            )
+        except RuntimeError as error:
+            if self._use_amp:
+                # Complete GradScaler's per-optimizer unscale cycle and lower
+                # its scale before attempting the next batch.
+                self.scaler.update()
+            if skip_nonfinite:
+                self._skip_nonfinite_batch(
+                    "non-finite gradient norm: " + str(error)
+                )
+                return None
+            self.optimizer.zero_grad(set_to_none=True)
+            raise FloatingPointError(
+                "Non-finite gradients at global step "
+                f"{self.global_step}: {error}"
+            ) from error
 
         # With AMP, GradScaler may skip optimizer.step() on overflow. In that
         # case scheduler.step() must also be skipped to keep call order valid.
@@ -898,6 +986,7 @@ class Trainer:
         scale_after = self.scaler.get_scale()
         if scale_after >= scale_before:
             self.scheduler.step()
+        self._nonfinite_skip_consecutive = 0
 
         scalar_dict = {k: v.item() if isinstance(v, torch.Tensor) else v
                        for k, v in loss_dict.items()}
