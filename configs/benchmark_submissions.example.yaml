@@ -1,0 +1,39 @@
+# Benchmark test-set roots and optional official bundling utilities.
+# Individual benchmark sections may override model_config/checkpoint if a
+# benchmark-specific fine-tuned checkpoint is used.
+benchmarks:
+  sintel:
+    enabled: true
+    root: /mnt/a/benchmark_data/optical_flow/MPI-Sintel-complete
+    # Use the *latest* Bundler shipped by MPI Sintel.
+    bundler: /mnt/a/benchmark_data/optical_flow/MPI-Sintel-complete/bundler/linux/bundler
+    bundle_name: hqsflow_sintel.lzma
+
+  kitti2012:
+    enabled: true
+    root: /mnt/a/benchmark_data/optical_flow/KITTI_2012/data_stereo_flow
+    camera: image_0
+    flow_type: occ
+
+  kitti2015:
+    enabled: true
+    root: /mnt/a/benchmark_data/optical_flow/KITTI_2015/data_scene_flow
+    camera: image_2
+    flow_type: occ
+
+  spring:
+    enabled: true
+    root: /mnt/a/benchmark_data/optical_flow/spring
+    # Spring test images are full-HD while submission .flo5 maps use the 4K
+    # spatial grid. The flow VECTOR UNITS remain full-HD pixels, so the script
+    # upsamples spatially by 2 without multiplying u/v by 2.
+    output_spatial_scale: 2
+    flow_subsampling: /mnt/a/benchmark_data/optical_flow/spring/tools/flow_subsampling
+
+  hd1k:
+    # Generates a legacy challenge export from hd1k_challenge. The current HCI
+    # site does not expose a clearly verifiable standalone modern submission
+    # workflow, so this is not labelled upload-ready by the tool.
+    enabled: false
+    root: /mnt/a/benchmark_data/optical_flow/HD1K
+    camera: image_2

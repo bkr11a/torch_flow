@@ -1,0 +1,130 @@
+# OF-A1: equal-capacity unconstrained recurrent control.
+# Mirrors configs/dropins/16_hqs_core_pretrained_gmflow.yaml except for the
+# recurrent solver model_type. The front-end, frozen GMFlow, scale schedule,
+# recurrence depth, matching evidence and final upsampler remain identical.
+
+run_name: hqs_core/recurrent_control_pretrained_gmflow_2_4_2_2
+
+mlflow:
+  registered_model_name: HQSCoreRecurrentControl
+  tags:
+    architecture: hqs_core_recurrent_control
+    ablation_group: OF-A
+    ablation_id: A1
+    correspondence: official_gmflow_things_single_scale
+    correspondence_training: frozen
+    operator_structure: unconstrained_fused_recurrent
+
+model:
+  model_type: hqs_core_recurrent_control
+
+  hqs_core:
+    feature_channels: [32, 64, 96, 128]
+    match_channels: [64, 96, 128, 128]
+    context_channels: [64, 64, 96, 96]
+    blocks_per_scale: [1, 2, 2, 2]
+    groups: 8
+    matching_pyramid: gmflow
+
+    gmflow_feature_channels: 128
+    gmflow_transformer_depth: 6
+    gmflow_ffn_expansion: 4
+    gmflow_attention_splits: 2
+    gmflow_gradient_checkpointing: false
+    gmflow_propagation_query_chunk_size: 256
+    gmflow_released_weights_compatible: true
+    gmflow_pretrained_checkpoint: ${oc.env:GMFLOW_CHECKPOINT,pretrained/gmflow_things-e9887eda.pth}
+    gmflow_pretrained_strict: true
+    gmflow_freeze_pretrained: true
+
+    iterations: [2, 4, 2, 2]
+    jacobi_sweeps: [2, 2, 1, 1]
+    correlation_radii: [4, 4, 4, 3]
+    all_pairs_levels: [1, 4]
+    correlation_embedding_dim: 64
+    local_corr_channel_chunk: 4
+    local_corr_checkpoint: true
+
+    coarse_hidden_dim: 96
+    fine_hidden_dim: 64
+    prior_hidden_channels: 64
+    validity_hidden_dim: 32
+    upsample_hidden_dim: 64
+
+    max_data_delta: [2.0, 2.0, 1.5, 1.0]
+    max_prox_delta: [0.5, 0.5, 0.5, 0.25]
+
+    beta_initial: 0.10
+    beta_minimum: 0.01
+    lambda_initial: 0.08
+    lambda_minimum: 0.001
+    edge_alpha: 10.0
+    analytic_weight: 1.0
+    learned_data_weight: 1.0
+    initial_reliability: 0.90
+    allow_external_validity_inputs: false
+
+    global_match_scale: 8
+    global_match_transition_mode: native_residual
+    global_decoder: soft_expectation
+    global_correlation_mode: sqrt_dim
+    global_temperature: 1.0
+    global_query_chunk_size: 256
+    global_confidence_gated: false
+    global_confidence_floor: 0.0
+    global_bidirectional: true
+    global_use_flow_propagation: false
+    global_propagation_routing: raw
+    global_fb_data_gate: false
+    global_fb_gate_source: raw
+    global_fb_data_gate_scales: [16, 8]
+    global_fb_alpha: 0.01
+    global_fb_beta: 0.5
+    global_fb_softness: 0.1
+    global_fb_threshold_mode: gmflow
+
+    # Capacity search is performed independently for the coarse and fine cells.
+    # Every balancing parameter remains on the active forward path.
+    recurrent_control:
+      capacity_tolerance: 0.01
+      hidden_min: 48
+      hidden_max: 192
+      hidden_step: 8
+      residual_blocks_min: 0
+      residual_blocks_max: 6
+      adapter_max_channels: 2048
+
+loss:
+  num_stages: 10
+  stage_weight_mode: geometric
+  gamma: 0.85
+  global_init_weight: 0.0
+  global_propagated_weight: 0.0
+  global_confidence_weight: 0.0
+  global_fb_visibility_weight: 0.0
+  # Keep the same auxiliary visibility supervision as A0. Reliability remains
+  # a predicted diagnostic/input feature in A1 but is NOT a hard routing gate.
+  core_visibility_weight: 0.01
+  core_visibility_last_n: 4
+  smooth_weight: 0.0
+  inter_smooth_weight: 0.0
+  boundary_weight: 0.0
+  raw_final_weight: 0.0
+  iter_damp_weight: 0.0
+  photo_weight: 0.0
+  ofce_weight: 0.0
+  detail_weight: 0.0
+  occlusion_aware:
+    enabled: false
+
+training:
+  amp: false
+  lr: 1.0e-4
+  warmup_pct: 0.05
+  global_matcher_warmup_steps: 0
+  freeze_backbone_during_global_warmup: false
+  grad_clip: 1.0
+  fail_on_nonfinite: true
+
+data:
+  detail_crop_prob: 0.0

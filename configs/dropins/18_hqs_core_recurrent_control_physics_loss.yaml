@@ -1,0 +1,28 @@
+# OF-A2 placeholder: equal-capacity recurrent control + loss-level physics.
+#
+# IMPORTANT: this variant is intentionally disabled in the supplied ablation
+# matrix until the auxiliary loss weights are calibrated.  Do not use it as a
+# reported ablation merely by enabling this file: A2 must differ from A1 only
+# through a pre-declared physics-loss package with calibrated/fixed weights.
+
+run_name: hqs_core/recurrent_control_physics_loss_PENDING_CALIBRATION
+
+mlflow:
+  registered_model_name: HQSCoreRecurrentControlPhysicsLoss
+  tags:
+    architecture: hqs_core_recurrent_control
+    ablation_group: OF-A
+    ablation_id: A2
+    operator_structure: unconstrained_fused_recurrent
+    physics_loss_status: pending_calibration
+
+model:
+  model_type: hqs_core_recurrent_control
+
+# These remain zero until a separate calibration decision fixes the A2 package.
+# Once calibrated, copy the complete A1 drop-in first, then change ONLY the
+# declared loss terms here so the A1 -> A2 comparison remains loss-only.
+loss:
+  photo_weight: 0.0
+  smooth_weight: 0.0
+  ofce_weight: 0.0

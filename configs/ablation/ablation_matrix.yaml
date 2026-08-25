@@ -1,0 +1,134 @@
+version: 1
+repo_root: /home/bradrice/repos/torch_flow
+output_root: ablation_runs
+
+defaults:
+  python: python
+  entrypoint: train_curriculum.py
+  config: configs/default.yaml
+  curriculum: configs/curriculum/universal_replay_curriculum.yaml
+
+jobs:
+  A0:
+    group: OF-A
+    enabled: true
+    implementation_status: ready
+    tags: [reference, hqs, architecture]
+    override: configs/dropins/16_hqs_core_pretrained_gmflow.yaml
+    base_run_name: ablation/of_a/A0_full_hqs
+    cli_overrides:
+      - training.num_steps=50000
+      - training.val_every=5000
+      - training.save_every=10000
+      - mlflow.enabled=false
+
+  A1:
+    group: OF-A
+    enabled: true
+    implementation_status: ready
+    tags: [recurrent_control, equal_capacity, architecture]
+    override: configs/dropins/17_hqs_core_recurrent_control.yaml
+    base_run_name: ablation/of_a/A1_equal_capacity_recurrent
+    cli_overrides:
+      - training.num_steps=50000
+      - training.val_every=5000
+      - training.save_every=10000
+      - mlflow.enabled=false
+
+  A2:
+    group: OF-A
+    enabled: false
+    implementation_status: requires_loss_weight_calibration
+    tags: [recurrent_control, physics_loss]
+    override: configs/dropins/18_hqs_core_recurrent_control_physics_loss.yaml
+    base_run_name: ablation/of_a/A2_physics_loss_only
+
+  A3:
+    group: OF-A
+    enabled: false
+    implementation_status: not_implemented
+    tags: [no_q, split_state]
+    # Planned: structured direct-flow cell retaining operator order but no q split.
+
+  B0:
+    group: OF-B
+    enabled: false
+    implementation_status: not_implemented
+    tags: [operator_reference]
+  B1:
+    group: OF-B
+    enabled: false
+    implementation_status: not_implemented
+    tags: [no_analytic_data]
+  B2:
+    group: OF-B
+    enabled: false
+    implementation_status: not_implemented
+    tags: [no_learned_data]
+  B3:
+    group: OF-B
+    enabled: false
+    implementation_status: not_implemented
+    tags: [no_analytic_prox]
+  B4:
+    group: OF-B
+    enabled: false
+    implementation_status: not_implemented
+    tags: [no_learned_prox]
+  B5:
+    group: OF-B
+    enabled: false
+    implementation_status: not_implemented
+    tags: [no_prox_path]
+
+  C0:
+    group: OF-C
+    enabled: false
+    implementation_status: not_implemented
+    tags: [learned_reliability]
+  C1:
+    group: OF-C
+    enabled: false
+    implementation_status: not_implemented
+    tags: [ungated]
+  C2:
+    group: OF-C
+    enabled: false
+    implementation_status: not_implemented
+    tags: [geometric_reliability]
+  C3:
+    group: OF-C
+    enabled: false
+    implementation_status: not_implemented
+    tags: [oracle_reliability]
+  C4:
+    group: OF-C
+    enabled: false
+    implementation_status: not_implemented
+    tags: [spatial_control]
+
+  D0:
+    group: OF-D
+    enabled: false
+    implementation_status: not_implemented
+    tags: [no_routing]
+  D1:
+    group: OF-D
+    enabled: false
+    implementation_status: not_implemented
+    tags: [residual_gate]
+  D2:
+    group: OF-D
+    enabled: false
+    implementation_status: not_implemented
+    tags: [analytic_gate]
+  D3:
+    group: OF-D
+    enabled: false
+    implementation_status: not_implemented
+    tags: [all_data_gate]
+  D4:
+    group: OF-D
+    enabled: false
+    implementation_status: not_implemented
+    tags: [full_graph_routing]

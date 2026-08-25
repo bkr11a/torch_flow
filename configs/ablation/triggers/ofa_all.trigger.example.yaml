@@ -1,0 +1,20 @@
+trigger_id: ofa_equal_capacity_main
+repo_root: /home/bradrice/repos/torch_flow
+output_root: ablation_runs
+
+select:
+  groups: [OF-A]
+  # Only matrix jobs with enabled=true and implementation_status=ready run.
+
+resources:
+  # With multiple GPUs, use e.g. [0, 1, 2, 3]. One training process is launched
+  # per GPU by default. On a single RTX 5090 this will therefore run sequentially
+  # unless oversubscription is explicitly enabled (not recommended for these jobs).
+  gpus: [0]
+  max_parallel: 1
+  max_parallel_per_gpu: 1
+  allow_gpu_oversubscription: false
+
+resume_existing: true
+fail_fast: false
+poll_seconds: 2.0

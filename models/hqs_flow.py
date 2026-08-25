@@ -34,7 +34,9 @@ def build_model(cfg, model_type: str = "tfport"):
         cfg: Configuration object with cfg.model sub-config
         model_type: "tfport" (default, faithful TensorFlow recreation),
                     "original" (multi-stage unrolled), ``hqs_core``,
-                    ``hqs_lm_of`` (learned probabilistic correspondence and
+                    ``hqs_core_recurrent_control`` (equal-capacity generic
+                    recurrent control for the OF-A ablation), ``hqs_lm_of``
+                    (learned probabilistic correspondence and
                     transformer attention fused inside LM), ``hqs_field_of``
                     (multi-hypothesis correlation data term with a
                     source-conditioned graph-field proximal), ``hqs_otof``
@@ -58,6 +60,16 @@ def build_model(cfg, model_type: str = "tfport"):
         from hqs_pytorch.customML.customModels.HQSCore import HQSCore
 
         return HQSCore(cfg.model)
+    if model_type in {
+        "hqs_core_recurrent_control",
+        "hqs_recurrent_control",
+        "recurrent_control",
+    }:
+        from hqs_pytorch.customML.customModels.HQSCoreRecurrentControl import (
+            HQSCoreRecurrentControl,
+        )
+
+        return HQSCoreRecurrentControl(cfg.model)
     if model_type in {"hqs_lm_of", "hqslm_of", "hqs-lm-of"}:
         from hqs_pytorch.customML.customModels.HQSLMOpticalFlow import (
             HQSLMOpticalFlow,
@@ -102,6 +114,7 @@ def build_model(cfg, model_type: str = "tfport"):
     raise ValueError(
         f"Unknown model_type: {model_type}. "
         "Use one of: tfport | tf_faithful | tf_port | original | legacy | "
-        "hqs_core | hqscore | core | hqs_lm_of | hqs_field_of | "
+        "hqs_core | hqscore | core | hqs_core_recurrent_control | "
+        "hqs_lm_of | hqs_field_of | "
         "hqs_otof | hqs_field_of_v2 | hqs_lm_sf."
     )

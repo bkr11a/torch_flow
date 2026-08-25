@@ -16,7 +16,8 @@ from .warp import (
 )
 
 __all__ = [
-    "HQSFlow", "HQSCore", "HQSLMOpticalFlow", "HQSFieldOpticalFlow",
+    "HQSFlow", "HQSCore", "HQSCoreRecurrentControl", "HQSLMOpticalFlow",
+    "HQSFieldOpticalFlow",
     "HQSOTOpticalFlow", "HQSFieldOpticalFlowV2", "HQSLMSceneFlow",
     "build_model",
     "BasicEncoder", "SmallEncoder", "build_encoder",
@@ -35,6 +36,9 @@ def __getattr__(name: str):
     # is still being defined.
     model_modules = {
         "HQSCore": "hqs_pytorch.customML.customModels.HQSCore",
+        "HQSCoreRecurrentControl": (
+            "hqs_pytorch.customML.customModels.HQSCoreRecurrentControl"
+        ),
         "HQSLMOpticalFlow": (
             "hqs_pytorch.customML.customModels.HQSLMOpticalFlow"
         ),
