@@ -1,0 +1,16 @@
+trigger_id: ofa_a1_recurrent_baseline
+repo_root: /home/bradrice/repos/torch_flow
+output_root: ablation_runs
+
+select:
+  ids: [A1]
+
+resources:
+  gpus: [0]
+  max_parallel: 1
+  max_parallel_per_gpu: 1
+  allow_gpu_oversubscription: false
+
+resume_existing: true
+fail_fast: true
+poll_seconds: 2.0

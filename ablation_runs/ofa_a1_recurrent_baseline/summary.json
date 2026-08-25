@@ -1,0 +1,10 @@
+{
+  "completed": [
+    "A1"
+  ],
+  "failed": [],
+  "finished_at": "2026-08-25T15:48:57+08:00",
+  "matrix": "/home/bradrice/repos/torch_flow/configs/ablation/ablation_matrix.yaml",
+  "trigger": "/home/bradrice/repos/torch_flow/configs/ablation/triggers/a1_recurrent_baseline.trigger.yaml",
+  "trigger_id": "ofa_a1_recurrent_baseline"
+}

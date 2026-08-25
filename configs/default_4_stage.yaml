@@ -1,0 +1,105 @@
+# =============================================================================
+# HQSFlow – Default / Base Configuration
+# All benchmark and ablation configs inherit from this and override as needed.
+# =============================================================================
+
+run_name: hqs_flow_default
+log_dir:  logs
+checkpoint_dir: checkpoints
+use_wandb: false
+wandb_project: hqs_flow
+
+mlflow:
+  enabled: false
+  tracking_uri: "https://mlflow.spicedrice.home/"
+  experiment_name: "torch_flow"
+  insecure_tls: true
+  strict: false
+  log_checkpoints: true
+  log_tensorboard: true
+  register_best: true
+  registered_model_name: "HQSFlowTFPort"
+  best_alias: "best"
+  tags:
+    project: "torch_flow"
+    framework: "pytorch"
+
+# ── Model ─────────────────────────────────────────────────────────────────
+model:
+  num_stages: 4                  # K unrolled HQS iterations
+
+  # Weight-sharing across stages:
+  #   share_all    – one UpdateNet + one ProxNet (recurrent, fewest params)
+  #   share_none   – independent weights per stage (most expressive)
+  #   share_update – shared UpdateNet, independent ProxNets
+  #   share_prox   – independent UpdateNets, shared ProxNet
+  weight_sharing: share_all
+
+  upsample_scale: 8               # encoder output stride → full-res factor
+
+  encoder:                        # feature extractor (applied to both images)
+    type: basic
+    output_dim: 256
+    norm: instance
+    output_stride: 8
+    dropout: 0.0
+
+  context:                        # context encoder (applied to image1 only)
+    type: basic
+    output_dim: 128
+    norm: batch
+    output_stride: 8
+    dropout: 0.0
+
+  corr:                           # correlation / cost volume
+    type: all_pairs               # "all_pairs" | "local"
+    num_levels: 4
+    radius: 4
+
+  update_net:                     # data-subproblem solver
+    hidden_dim: 128
+    head_dim: 256
+
+  prox:                           # regularisation subproblem (proximal net)
+    type: unet                    # "unet" | "dncnn" | "none"
+    base_ch: 64
+    depth: 3
+
+# ── Loss ──────────────────────────────────────────────────────────────────
+loss:
+  gamma: 0.85                     # geometric decay over stages
+  max_flow: 400.0                 # ignore GT with magnitude > this (px)
+  loss_fn: charbonnier            # "charbonnier" | "l1" | "l2"
+  smooth_weight: 0.0
+  photo_weight: 0.0
+  ofce_weight: 0.0                # Optical Flow Constraint Equation loss
+
+# ── Training ──────────────────────────────────────────────────────────────
+training:
+  num_steps: 100000
+  lr: 4.0e-4
+  weight_decay: 1.0e-4
+  warmup_pct: 0.05
+  grad_clip: 1.0
+  log_every: 100
+  val_every: 5000
+  save_every: 10000
+  checkpoint: null               # path to resume from
+
+# ── Data ──────────────────────────────────────────────────────────────────
+data:
+  name: chairs                   # "chairs" | "things" | "sintel" | "spring" | "kitti"
+  root: ./data/benchmark_data/FlyingChairs_release
+  batch_size: 6
+  num_workers: 4
+  crop_size: [368, 496]
+  min_scale: -0.1
+  max_scale: 1.0
+  dstype: clean
+
+val_data:
+  name: chairs
+  root: ./data/benchmark_data/FlyingChairs_release
+  batch_size: 4
+  num_workers: 2
+  crop_size: [368, 496]
