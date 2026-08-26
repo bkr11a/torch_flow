@@ -21,6 +21,9 @@ jobs:
       - training.val_every=5000
       - training.save_every=10000
       - mlflow.enabled=false
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
 
   A1:
     group: OF-A
@@ -34,6 +37,9 @@ jobs:
       - training.val_every=5000
       - training.save_every=10000
       - mlflow.enabled=false
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
 
   A2:
     group: OF-A
