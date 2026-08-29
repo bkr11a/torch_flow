@@ -43,98 +43,204 @@ jobs:
 
   A2:
     group: OF-A
-    enabled: false
-    implementation_status: requires_loss_weight_calibration
-    tags: [recurrent_control, physics_loss]
+    enabled: true
+    implementation_status: ready
+    tags: [recurrent_control, physics_loss, loss_only]
     override: configs/dropins/18_hqs_core_recurrent_control_physics_loss.yaml
     base_run_name: ablation/of_a/A2_physics_loss_only
+    cli_overrides:
+      - training.num_steps=50000
+      - training.val_every=5000
+      - training.save_every=10000
+      - mlflow.enabled=false
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
 
   A3:
     group: OF-A
-    enabled: false
-    implementation_status: not_implemented
-    tags: [no_q, split_state]
-    # Planned: structured direct-flow cell retaining operator order but no q split.
+    enabled: true
+    implementation_status: ready
+    tags: [hqs, physics_loss, architecture_objective_interaction]
+    override: configs/dropins/19_hqs_core_augmented_physics_loss.yaml
+    base_run_name: ablation/of_a/A3_hqs_augmented_loss
+    cli_overrides:
+      - training.num_steps=50000
+      - training.val_every=5000
+      - training.save_every=10000
+      - mlflow.enabled=false
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
 
-  B0:
-    group: OF-B
-    enabled: false
-    implementation_status: not_implemented
-    tags: [operator_reference]
+  A4:
+    group: OF-A
+    enabled: true
+    implementation_status: ready
+    tags: [single_state, no_split, capacity_matched]
+    override: configs/dropins/20_hqs_core_single_state.yaml
+    base_run_name: ablation/of_a/A4_no_split_state
+    cli_overrides:
+      - training.num_steps=50000
+      - training.val_every=5000
+      - training.save_every=10000
+      - mlflow.enabled=false
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
+
   B1:
     group: OF-B
-    enabled: false
-    implementation_status: not_implemented
-    tags: [no_analytic_data]
+    enabled: true
+    implementation_status: ready
+    tags: [analytic_data_only, no_learned_data]
+    override: configs/dropins/21_hqs_core_B1_analytic_data_only.yaml
+    base_run_name: ablation/of_b/B1_analytic_data_only
+    cli_overrides:
+      - training.num_steps=50000
+      - training.val_every=5000
+      - training.save_every=10000
+      - mlflow.enabled=false
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
+
   B2:
     group: OF-B
-    enabled: false
-    implementation_status: not_implemented
-    tags: [no_learned_data]
+    enabled: true
+    implementation_status: ready
+    tags: [learned_data_only, no_analytic_data]
+    override: configs/dropins/22_hqs_core_B2_learned_data_only.yaml
+    base_run_name: ablation/of_b/B2_learned_data_only
+    cli_overrides:
+      - training.num_steps=50000
+      - training.val_every=5000
+      - training.save_every=10000
+      - mlflow.enabled=false
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
+
   B3:
     group: OF-B
-    enabled: false
-    implementation_status: not_implemented
-    tags: [no_analytic_prox]
+    enabled: true
+    implementation_status: ready
+    tags: [analytic_proximal_only, no_learned_prox]
+    override: configs/dropins/23_hqs_core_B3_analytic_proximal_only.yaml
+    base_run_name: ablation/of_b/B3_analytic_proximal_only
+    cli_overrides:
+      - training.num_steps=50000
+      - training.val_every=5000
+      - training.save_every=10000
+      - mlflow.enabled=false
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
+
   B4:
     group: OF-B
-    enabled: false
-    implementation_status: not_implemented
-    tags: [no_learned_prox]
-  B5:
-    group: OF-B
-    enabled: false
-    implementation_status: not_implemented
-    tags: [no_prox_path]
+    enabled: true
+    implementation_status: ready
+    tags: [learned_proximal_only, no_analytic_prox]
+    override: configs/dropins/24_hqs_core_B4_learned_proximal_only.yaml
+    base_run_name: ablation/of_b/B4_learned_proximal_only
+    cli_overrides:
+      - training.num_steps=50000
+      - training.val_every=5000
+      - training.save_every=10000
+      - mlflow.enabled=false
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
 
   C0:
     group: OF-C
     enabled: false
     implementation_status: not_implemented
     tags: [learned_reliability]
+    cli_overrides:
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
   C1:
     group: OF-C
     enabled: false
     implementation_status: not_implemented
     tags: [ungated]
+    cli_overrides:
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
   C2:
     group: OF-C
     enabled: false
     implementation_status: not_implemented
     tags: [geometric_reliability]
+    cli_overrides:
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
   C3:
     group: OF-C
     enabled: false
     implementation_status: not_implemented
     tags: [oracle_reliability]
+    cli_overrides:
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
   C4:
     group: OF-C
     enabled: false
     implementation_status: not_implemented
     tags: [spatial_control]
+    cli_overrides:
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
 
   D0:
     group: OF-D
     enabled: false
     implementation_status: not_implemented
     tags: [no_routing]
+    cli_overrides:
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
   D1:
     group: OF-D
     enabled: false
     implementation_status: not_implemented
     tags: [residual_gate]
+    cli_overrides:
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
   D2:
     group: OF-D
     enabled: false
     implementation_status: not_implemented
     tags: [analytic_gate]
+    cli_overrides:
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
   D3:
     group: OF-D
     enabled: false
     implementation_status: not_implemented
     tags: [all_data_gate]
+    cli_overrides:
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
   D4:
     group: OF-D
     enabled: false
     implementation_status: not_implemented
     tags: [full_graph_routing]
+    cli_overrides:
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10

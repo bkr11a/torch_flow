@@ -1,21 +1,19 @@
-# OF-A2: loss-only physics control.
-# Exact A1 equal-capacity recurrent architecture; ONLY the training objective
-# changes to Eq. (65): L_seq + 0.20 L_phot + 0.20 L_reg + 0.20 L_OFCE.
-# L_reg is implemented by the existing first-order edge-aware SmoothnessLoss.
+# OF-B1: Analytic data only: learned data residual and its recurrent hidden update are bypassed.
+# All non-intervened A0 components, schedules, evidence and supervision remain fixed.
 
-run_name: hqs_core/ablation_A2_recurrent_physics_loss
+run_name: hqs_core/ablation_B1_analytic_data_only
 
 mlflow:
-  registered_model_name: HQSCoreA2LossOnlyPhysics
+  registered_model_name: HQSCoreB1AnalyticDataOnly
   tags:
-    architecture: hqs_core_recurrent_control
-    ablation_group: OF-A
-    ablation_id: A2
-    operator_structure: unconstrained_fused_recurrent
-    physics_loss: phot_0.20_reg_0.20_ofce_0.20
+    architecture: hqs_core_operator_ablation
+    ablation_group: OF-B
+    ablation_id: B1
+    condition: analytic_data_only
+    reference: A0
 
 model:
-  model_type: hqs_core_recurrent_control
+  model_type: hqs_core_operator_ablation
 
   hqs_core:
     feature_channels: [32, 64, 96, 128]
@@ -83,14 +81,12 @@ model:
     global_fb_softness: 0.1
     global_fb_threshold_mode: gmflow
 
-    recurrent_control:
-      capacity_tolerance: 0.01
-      hidden_min: 48
-      hidden_max: 192
-      hidden_step: 8
-      residual_blocks_min: 0
-      residual_blocks_max: 6
-      adapter_max_channels: 2048
+    operator_ablation:
+      use_analytic_data: true
+      use_learned_data: false
+      analytic_input_to_learned: true
+      use_analytic_prox: true
+      use_learned_prox: true
 
 loss:
   num_stages: 10
@@ -102,13 +98,13 @@ loss:
   global_fb_visibility_weight: 0.0
   core_visibility_weight: 0.01
   core_visibility_last_n: 4
-  smooth_weight: 0.20
+  smooth_weight: 0.00
   inter_smooth_weight: 0.0
   boundary_weight: 0.0
   raw_final_weight: 0.0
   iter_damp_weight: 0.0
-  photo_weight: 0.20
-  ofce_weight: 0.20
+  photo_weight: 0.00
+  ofce_weight: 0.00
   detail_weight: 0.0
   occlusion_aware:
     enabled: false

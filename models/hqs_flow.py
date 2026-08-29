@@ -35,7 +35,10 @@ def build_model(cfg, model_type: str = "tfport"):
         model_type: "tfport" (default, faithful TensorFlow recreation),
                     "original" (multi-stage unrolled), ``hqs_core``,
                     ``hqs_core_recurrent_control`` (equal-capacity generic
-                    recurrent control for the OF-A ablation), ``hqs_lm_of``
+                    recurrent control for the OF-A ablation),
+                    ``hqs_core_single_state`` (OF-A4 no-split-state control),
+                    ``hqs_core_operator_ablation`` (OF-B operator controls),
+                    ``hqs_lm_of``
                     (learned probabilistic correspondence and
                     transformer attention fused inside LM), ``hqs_field_of``
                     (multi-hypothesis correlation data term with a
@@ -70,6 +73,26 @@ def build_model(cfg, model_type: str = "tfport"):
         )
 
         return HQSCoreRecurrentControl(cfg.model)
+    if model_type in {
+        "hqs_core_single_state",
+        "hqs_single_state",
+        "single_state",
+    }:
+        from hqs_pytorch.customML.customModels.HQSCoreSingleState import (
+            HQSCoreSingleState,
+        )
+
+        return HQSCoreSingleState(cfg.model)
+    if model_type in {
+        "hqs_core_operator_ablation",
+        "hqs_operator_ablation",
+        "operator_ablation",
+    }:
+        from hqs_pytorch.customML.customModels.HQSCoreOperatorAblation import (
+            HQSCoreOperatorAblation,
+        )
+
+        return HQSCoreOperatorAblation(cfg.model)
     if model_type in {"hqs_lm_of", "hqslm_of", "hqs-lm-of"}:
         from hqs_pytorch.customML.customModels.HQSLMOpticalFlow import (
             HQSLMOpticalFlow,
@@ -115,6 +138,7 @@ def build_model(cfg, model_type: str = "tfport"):
         f"Unknown model_type: {model_type}. "
         "Use one of: tfport | tf_faithful | tf_port | original | legacy | "
         "hqs_core | hqscore | core | hqs_core_recurrent_control | "
+        "hqs_core_single_state | hqs_core_operator_ablation | "
         "hqs_lm_of | hqs_field_of | "
         "hqs_otof | hqs_field_of_v2 | hqs_lm_sf."
     )
