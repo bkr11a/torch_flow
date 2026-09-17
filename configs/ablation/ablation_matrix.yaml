@@ -244,3 +244,131 @@ jobs:
       - training.skip_nonfinite_batches=true
       - training.max_nonfinite_skips=50
       - training.max_consecutive_nonfinite_skips=10
+
+  E1:
+    group: OF-E
+    enabled: true
+    implementation_status: ready
+    tags: [iteration_depth, single_iteration]
+    override: configs/dropins/of_e/E1_single_iteration_depth.yaml
+    base_run_name: ablation/of_e/E1_single_iteration_depth
+    cli_overrides:
+      - training.num_steps=50000
+      - training.val_every=5000
+      - training.save_every=10000
+      - mlflow.enabled=false
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
+
+  E2:
+    group: OF-E
+    enabled: true
+    implementation_status: ready
+    tags: [iteration_depth, half_iteration]
+    override: configs/dropins/of_e/E2_half_iteration_depth.yaml
+    base_run_name: ablation/of_e/E2_half_iteration_depth
+    cli_overrides:
+      - training.num_steps=50000
+      - training.val_every=5000
+      - training.save_every=10000
+      - mlflow.enabled=false
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
+  
+  E3:
+    group: OF-E
+    enabled: true
+    implementation_status: ready
+    tags: [iteration_depth, coarse_iteration]
+    override: configs/dropins/of_e/E3_coarse_iteration_depth.yaml
+    base_run_name: ablation/of_e/E3_coarse_iteration_depth
+    cli_overrides:
+      - training.num_steps=50000
+      - training.val_every=5000
+      - training.save_every=10000
+      - mlflow.enabled=false
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
+
+  E4:
+    group: OF-E
+    enabled: true
+    implementation_status: ready
+    tags: [iteration_depth, fine_iteration]
+    override: configs/dropins/of_e/E4_fine_iteration_depth.yaml
+    base_run_name: ablation/of_e/E4_fine_iteration_depth
+    cli_overrides:
+      - training.num_steps=50000
+      - training.val_every=5000
+      - training.save_every=10000
+      - mlflow.enabled=false
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
+
+  E5:
+    group: OF-E
+    enabled: true
+    implementation_status: ready
+    tags: [iteration_depth, 1_8_iteration]
+    override: configs/dropins/of_e/E5_1_8_iteration_depth.yaml
+    base_run_name: ablation/of_e/E5_1_8_iteration_depth
+    cli_overrides:
+      - training.num_steps=50000
+      - training.val_every=5000
+      - training.save_every=10000
+      - mlflow.enabled=false
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
+
+  E6:
+    group: OF-E
+    enabled: true
+    implementation_status: ready
+    tags: [iteration_depth, double_iteration]
+    override: configs/dropins/of_e/E6_double_iteration_depth.yaml
+    base_run_name: ablation/of_e/E6_double_iteration_depth
+    cli_overrides:
+      - training.num_steps=50000
+      - training.val_every=5000
+      - training.save_every=10000
+      - mlflow.enabled=false
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
+
+  E7:
+    group: OF-E
+    enabled: true
+    implementation_status: ready
+    tags: [iteration_depth, standard_iteration_moderate_data_proximal_deltas]
+    override: configs/dropins/of_e/E7_standard_iteration_moderate_data_proximal_deltas.yaml
+    base_run_name: ablation/of_e/E7_standard_iteration_moderate_data_proximal_deltas
+    cli_overrides:
+      - training.num_steps=50000
+      - training.val_every=5000
+      - training.save_every=10000
+      - mlflow.enabled=false
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
+
+  E8:
+    group: OF-E
+    enabled: true
+    implementation_status: ready
+    tags: [iteration_depth, standard_iteration_moderate_data_proximal_deltas]
+    override: configs/dropins/of_e/E8_standard_iteration_large_data_proximal_deltas.yaml
+    base_run_name: ablation/of_e/E8_standard_iteration_large_data_proximal_deltas
+    cli_overrides:
+      - training.num_steps=50000
+      - training.val_every=5000
+      - training.save_every=10000
+      - mlflow.enabled=false
+      - training.skip_nonfinite_batches=true
+      - training.max_nonfinite_skips=50
+      - training.max_consecutive_nonfinite_skips=10
