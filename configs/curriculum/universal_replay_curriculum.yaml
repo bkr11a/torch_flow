@@ -49,7 +49,7 @@ curriculum:
         name: chairs
         root: "/mnt/a/benchmark_data/optical_flow/FlyingChairs_release"
         batch_size: 6
-        num_workers: 6
+        num_workers: 16
         crop_size: [368, 496]
         min_scale: -0.1
         max_scale: 1.0
@@ -118,7 +118,7 @@ curriculum:
         side: both
         direction: forward
         batch_size: 6
-        num_workers: 4
+        num_workers: 16
         crop_size: [400, 720]
         min_scale: -0.2
         max_scale: 0.8
@@ -131,7 +131,7 @@ curriculum:
         side: both
         direction: forward
         batch_size: 6
-        num_workers: 2
+        num_workers: 16
         crop_size: [400, 720]
 
     - id: u03_general_replay_mixed
@@ -173,7 +173,7 @@ curriculum:
           pyramid_l1_iters: 4
       loss:
         stage_weight_mode: geometric
-        num_stages: 16
+        num_stages: 12
         inter_smooth_weight: 0.005
         boundary_weight: 0.02
         iter_damp_weight: 0.002
@@ -186,7 +186,7 @@ curriculum:
         seed: 31003
         include_dataset_id: true
         batch_size: 6
-        num_workers: 4
+        num_workers: 16
         crop_size: [400, 720]
         min_scale: -0.2
         max_scale: 0.6
@@ -203,7 +203,7 @@ curriculum:
         seed: 931003
         include_dataset_id: true
         batch_size: 1
-        num_workers: 2
+        num_workers: 16
         crop_size: [400, 720]
         datasets:
           - {label: things_subset, name: things, root: "/mnt/a/benchmark_data/optical_flow/FlyingThings3D/FlyingThings3D_subset", dstype: clean, side: both, direction: forward, weight: 0.30}
@@ -263,7 +263,7 @@ curriculum:
         seed: 41004
         include_dataset_id: true
         batch_size: 6
-        num_workers: 4
+        num_workers: 16
         crop_size: [320, 768]
         min_scale: -0.2
         max_scale: 0.4
@@ -283,7 +283,7 @@ curriculum:
         seed: 941004
         include_dataset_id: true
         batch_size: 1
-        num_workers: 2
+        num_workers: 16
         crop_size: [320, 768]
         datasets:
           - {label: things_subset, name: things, root: "/mnt/a/benchmark_data/optical_flow/FlyingThings3D/FlyingThings3D_subset", dstype: clean, side: both, direction: forward, weight: 0.20}
