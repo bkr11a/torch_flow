@@ -279,7 +279,7 @@ jobs:
   
   E3:
     group: OF-E
-    enabled: true
+    enabled: false
     implementation_status: ready
     tags: [iteration_depth, coarse_iteration]
     override: configs/dropins/of_e/E3_coarse_iteration_depth.yaml
@@ -295,7 +295,7 @@ jobs:
 
   E4:
     group: OF-E
-    enabled: true
+    enabled: false
     implementation_status: ready
     tags: [iteration_depth, fine_iteration]
     override: configs/dropins/of_e/E4_fine_iteration_depth.yaml
@@ -311,7 +311,7 @@ jobs:
 
   E5:
     group: OF-E
-    enabled: true
+    enabled: false
     implementation_status: ready
     tags: [iteration_depth, 1_8_iteration]
     override: configs/dropins/of_e/E5_1_8_iteration_depth.yaml
@@ -327,7 +327,7 @@ jobs:
 
   E6:
     group: OF-E
-    enabled: true
+    enabled: false
     implementation_status: ready
     tags: [iteration_depth, double_iteration]
     override: configs/dropins/of_e/E6_double_iteration_depth.yaml
@@ -361,7 +361,7 @@ jobs:
     group: OF-E
     enabled: true
     implementation_status: ready
-    tags: [iteration_depth, standard_iteration_moderate_data_proximal_deltas]
+    tags: [iteration_depth, standard_iteration_large_data_proximal_deltas]
     override: configs/dropins/of_e/E8_standard_iteration_large_data_proximal_deltas.yaml
     base_run_name: ablation/of_e/E8_standard_iteration_large_data_proximal_deltas
     cli_overrides:
