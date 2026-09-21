@@ -348,6 +348,8 @@ jobs:
     tags: [iteration_depth, standard_iteration_moderate_data_proximal_deltas]
     override: configs/dropins/of_e/E7_standard_iteration_moderate_data_proximal_deltas.yaml
     base_run_name: ablation/of_e/E7_standard_iteration_moderate_data_proximal_deltas
+    # Starting the training from the checkpoint of where it got to before crashing
+    start_stage: curr_u03_general_replay_mixed
     cli_overrides:
       - training.num_steps=50000
       - training.val_every=5000
@@ -356,6 +358,9 @@ jobs:
       - training.skip_nonfinite_batches=true
       - training.max_nonfinite_skips=50
       - training.max_consecutive_nonfinite_skips=10
+      # CLI command checkpoint and resume mode for continuing training from the previous checkpoint
+      - training.checkpoint=checkpoints/ablation/of_e/E7_standard_iteration_moderate_data_proximal_deltas/curr_u03_general_replay_mixed
+      - training.resume_mode=full
 
   E8:
     group: OF-E
