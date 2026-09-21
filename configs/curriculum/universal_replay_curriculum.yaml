@@ -203,7 +203,7 @@ curriculum:
         seed: 931003
         include_dataset_id: true
         batch_size: 1
-        num_workers: 12
+        num_workers: 6
         crop_size: [400, 720]
         datasets:
           - {label: things_subset, name: things, root: "/mnt/a/benchmark_data/optical_flow/FlyingThings3D/FlyingThings3D_subset", dstype: clean, side: both, direction: forward, weight: 0.30}
@@ -283,7 +283,7 @@ curriculum:
         seed: 941004
         include_dataset_id: true
         batch_size: 1
-        num_workers: 12
+        num_workers: 6
         crop_size: [320, 768]
         datasets:
           - {label: things_subset, name: things, root: "/mnt/a/benchmark_data/optical_flow/FlyingThings3D/FlyingThings3D_subset", dstype: clean, side: both, direction: forward, weight: 0.20}
