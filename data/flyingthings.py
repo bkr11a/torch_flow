@@ -193,19 +193,23 @@ class FlyingThingsDataset(FlowDataset):
         if not flow_root.is_dir():
             raise RuntimeError(f"Subset flow root not found: {flow_root}")
 
+        image_extensions = (".png", ".jpg", ".jpeg", ".ppm")
+
+        def find_image(image_dir: Path, index: int):
+            stem = f"{index:07d}"
+
+            for extension in image_extensions:
+                path = image_dir / f"{stem}{extension}"
+                if path.is_file():
+                    return path
+
+            return None
+
         for side in self._subset_sides():
             image_dir = image_root / side
 
             if not image_dir.is_dir():
                 raise RuntimeError(f"Subset image dir not found: {image_dir}")
-
-            frames = sorted([
-                p for p in image_dir.iterdir()
-                if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg", ".ppm"}
-            ])
-
-            if len(frames) < 2:
-                raise RuntimeError(f"Need at least 2 images in {image_dir}, found {len(frames)}")
 
             for direction in self._subset_directions():
                 flow_dir = flow_root / side / direction
@@ -213,33 +217,36 @@ class FlyingThingsDataset(FlowDataset):
                 if not flow_dir.is_dir():
                     raise RuntimeError(f"Subset flow dir not found: {flow_dir}")
 
-                flow_files = sorted([
-                    p for p in flow_dir.iterdir()
+                flow_files = sorted(
+                    p
+                    for p in flow_dir.iterdir()
                     if p.is_file() and p.suffix.lower() in {".flo", ".pfm"}
-                ])
+                )
 
                 if not flow_files:
                     raise RuntimeError(f"No flow files found in {flow_dir}")
 
-                for i, img1 in enumerate(frames):
+                for flow_path in flow_files:
+                    try:
+                        frame_index = int(flow_path.stem)
+                    except ValueError:
+                        raise RuntimeError(
+                            "FlyingThings3D subset expects numeric flow filenames, "
+                            f"got {flow_path.name!r}"
+                        )
+
                     if direction == "into_future":
-                        img2_idx = i + 1
+                        target_index = frame_index + 1
                     else:
-                        img2_idx = i - 1
+                        target_index = frame_index - 1
 
-                    if img2_idx < 0 or img2_idx >= len(frames):
-                        continue
+                    img1 = find_image(image_dir, frame_index)
+                    img2 = find_image(image_dir, target_index)
 
-                    img2 = frames[img2_idx]
-                    flow_path = self._match_subset_flow_file(
-                        img1=img1,
-                        flow_dir=flow_dir,
-                        flow_files=flow_files,
-                        pair_index=i,
-                    )
-
-                    if flow_path is None:
-                        # Do not append flow=None for supervised training.
+                    # A flow annotation is usable only when both corresponding
+                    # images exist. Missing target frames naturally eliminate
+                    # sequence-boundary transitions.
+                    if img1 is None or img2 is None:
                         continue
 
                     self._samples.append({
@@ -250,49 +257,47 @@ class FlyingThingsDataset(FlowDataset):
 
         if not self._samples:
             raise RuntimeError(
-                "FlyingThings3D subset found images/flow folders but no valid pairs.\n"
+                "FlyingThings3D subset found no valid image/flow triplets.\n"
                 f"root={self.root}\n"
                 f"split={split_name}\n"
                 f"side={self.side}\n"
-                f"direction={self.direction}\n\n"
-                "Inspect names with:\n"
-                f"  find {image_root} -maxdepth 2 -type f | head -20\n"
-                f"  find {flow_root} -maxdepth 4 -type f | head -20"
+                f"direction={self.direction}"
             )
 
-    def _match_subset_flow_file(self, img1, flow_dir, flow_files, pair_index: int):
-        """
-        Match a flow file to img1.
+    ######## OLD, WRONG AND NO LONGER REQUIRED
+    # def _match_subset_flow_file(self, img1, flow_dir, flow_files, pair_index: int):
+        # """
+        # Match a flow file to img1.
 
-        Supports common names like:
-            0000000.flo
-            000000.flo
-            frame_0001.flo
-            OpticalFlowIntoFuture_000000_L.pfm
+        # Supports common names like:
+            # 0000000.flo
+            # 000000.flo
+            # frame_0001.flo
+            # OpticalFlowIntoFuture_000000_L.pfm
 
-        Falls back to sorted flow file order.
-        """
-        stem = img1.stem
+        # Falls back to sorted flow file order.
+        # """
+        # stem = img1.stem
 
-        candidates = []
-        for ext in (".flo", ".pfm"):
-            candidates.extend([
-                flow_dir / f"{stem}{ext}",
-                flow_dir / f"{int(stem):06d}{ext}" if stem.isdigit() else flow_dir / f"{stem}{ext}",
-                flow_dir / f"{int(stem):07d}{ext}" if stem.isdigit() else flow_dir / f"{stem}{ext}",
-                flow_dir / f"OpticalFlowIntoFuture_{stem}_L{ext}",
-                flow_dir / f"OpticalFlowIntoPast_{stem}_L{ext}",
-            ])
+        # candidates = []
+        # for ext in (".flo", ".pfm"):
+            # candidates.extend([
+                # flow_dir / f"{stem}{ext}",
+                # flow_dir / f"{int(stem):06d}{ext}" if stem.isdigit() else flow_dir / f"{stem}{ext}",
+                # flow_dir / f"{int(stem):07d}{ext}" if stem.isdigit() else flow_dir / f"{stem}{ext}",
+                # flow_dir / f"OpticalFlowIntoFuture_{stem}_L{ext}",
+                # flow_dir / f"OpticalFlowIntoPast_{stem}_L{ext}",
+            # ])
 
-        for p in candidates:
-            if p.is_file():
-                return p
+        # for p in candidates:
+            # if p.is_file():
+                # return p
 
-        # Fallback: assume sorted nth flow corresponds to nth valid image-pair.
-        if pair_index < len(flow_files):
-            return flow_files[pair_index]
+        # # Fallback: assume sorted nth flow corresponds to nth valid image-pair.
+        # if pair_index < len(flow_files):
+            # return flow_files[pair_index]
 
-        return None
+        # return None
 
     # ------------------------------------------------------------------
     # Full FlyingThings3D layout
