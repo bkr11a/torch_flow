@@ -12,7 +12,7 @@ data:
   seed: 941004
   include_dataset_id: true
   batch_size: 1
-  num_workers: 2
+  num_workers: 8
 
 evaluation:
   native_resolution: true

@@ -11,7 +11,7 @@ datasets:
       root: "/mnt/a/benchmark_data/optical_flow/FlyingChairs_release"
       dstype: clean
       batch_size: 1
-      num_workers: 2
+      num_workers: 16
       eval_center_crop: true
       eval_crop_size: [368, 496]
 
@@ -29,7 +29,7 @@ datasets:
       side: both
       direction: forward
       batch_size: 1
-      num_workers: 2
+      num_workers: 8
       eval_center_crop: true
       eval_crop_size: [400, 720]
 
@@ -45,7 +45,7 @@ datasets:
       root: "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete"
       dstype: clean
       batch_size: 1
-      num_workers: 2
+      num_workers: 8
       eval_center_crop: true
       eval_crop_size: [320, 768]
 
@@ -61,7 +61,7 @@ datasets:
       root: "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete"
       dstype: final
       batch_size: 1
-      num_workers: 2
+      num_workers: 8
       eval_center_crop: true
       eval_crop_size: [320, 768]
 
@@ -79,7 +79,7 @@ datasets:
       side: left
       val_fraction: 0.10
       batch_size: 1
-      num_workers: 2
+      num_workers: 4
       eval_center_crop: true
       eval_crop_size: [320, 768]
 
@@ -96,7 +96,7 @@ datasets:
       camera: image_2
       val_fraction: 0.10
       batch_size: 1
-      num_workers: 2
+      num_workers: 8
       eval_center_crop: true
       eval_crop_size: [320, 768]
 
@@ -113,7 +113,7 @@ datasets:
       camera: image_2
       flow_type: occ
       batch_size: 1
-      num_workers: 2
+      num_workers: 8
       eval_center_crop: true
       eval_crop_size: [320, 960]
 
@@ -130,6 +130,6 @@ datasets:
       camera: image_0
       flow_type: occ
       batch_size: 1
-      num_workers: 2
+      num_workers: 8
       eval_center_crop: true
       eval_crop_size: [320, 960]
