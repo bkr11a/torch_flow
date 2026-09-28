@@ -279,7 +279,7 @@ jobs:
   
   E3:
     group: OF-E
-    enabled: false
+    enabled: true
     implementation_status: ready
     tags: [iteration_depth, coarse_iteration]
     override: configs/dropins/of_e/E3_coarse_iteration_depth.yaml
@@ -295,7 +295,7 @@ jobs:
 
   E4:
     group: OF-E
-    enabled: false
+    enabled: true
     implementation_status: ready
     tags: [iteration_depth, fine_iteration]
     override: configs/dropins/of_e/E4_fine_iteration_depth.yaml
@@ -311,7 +311,7 @@ jobs:
 
   E5:
     group: OF-E
-    enabled: false
+    enabled: true
     implementation_status: ready
     tags: [iteration_depth, 1_8_iteration]
     override: configs/dropins/of_e/E5_1_8_iteration_depth.yaml
@@ -327,7 +327,7 @@ jobs:
 
   E6:
     group: OF-E
-    enabled: false
+    enabled: true
     implementation_status: ready
     tags: [iteration_depth, double_iteration]
     override: configs/dropins/of_e/E6_double_iteration_depth.yaml
