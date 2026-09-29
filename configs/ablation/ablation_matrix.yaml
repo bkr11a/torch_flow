@@ -284,6 +284,7 @@ jobs:
     tags: [iteration_depth, coarse_iteration]
     override: configs/dropins/of_e/E3_coarse_iteration_depth.yaml
     base_run_name: ablation/of_e/E3_coarse_iteration_depth
+    start_stage: u04_universal_balanced_final
     cli_overrides:
       - training.num_steps=50000
       - training.val_every=5000
