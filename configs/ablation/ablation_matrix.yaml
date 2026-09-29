@@ -292,6 +292,8 @@ jobs:
       - training.skip_nonfinite_batches=true
       - training.max_nonfinite_skips=50
       - training.max_consecutive_nonfinite_skips=10
+      - training.checkpoint=checkpoints/ablation/of_e/E3_coarse_iteration_depth/curr_u04_universal_balanced_final/best.pth
+      - training.resume_mode=full
 
   E4:
     group: OF-E
