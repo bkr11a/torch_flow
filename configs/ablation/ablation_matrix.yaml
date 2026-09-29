@@ -312,7 +312,7 @@ jobs:
       - training.skip_nonfinite_batches=true
       - training.max_nonfinite_skips=50
       - training.max_consecutive_nonfinite_skips=10
-      - training.checkpoint=checkpoints/ablation/of_e/E4_fine_iteration_depth/curr_u02_things_pgma_init/best.pth
+      - training.checkpoint=checkpoints/ablation/of_e/E4_fine_iteration_depth/curr_u01_chairs_baseline/best.pth
       - training.resume_mode=weights_only
 
   E5:
