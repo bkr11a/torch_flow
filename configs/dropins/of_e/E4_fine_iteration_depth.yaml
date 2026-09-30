@@ -130,3 +130,4 @@ training:
 
 data:
   detail_crop_prob: 0.0
+  batch_size: 4
