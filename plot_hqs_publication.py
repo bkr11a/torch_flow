@@ -307,7 +307,7 @@ def render(out,style):
                         ax=fig.add_subplot(gs[r,j]);kind='input' if r==0 else 'gt' if r==1 else 'pred';mid=cohort[r-2] if r>=2 else None
                         badge=f"p95 {d['flow_scale_px']:.1f}px" if r==1 else f"EPE {metrics[mid,d['id']]:.3f}" if r>=2 and style['show_epe'] else None
                         panel(ax,image(kind,d,mid),'#df8c26' if r==0 else '#269a50' if r==1 else '#999999',badge)
-                        if r==0:ax.set_title(d['title']+'\n'+textwrap.shorten(d['sample_id'],width=29,placeholder='…'),fontsize=7,pad=3)
+                        if r==0:ax.set_title(d['title']+'\n'+textwrap.shorten(d['sample_id'],width=39,placeholder='…'),fontsize=7,pad=3)
                         if j==0:
                             label='Input pair' if r==0 else 'Ground truth' if r==1 else mid
                             ax.text(-.06,.5,label,transform=ax.transAxes,ha='right',va='center',fontsize=8)
