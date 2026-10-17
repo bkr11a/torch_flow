@@ -1,0 +1,58 @@
+{
+  "models": [
+    {
+      "id": "A0",
+      "checkpoint": "checkpoints/ablation/of_a/A0_full_hqs/best.pth"
+    },
+    {
+      "id": "A1",
+      "checkpoint": "checkpoints/ablation/of_A/A1_equal_capacity_recurrent/best.pth"
+    },
+    {
+      "id": "B1",
+      "checkpoint": "checkpoints/ablation/of_B/B1_analytic_data_only/best.pth"
+    },
+    {
+      "id": "B3",
+      "checkpoint": "checkpoints/ablation/of_B/B3_analytic_proximal_only/best.pth"
+    },
+    {
+      "id": "E7",
+      "checkpoint": "checkpoints/ablation/of_E/E7_standard_iteration_moderate_data_proximal_deltas/best.pth"
+    }
+  ],
+  "datasets": [
+    {
+      "id": "chairs",
+      "data_config": "configs/eval/chairs_native.yaml"
+    },
+    {
+      "id": "things_subset",
+      "data_config": "configs/eval/things_subset_native.yaml"
+    },
+    {
+      "id": "sintel_clean",
+      "data_config": "configs/eval/sintel_clean_native.yaml"
+    },
+    {
+      "id": "sintel_final",
+      "data_config": "configs/eval/sintel_final_native.yaml"
+    },
+    {
+      "id": "spring_left",
+      "data_config": "configs/eval/spring_left_native.yaml"
+    },
+    {
+      "id": "kitti2012",
+      "data_config": "configs/eval/kitti2012_native.yaml"
+    },
+    {
+      "id": "kitti2015",
+      "data_config": "configs/eval/kitti2015_native.yaml"
+    },
+    {
+      "id": "hd1k",
+      "data_config": "configs/eval/hd1k_native.yaml"
+    }
+  ]
+}
