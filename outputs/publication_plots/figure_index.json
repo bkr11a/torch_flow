@@ -1,0 +1,27 @@
+{
+  "files": [
+    "plates/OF-A_1_1.pdf",
+    "plates/OF-B_1_1.pdf",
+    "plates/OF-E_1_1.pdf",
+    "plates/OF-E_2_1.pdf",
+    "atlases/chairs_1.pdf",
+    "atlases/things_subset_clean_1.pdf",
+    "atlases/sintel_clean_1.pdf",
+    "atlases/sintel_final_1.pdf",
+    "atlases/spring_left_1.pdf",
+    "atlases/kitti2012_1.pdf",
+    "atlases/kitti2015_1.pdf",
+    "atlases/hd1k_1.pdf"
+  ],
+  "style": {
+    "width_inches": 11.2,
+    "dpi": 300,
+    "font_size": 8,
+    "datasets_per_plate": 8,
+    "models_per_plate": 5,
+    "atlas_columns": 4,
+    "atlas_models_per_page": 16,
+    "show_epe": true
+  },
+  "caption": "Qualitative optical-flow estimates on fixed internal validation pairs. Input frames have orange borders and ground truth has green borders. All predictions for a pair share the flow colour scale determined by the 95th percentile of valid ground-truth magnitude; larger magnitudes saturate. Grey ground-truth pixels lack reliable annotation. Prediction fields remain dense. Panel EPE values refer only to valid annotated pixels of the displayed pair, not dataset averages."
+}

@@ -1,0 +1,31 @@
+{
+  "command": [
+    "python",
+    "/home/bradrice/repos/torch_flow/train_curriculum.py",
+    "--config",
+    "/home/bradrice/repos/torch_flow/configs/default.yaml",
+    "--override",
+    "/home/bradrice/repos/torch_flow/configs/dropins/of_e/E6_double_iteration_depth.yaml",
+    "--curriculum",
+    "/home/bradrice/repos/torch_flow/configs/curriculum/universal_replay_curriculum.yaml",
+    "--base-run-name",
+    "ablation/of_e/E6_double_iteration_depth",
+    "training.num_steps=50000",
+    "training.val_every=5000",
+    "training.save_every=10000",
+    "mlflow.enabled=false",
+    "training.skip_nonfinite_batches=true",
+    "training.max_nonfinite_skips=50",
+    "training.max_consecutive_nonfinite_skips=10",
+    "training.checkpoint=checkpoints/ablation/of_e/E6_double_iteration_depth/curr_u01_chairs_baseline/best.pth",
+    "training.resume_mode=full"
+  ],
+  "ended_at": null,
+  "gpu": "0",
+  "group": "OF-E",
+  "job_id": "E6",
+  "pid": 740545,
+  "returncode": null,
+  "started_at": "2026-10-05T08:33:24+08:00",
+  "state": "running"
+}

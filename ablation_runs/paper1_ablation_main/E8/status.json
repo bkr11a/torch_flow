@@ -1,0 +1,29 @@
+{
+  "command": [
+    "python",
+    "/home/bradrice/repos/torch_flow/train_curriculum.py",
+    "--config",
+    "/home/bradrice/repos/torch_flow/configs/default.yaml",
+    "--override",
+    "/home/bradrice/repos/torch_flow/configs/dropins/of_e/E8_standard_iteration_large_data_proximal_deltas.yaml",
+    "--curriculum",
+    "/home/bradrice/repos/torch_flow/configs/curriculum/universal_replay_curriculum.yaml",
+    "--base-run-name",
+    "ablation/of_e/E8_standard_iteration_large_data_proximal_deltas",
+    "training.num_steps=50000",
+    "training.val_every=5000",
+    "training.save_every=10000",
+    "mlflow.enabled=false",
+    "training.skip_nonfinite_batches=true",
+    "training.max_nonfinite_skips=50",
+    "training.max_consecutive_nonfinite_skips=10"
+  ],
+  "ended_at": "2026-09-24T07:37:45+08:00",
+  "gpu": "0",
+  "group": "OF-E",
+  "job_id": "E8",
+  "pid": 3614,
+  "returncode": 0,
+  "started_at": "2026-09-22T23:01:11+08:00",
+  "state": "completed"
+}

@@ -1,0 +1,317 @@
+[
+  {
+    "id": "chairs",
+    "title": "FlyingChairs",
+    "index": 0,
+    "split": "val",
+    "dataset_size": 2288,
+    "sample_id": "data/20585_img1.ppm",
+    "record": {
+      "image1": "/mnt/a/benchmark_data/optical_flow/FlyingChairs_release/data/20585_img1.ppm",
+      "image2": "/mnt/a/benchmark_data/optical_flow/FlyingChairs_release/data/20585_img2.ppm",
+      "flow": "/mnt/a/benchmark_data/optical_flow/FlyingChairs_release/data/20585_flow.flo"
+    },
+    "native_hw": [
+      384,
+      512
+    ],
+    "crop_yxhw": [
+      8,
+      8,
+      368,
+      496
+    ],
+    "flow_scale_px": 53.99008560180664,
+    "data": {
+      "mode": "single",
+      "name": "chairs",
+      "root": "/mnt/a/benchmark_data/optical_flow/FlyingChairs_release",
+      "dstype": "clean",
+      "batch_size": 1,
+      "num_workers": 16,
+      "eval_center_crop": true,
+      "eval_crop_size": [
+        368,
+        496
+      ]
+    },
+    "sample_hash": "d02a01a434243818cc55bcb4c6704077c4217fc907e2c4be98c06a897bab529c"
+  },
+  {
+    "id": "things_subset_clean",
+    "title": "FlyingThings3D",
+    "index": 0,
+    "split": "val",
+    "dataset_size": 7648,
+    "sample_id": "left/0000000.png",
+    "record": {
+      "image1": "/mnt/a/benchmark_data/optical_flow/FlyingThings3D/FlyingThings3D_subset/val/image_clean/left/0000000.png",
+      "image2": "/mnt/a/benchmark_data/optical_flow/FlyingThings3D/FlyingThings3D_subset/val/image_clean/left/0000001.png",
+      "flow": "/mnt/a/benchmark_data/optical_flow/FlyingThings3D/FlyingThings3D_subset/val/flow/left/into_future/0000000.flo"
+    },
+    "native_hw": [
+      540,
+      960
+    ],
+    "crop_yxhw": [
+      70,
+      120,
+      400,
+      720
+    ],
+    "flow_scale_px": 131.7633819580078,
+    "data": {
+      "mode": "single",
+      "name": "things",
+      "root": "/mnt/a/benchmark_data/optical_flow/FlyingThings3D/FlyingThings3D_subset",
+      "dstype": "clean",
+      "side": "both",
+      "direction": "forward",
+      "batch_size": 1,
+      "num_workers": 8,
+      "eval_center_crop": true,
+      "eval_crop_size": [
+        400,
+        720
+      ]
+    },
+    "sample_hash": "52bfe8eec421c9f9f93ab772fd0e65fdc1d6b5e9a684419e89adff80d6231864"
+  },
+  {
+    "id": "sintel_clean",
+    "title": "MPI-Sintel Clean",
+    "index": 26,
+    "split": "val",
+    "dataset_size": 296,
+    "sample_id": "ambush_4/frame_0027.png",
+    "record": {
+      "image1": "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete/training/clean/ambush_4/frame_0027.png",
+      "image2": "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete/training/clean/ambush_4/frame_0028.png",
+      "flow": "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete/training/flow/ambush_4/frame_0027.flo",
+      "occlusion": "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete/training/occlusions/ambush_4/frame_0027.png",
+      "invalid": "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete/training/invalid/ambush_4/frame_0027.png"
+    },
+    "native_hw": [
+      436,
+      1024
+    ],
+    "crop_yxhw": [
+      58,
+      128,
+      320,
+      768
+    ],
+    "flow_scale_px": 138.11395263671875,
+    "data": {
+      "mode": "single",
+      "name": "sintel",
+      "root": "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete",
+      "dstype": "clean",
+      "batch_size": 1,
+      "num_workers": 8,
+      "eval_center_crop": true,
+      "eval_crop_size": [
+        320,
+        768
+      ]
+    },
+    "sample_hash": "3997d2dd7ad4f4c9c3983ecf97205fcbb734c74c4892cbceb4a93f905dcbb7b2"
+  },
+  {
+    "id": "sintel_final",
+    "title": "MPI-Sintel Final",
+    "index": 26,
+    "split": "val",
+    "dataset_size": 296,
+    "sample_id": "ambush_4/frame_0027.png",
+    "record": {
+      "image1": "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete/training/final/ambush_4/frame_0027.png",
+      "image2": "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete/training/final/ambush_4/frame_0028.png",
+      "flow": "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete/training/flow/ambush_4/frame_0027.flo",
+      "occlusion": "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete/training/occlusions/ambush_4/frame_0027.png",
+      "invalid": "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete/training/invalid/ambush_4/frame_0027.png"
+    },
+    "native_hw": [
+      436,
+      1024
+    ],
+    "crop_yxhw": [
+      58,
+      128,
+      320,
+      768
+    ],
+    "flow_scale_px": 138.11395263671875,
+    "data": {
+      "mode": "single",
+      "name": "sintel",
+      "root": "/mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete",
+      "dstype": "final",
+      "batch_size": 1,
+      "num_workers": 8,
+      "eval_center_crop": true,
+      "eval_crop_size": [
+        320,
+        768
+      ]
+    },
+    "sample_hash": "8822db4f5134130cc5e05c2a8fb71388756295acbdb227de9891d57e10a80e70"
+  },
+  {
+    "id": "spring_left",
+    "title": "Spring",
+    "index": 320,
+    "split": "val",
+    "dataset_size": 624,
+    "sample_id": "frame_left/frame_left_0161.png",
+    "record": {
+      "image1": "/mnt/a/benchmark_data/optical_flow/Spring/spring/train/0045/frame_left/frame_left_0161.png",
+      "image2": "/mnt/a/benchmark_data/optical_flow/Spring/spring/train/0045/frame_left/frame_left_0162.png",
+      "flow": "/mnt/a/benchmark_data/optical_flow/Spring/spring/train/0045/flow_FW_left/flow_FW_left_0161.flo5"
+    },
+    "native_hw": [
+      1080,
+      1920
+    ],
+    "crop_yxhw": [
+      380,
+      576,
+      320,
+      768
+    ],
+    "flow_scale_px": 0.5678314566612244,
+    "data": {
+      "mode": "single",
+      "name": "spring",
+      "root": "/mnt/a/benchmark_data/optical_flow/Spring/spring",
+      "direction": "forward",
+      "side": "left",
+      "val_fraction": 0.1,
+      "batch_size": 1,
+      "num_workers": 4,
+      "eval_center_crop": true,
+      "eval_crop_size": [
+        320,
+        768
+      ]
+    },
+    "sample_hash": "e08a8fc67f63a58fdc4a772b434c1a88143db15e4f931f9e42c5ffb3f2f0136d"
+  },
+  {
+    "id": "kitti2012",
+    "title": "KITTI 2012",
+    "index": 0,
+    "split": "val",
+    "dataset_size": 40,
+    "sample_id": "image_0/000154_10.png",
+    "record": {
+      "image1": "/mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2012/data_stereo_flow/training/image_0/000154_10.png",
+      "image2": "/mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2012/data_stereo_flow/training/image_0/000154_11.png",
+      "flow": "/mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2012/data_stereo_flow/training/flow_occ/000154_10.png"
+    },
+    "native_hw": [
+      370,
+      1226
+    ],
+    "crop_yxhw": [
+      25,
+      133,
+      320,
+      960
+    ],
+    "flow_scale_px": 95.49417877197266,
+    "data": {
+      "mode": "single",
+      "name": "kitti",
+      "root": "/mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2012/data_stereo_flow",
+      "camera": "image_0",
+      "flow_type": "occ",
+      "batch_size": 1,
+      "num_workers": 8,
+      "eval_center_crop": true,
+      "eval_crop_size": [
+        320,
+        960
+      ]
+    },
+    "sample_hash": "4b5291a55c8588d5921926e75cf95e340d5e969334b4cc6b7c28e09a6a7a3925"
+  },
+  {
+    "id": "kitti2015",
+    "title": "KITTI 2015",
+    "index": 0,
+    "split": "val",
+    "dataset_size": 40,
+    "sample_id": "image_2/000160_10.png",
+    "record": {
+      "image1": "/mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2015/data_scene_flow/training/image_2/000160_10.png",
+      "image2": "/mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2015/data_scene_flow/training/image_2/000160_11.png",
+      "flow": "/mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2015/data_scene_flow/training/flow_occ/000160_10.png"
+    },
+    "native_hw": [
+      374,
+      1238
+    ],
+    "crop_yxhw": [
+      27,
+      139,
+      320,
+      960
+    ],
+    "flow_scale_px": 53.88214111328125,
+    "data": {
+      "mode": "single",
+      "name": "kitti",
+      "root": "/mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2015/data_scene_flow",
+      "camera": "image_2",
+      "flow_type": "occ",
+      "batch_size": 1,
+      "num_workers": 8,
+      "eval_center_crop": true,
+      "eval_crop_size": [
+        320,
+        960
+      ]
+    },
+    "sample_hash": "6877097d113fe0f5bec95fcc7700708fecb14f3d2e18e87720dc9714a7de9429"
+  },
+  {
+    "id": "hd1k",
+    "title": "HD1K",
+    "index": 0,
+    "split": "val",
+    "dataset_size": 87,
+    "sample_id": "image_2/000032_0010.png",
+    "record": {
+      "image1": "/mnt/a/benchmark_data/optical_flow/HD1K/hd1k_full_package/hd1k_input/image_2/000032_0010.png",
+      "image2": "/mnt/a/benchmark_data/optical_flow/HD1K/hd1k_full_package/hd1k_input/image_2/000032_0011.png",
+      "flow": "/mnt/a/benchmark_data/optical_flow/HD1K/hd1k_full_package/hd1k_flow_gt/flow_occ/000032_0010.png"
+    },
+    "native_hw": [
+      1080,
+      2560
+    ],
+    "crop_yxhw": [
+      380,
+      896,
+      320,
+      768
+    ],
+    "flow_scale_px": 2.105262279510498,
+    "data": {
+      "mode": "single",
+      "name": "hd1k",
+      "root": "/mnt/a/benchmark_data/optical_flow/HD1K/hd1k_full_package",
+      "camera": "image_2",
+      "val_fraction": 0.1,
+      "batch_size": 1,
+      "num_workers": 8,
+      "eval_center_crop": true,
+      "eval_crop_size": [
+        320,
+        768
+      ]
+    },
+    "sample_hash": "8850021a87ea1b1d3d9d461bd828719b88716d0eb9ca38dda68f297d7e338e0e"
+  }
+]

@@ -1,0 +1,259 @@
+# Paths are relative to repo_root. Verify checkpoint STAGES against your results table.
+# E6 intentionally excluded. Dataset selection is within split=val.
+version: 1
+repo_root: /home/bradrice/repos/torch_flow
+output_dir: outputs/publication_plots
+device: auto
+amp: false
+pad_divisor: 8
+resolution: suite
+style:
+  width_inches: 11.2
+  dpi: 300
+  font_size: 8
+  datasets_per_plate: 8
+  models_per_plate: 5
+  atlas_columns: 4
+  atlas_models_per_page: 16
+  show_epe: true
+datasets:
+- id: chairs
+  title: FlyingChairs
+  data:
+    mode: single
+    name: chairs
+    root: /mnt/a/benchmark_data/optical_flow/FlyingChairs_release
+    dstype: clean
+    batch_size: 1
+    num_workers: 16
+    eval_center_crop: true
+    eval_crop_size:
+    - 368
+    - 496
+  selection:
+    index: 0
+- id: things_subset_clean
+  title: FlyingThings3D
+  data:
+    mode: single
+    name: things
+    root: /mnt/a/benchmark_data/optical_flow/FlyingThings3D/FlyingThings3D_subset
+    dstype: clean
+    side: both
+    direction: forward
+    batch_size: 1
+    num_workers: 8
+    eval_center_crop: true
+    eval_crop_size:
+    - 400
+    - 720
+  selection:
+    index: 0
+- id: sintel_clean
+  title: MPI-Sintel Clean
+  data:
+    mode: single
+    name: sintel
+    root: /mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete
+    dstype: clean
+    batch_size: 1
+    num_workers: 8
+    eval_center_crop: true
+    eval_crop_size:
+    - 320
+    - 768
+  selection:
+    index: 26
+- id: sintel_final
+  title: MPI-Sintel Final
+  data:
+    mode: single
+    name: sintel
+    root: /mnt/a/benchmark_data/optical_flow/MPI-Sintel/MPI-Sintel-complete
+    dstype: final
+    batch_size: 1
+    num_workers: 8
+    eval_center_crop: true
+    eval_crop_size:
+    - 320
+    - 768
+  selection:
+    index: 26
+- id: spring_left
+  title: Spring
+  data:
+    mode: single
+    name: spring
+    root: /mnt/a/benchmark_data/optical_flow/Spring/spring
+    direction: forward
+    side: left
+    val_fraction: 0.1
+    batch_size: 1
+    num_workers: 4
+    eval_center_crop: true
+    eval_crop_size:
+    - 320
+    - 768
+  selection:
+    index: 320
+- id: kitti2012
+  title: KITTI 2012
+  data:
+    mode: single
+    name: kitti
+    root: /mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2012/data_stereo_flow
+    camera: image_0
+    flow_type: occ
+    batch_size: 1
+    num_workers: 8
+    eval_center_crop: true
+    eval_crop_size:
+    - 320
+    - 960
+  selection:
+    index: 0
+- id: kitti2015
+  title: KITTI 2015
+  data:
+    mode: single
+    name: kitti
+    root: /mnt/a/benchmark_data/optical_flow/KITTI/KITTI 2015/data_scene_flow
+    camera: image_2
+    flow_type: occ
+    batch_size: 1
+    num_workers: 8
+    eval_center_crop: true
+    eval_crop_size:
+    - 320
+    - 960
+  selection:
+    index: 0
+- id: hd1k
+  title: HD1K
+  data:
+    mode: single
+    name: hd1k
+    root: /mnt/a/benchmark_data/optical_flow/HD1K/hd1k_full_package
+    camera: image_2
+    val_fraction: 0.1
+    batch_size: 1
+    num_workers: 8
+    eval_center_crop: true
+    eval_crop_size:
+    - 320
+    - 768
+  selection:
+    index: 0
+models:
+- id: A0
+  label: Reference
+  group: OF-A
+  checkpoint: checkpoints/ablation/of_a/A0_full_hqs/curr_u04_universal_balanced_final/best.pth
+  checkpoints: {}
+  config: null
+  overrides: []
+- id: A1
+  label: Generic recurrence
+  group: OF-A
+  checkpoint: checkpoints/ablation/of_a/A1_equal_capacity_recurrent/curr_u04_universal_balanced_final/best.pth
+  checkpoints: {}
+  config: null
+  overrides: []
+- id: A2
+  label: Loss-only physics
+  group: OF-A
+  checkpoint: checkpoints/ablation/of_a/A2_physics_loss_only/curr_u04_universal_balanced_final/best.pth
+  checkpoints: {}
+  config: null
+  overrides: []
+- id: A3
+  label: Augmented loss
+  group: OF-A
+  checkpoint: checkpoints/ablation/of_a/A3_hqs_augmented_loss/curr_u04_universal_balanced_final/best.pth
+  checkpoints: {}
+  config: null
+  overrides: []
+- id: A4
+  label: No split state
+  group: OF-A
+  checkpoint: checkpoints/ablation/of_a/A4_no_split_state/curr_u04_universal_balanced_final/best.pth
+  checkpoints: {}
+  config: null
+  overrides: []
+- id: B1
+  label: Analytic data
+  group: OF-B
+  checkpoint: checkpoints/ablation/of_b/B1_analytic_data_only/curr_u04_universal_balanced_final/best.pth
+  checkpoints: {}
+  config: null
+  overrides: []
+- id: B2
+  label: Learned data
+  group: OF-B
+  checkpoint: checkpoints/ablation/of_b/B2_learned_data_only/curr_u04_universal_balanced_final/best.pth
+  checkpoints: {}
+  config: null
+  overrides: []
+- id: B3
+  label: Analytic proximal
+  group: OF-B
+  checkpoint: checkpoints/ablation/of_b/B3_analytic_proximal_only/curr_u04_universal_balanced_final/best.pth
+  checkpoints: {}
+  config: null
+  overrides: []
+- id: B4
+  label: Learned proximal
+  group: OF-B
+  checkpoint: checkpoints/ablation/of_b/B4_learned_proximal_only/curr_u04_universal_balanced_final/best.pth
+  checkpoints: {}
+  config: null
+  overrides: []
+- id: E1
+  label: Single depth
+  group: OF-E
+  checkpoint: checkpoints/ablation/of_e/E1_single_iteration_depth/curr_u04_universal_balanced_final/best.pth
+  checkpoints: {}
+  config: null
+  overrides: []
+- id: E2
+  label: Half depth
+  group: OF-E
+  checkpoint: checkpoints/ablation/of_e/E2_half_iteration_depth/curr_u04_universal_balanced_final/best.pth
+  checkpoints: {}
+  config: null
+  overrides: []
+- id: E3
+  label: Coarse allocation
+  group: OF-E
+  checkpoint: checkpoints/ablation/of_e/E3_coarse_iteration_depth/curr_u04_universal_balanced_final/best.pth
+  checkpoints: {}
+  config: null
+  overrides: []
+- id: E4
+  label: Fine allocation
+  group: OF-E
+  checkpoint: checkpoints/ablation/of_e/E4_fine_iteration_depth/curr_u04_universal_balanced_final/best.pth
+  checkpoints: {}
+  config: null
+  overrides: []
+- id: E5
+  label: 1/8 allocation
+  group: OF-E
+  checkpoint: checkpoints/ablation/of_e/E5_1_8_iteration_depth/curr_u04_universal_balanced_final/best.pth
+  checkpoints: {}
+  config: null
+  overrides: []
+- id: E7
+  label: Moderate updates
+  group: OF-E
+  checkpoint: checkpoints/ablation/of_e/E7_standard_iteration_moderate_data_proximal_deltas/curr_u04_universal_balanced_final/best.pth
+  checkpoints: {}
+  config: null
+  overrides: []
+- id: E8
+  label: Large updates
+  group: OF-E
+  checkpoint: checkpoints/ablation/of_e/E8_standard_iteration_large_data_proximal_deltas/curr_u04_universal_balanced_final/best.pth
+  checkpoints: {}
+  config: null
+  overrides: []

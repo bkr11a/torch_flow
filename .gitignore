@@ -38,3 +38,6 @@ results/
 
 # Ensure no patch files are committed
 *.patch
+
+# Ensure there are no pdf files that are ready to be commited
+*.pdf
