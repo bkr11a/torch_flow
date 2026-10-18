@@ -5,8 +5,28 @@ import csv
 import hashlib
 import json
 import math
+import time
 from pathlib import Path
 from common import json_write, load_model, path, predict, repo_setup, sha256
+
+
+def init_loader_worker(worker_id):
+    """CPU-only loader workers; avoid nested OpenCV/PyTorch thread pools."""
+    import torch
+    import cv2
+    torch.set_num_threads(1)
+    cv2.setNumThreads(0)
+
+
+def sample_loader(ds, workers, prefetch):
+    from torch.utils.data import DataLoader
+    kwargs = dict(batch_size=None, shuffle=False, num_workers=workers,
+                  pin_memory=False)
+    if workers:
+        kwargs.update(multiprocessing_context='spawn',
+                      worker_init_fn=init_loader_worker,
+                      prefetch_factor=prefetch, persistent_workers=False)
+    return DataLoader(ds, **kwargs)
 
 
 def inventory(ds, cfg, entry, repo):
@@ -81,12 +101,24 @@ def main():
     p.add_argument('--models', nargs='+')
     p.add_argument('--datasets', nargs='+')
     p.add_argument('--inventory-only', action='store_true')
+    p.add_argument('--num-workers', type=int, default=2,
+                   help='CPU data-loader processes; 0 disables multiprocessing')
+    p.add_argument('--prefetch-factor', type=int, default=1,
+                   help='Pairs prefetched per worker; keep low for native resolution')
+    p.add_argument('--cpu-threads', type=int, default=4,
+                   help='PyTorch threads for main-process CPU metrics')
     args = p.parse_args()
+    if args.num_workers < 0 or args.prefetch_factor < 1 or args.cpu_threads < 1:
+        p.error('Require num-workers >= 0, prefetch-factor >= 1, cpu-threads >= 1')
     repo = Path(args.repo).resolve(); mf = Path(args.manifest).resolve(); out = Path(args.out).resolve()
     provenance = repo_setup(repo)
     from omegaconf import OmegaConf
     from data import build_dataset
     import torch
+    import cv2
+    from tqdm.auto import tqdm
+    torch.set_num_threads(args.cpu_threads)
+    cv2.setNumThreads(0)
     from utils.metrics import compute_metrics
     torch.manual_seed(941004)
     torch.backends.cudnn.benchmark = False
@@ -128,9 +160,19 @@ def main():
             target = out / entry['id'] / (m['id'] + '.json')
             if target.exists(): raise FileExistsError(f'{target}; use a new output directory to avoid stale mixtures.')
             rows = []
-            for i, identity in enumerate(index):
-                s = ds[i]
+            loader = sample_loader(ds, args.num_workers, args.prefetch_factor)
+            timings = {'load_wait_s': 0., 'inference_s': 0., 'metrics_hash_s': 0.}
+            previous = time.perf_counter()
+            progress = tqdm(loader, total=len(index), desc=f'{m["id"]}/{entry["id"]}',
+                            unit='pair', dynamic_ncols=True)
+            for i, s in enumerate(progress):
+                identity = index[i]
+                now = time.perf_counter()
+                timings['load_wait_s'] += now - previous
+                started = now
                 f = predict(model, s['image1'], s['image2'], args.device, stride, pad_mode)
+                timings['inference_s'] += time.perf_counter() - started
+                started = time.perf_counter()
                 if s['flow'].shape != f.shape:
                     raise ValueError(f'GT/pred shape mismatch for {identity["pair_id"]}')
                 metrics = compute_metrics(f, s['flow'], s['valid'], occ_mask=s.get('occlusion'), invalid_mask=s.get('invalid'))
@@ -144,10 +186,18 @@ def main():
                         a = v.detach().cpu().numpy(); h.update(str((a.shape,str(a.dtype))).encode()); h.update(a.tobytes())
                 rows.append({**identity, 'support_sha256':h.hexdigest(),
                              'metrics':{k:float(v) if math.isfinite(float(v)) else None for k,v in metrics.items()}})
-                if i % 25 == 0: print(f'{m["id"]}/{entry["id"]}: {i+1}/{len(ds)}', flush=True)
+                timings['metrics_hash_s'] += time.perf_counter() - started
+                if i % 10 == 0:
+                    progress.set_postfix({k.replace('_s',''): f'{v/(i+1):.2f}s' for k,v in timings.items()})
+                previous = time.perf_counter()
+            if len(rows) != len(index):
+                raise RuntimeError('Loader returned an incomplete evaluation split')
+            print('Stage totals (seconds):', timings, flush=True)
             json_write(target, {'schema':1, 'model':m['id'], 'dataset':entry['id'],
                 'provenance':{**provenance, **meta, 'manifest_sha256':sha256(mf), 'metric_code_sha256':sha256(repo / 'utils/metrics.py')},
                 'data_config':OmegaConf.to_container(cfg,resolve=True), 'cluster_policy':policy,
+                'execution':{'num_workers':args.num_workers, 'prefetch_factor':args.prefetch_factor,
+                             'cpu_threads':args.cpu_threads, 'timings_seconds':timings},
                 'evaluation':{'native_resolution':True,'pad_to_stride':stride,'pad_mode':pad_mode,
                               'estimator':'equal-weight mean over defined image-pair metrics'}, 'rows':rows})
             print('Saved',target,flush=True)
