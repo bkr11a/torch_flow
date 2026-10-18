@@ -6,19 +6,19 @@
     },
     {
       "id": "A1",
-      "checkpoint": "checkpoints/ablation/of_A/A1_equal_capacity_recurrent/curr_u04_universal_balanced_final/best.pth"
+      "checkpoint": "checkpoints/ablation/of_a/A1_equal_capacity_recurrent/curr_u04_universal_balanced_final/best.pth"
     },
     {
       "id": "B1",
-      "checkpoint": "checkpoints/ablation/of_B/B1_analytic_data_only/curr_u04_universal_balanced_final/best.pth"
+      "checkpoint": "checkpoints/ablation/of_b/B1_analytic_data_only/curr_u04_universal_balanced_final/best.pth"
     },
     {
       "id": "B3",
-      "checkpoint": "checkpoints/ablation/of_B/B3_analytic_proximal_only/curr_u04_universal_balanced_final/best.pth"
+      "checkpoint": "checkpoints/ablation/of_b/B3_analytic_proximal_only/curr_u04_universal_balanced_final/best.pth"
     },
     {
       "id": "E7",
-      "checkpoint": "checkpoints/ablation/of_E/E7_standard_iteration_moderate_data_proximal_deltas/curr_u04_universal_balanced_final/best.pth"
+      "checkpoint": "checkpoints/ablation/of_e/E7_standard_iteration_moderate_data_proximal_deltas/curr_u04_universal_balanced_final/best.pth"
     }
   ],
   "datasets": [
