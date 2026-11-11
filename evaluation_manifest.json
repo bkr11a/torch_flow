@@ -2,7 +2,7 @@
   "models": [
     {
       "id": "A0",
-      "checkpoint": "checkpoints/ablation/of_a/A0_full_hqs//curr_u04_universal_balanced_final/best.pth"
+      "checkpoint": "checkpoints/ablation/of_a/A0_full_hqs/curr_u04_universal_balanced_final/best.pth"
     },
     {
       "id": "A1",
