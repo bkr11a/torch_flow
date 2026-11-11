@@ -164,7 +164,7 @@ def run_video(chain, destination):
                                      cv2.COLOR_RGB2BGR)
                 if writer is None:
                     size = (frame.shape[1], frame.shape[0])
-                    for codec in ('avc1', 'mp4v'):
+                    for codec in ('mp4v', 'avc1'):
                         test = cv2.VideoWriter(str(destination), cv2.VideoWriter_fourcc(*codec), fps, size)
                         if test.isOpened():
                             writer = test
